@@ -94,7 +94,7 @@ cd "${DAEMON_ROOT}"
 
 "${SCRIPT_DIR}/bootstrap-duckdb.sh" --arch "${ARCH}"
 rm -rf zig-out
-zig build -Dtarget="${TARGET}" -Doptimize=ReleaseSafe
+zig build -Dtarget="${TARGET}" -Doptimize=ReleaseSafe -Dversion="${VERSION}"
 
 mkdir -p "${OUT_DIR}"
 STAGING_DIR="$(mktemp -d)"

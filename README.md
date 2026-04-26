@@ -13,9 +13,9 @@ The hosted Sermon control plane is optional. The daemon is useful on its own.
 - Disk usage
 - systemd journal logs when available
 - Local DuckDB storage with retention
-- Optional remote metric push to a Sermon-compatible ingest endpoint
+- Optional remote push to a Sermon-compatible ingest endpoint
 
-Remote push includes top processes by CPU but intentionally omits process command line arguments.
+Remote push includes daemon version, host metrics, disks, top processes by CPU, and a capped batch of recent logs. It intentionally omits process command line arguments.
 
 ## Install
 
@@ -38,6 +38,8 @@ The installer creates a systemd service:
 
 - root install: `/opt/sermon`, `/etc/sermon`, `/var/lib/sermon/metrics.db`, `sermon-agent.service`
 - user install: `~/.local/opt/sermon`, `~/.config/sermon`, `~/.local/share/sermon/metrics.db`, user `sermon-agent.service`
+
+To update an installed daemon, rerun the installer with the desired `--version`. If an existing config is present and no `--ingestion-key` is provided, the installer preserves the existing config, replaces the binaries, and restarts the systemd service.
 
 ## Query local data
 
