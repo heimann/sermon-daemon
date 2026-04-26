@@ -238,6 +238,12 @@ fi
 
 quoted_exec="$(shell_quote "${INSTALL_DIR}/bin/sermon-agent")"
 quoted_config="$(shell_quote "${CONFIG_DIR}/config.json")"
+agent_exec_start="${quoted_exec} --config ${quoted_config}"
+user_exec_start="${agent_exec_start}"
+if [[ "${ROOT_INSTALL}" != "1" ]] && command -v sg >/dev/null 2>&1 && id -nG | tr ' ' '\n' | grep -qx systemd-journal; then
+  sg_path="$(command -v sg)"
+  user_exec_start="$(shell_quote "${sg_path}") systemd-journal -c $(shell_quote "${agent_exec_start}")"
+fi
 
 if [[ "${ROOT_INSTALL}" == "1" ]]; then
   cat >"${UNIT_PATH}" <<EOF
@@ -248,7 +254,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${quoted_exec} --config ${quoted_config}
+ExecStart=${agent_exec_start}
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -269,7 +275,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${quoted_exec} --config ${quoted_config}
+ExecStart=${user_exec_start}
 Restart=on-failure
 RestartSec=5
 

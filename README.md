@@ -11,7 +11,7 @@ The hosted Sermon control plane is optional. The daemon is useful on its own.
 - CPU and memory from `/proc`
 - Process snapshots from `/proc`
 - Disk usage
-- systemd journal logs when available
+- systemd journal logs when available (root installs, or user installs with journal access)
 - Local DuckDB storage with retention
 - Optional remote push to a Sermon-compatible ingest endpoint
 
