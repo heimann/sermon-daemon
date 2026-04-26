@@ -162,12 +162,18 @@ pub const Storage = struct {
             \\  timestamp TIMESTAMP NOT NULL,
             \\  source VARCHAR,
             \\  unit VARCHAR,
+            \\  identifier VARCHAR,
+            \\  systemd_unit VARCHAR,
             \\  priority INTEGER,
             \\  message TEXT,
             \\  pid INTEGER
             \\);
+            \\ALTER TABLE logs ADD COLUMN IF NOT EXISTS identifier VARCHAR;
+            \\ALTER TABLE logs ADD COLUMN IF NOT EXISTS systemd_unit VARCHAR;
             \\CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp);
             \\CREATE INDEX IF NOT EXISTS idx_logs_unit ON logs(unit);
+            \\CREATE INDEX IF NOT EXISTS idx_logs_identifier ON logs(identifier);
+            \\CREATE INDEX IF NOT EXISTS idx_logs_systemd_unit ON logs(systemd_unit);
             \\CREATE INDEX IF NOT EXISTS idx_logs_priority ON logs(priority);
         ;
 
@@ -283,7 +289,7 @@ pub const Storage = struct {
     }
 
     pub fn insertLog(self: *Storage, entry: LogEntry) !void {
-        const sql = "INSERT INTO logs VALUES (to_timestamp($1), $2, $3, $4, $5, $6)";
+        const sql = "INSERT INTO logs (timestamp, source, unit, identifier, systemd_unit, priority, message, pid) VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8)";
 
         var stmt: c.duckdb_prepared_statement = undefined;
         var state = c.duckdb_prepare(self.conn, sql.ptr, &stmt);
@@ -301,13 +307,25 @@ pub const Storage = struct {
             _ = c.duckdb_bind_null(stmt, 3);
         }
 
-        _ = c.duckdb_bind_uint8(stmt, 4, entry.priority);
-        _ = c.duckdb_bind_varchar_length(stmt, 5, entry.message.ptr, entry.message.len);
+        if (entry.identifier) |identifier| {
+            _ = c.duckdb_bind_varchar_length(stmt, 4, identifier.ptr, identifier.len);
+        } else {
+            _ = c.duckdb_bind_null(stmt, 4);
+        }
+
+        if (entry.systemd_unit) |systemd_unit| {
+            _ = c.duckdb_bind_varchar_length(stmt, 5, systemd_unit.ptr, systemd_unit.len);
+        } else {
+            _ = c.duckdb_bind_null(stmt, 5);
+        }
+
+        _ = c.duckdb_bind_uint8(stmt, 6, entry.priority);
+        _ = c.duckdb_bind_varchar_length(stmt, 7, entry.message.ptr, entry.message.len);
 
         if (entry.pid) |pid| {
-            _ = c.duckdb_bind_uint32(stmt, 6, pid);
+            _ = c.duckdb_bind_uint32(stmt, 8, pid);
         } else {
-            _ = c.duckdb_bind_null(stmt, 6);
+            _ = c.duckdb_bind_null(stmt, 8);
         }
 
         var result: c.duckdb_result = undefined;
@@ -474,7 +492,7 @@ pub const Storage = struct {
     }
 
     pub fn queryLogs(self: *Storage, since: ?i64, unit: ?[]const u8, priority: ?u8) ![]LogEntry {
-        const sql = "SELECT * FROM logs WHERE ($1::BIGINT IS NULL OR timestamp >= to_timestamp($1)) AND ($2::VARCHAR IS NULL OR unit = $2) AND ($3::INTEGER IS NULL OR priority = $3) ORDER BY timestamp DESC";
+        const sql = "SELECT timestamp, source, unit, identifier, systemd_unit, priority, message, pid FROM logs WHERE ($1::BIGINT IS NULL OR timestamp >= to_timestamp($1)) AND ($2::VARCHAR IS NULL OR unit = $2) AND ($3::INTEGER IS NULL OR priority = $3) ORDER BY timestamp DESC";
 
         var stmt: c.duckdb_prepared_statement = undefined;
         var state = c.duckdb_prepare(self.conn, sql.ptr, &stmt);
@@ -534,18 +552,32 @@ pub const Storage = struct {
             };
             errdefer if (unit_val) |u| self.allocator.free(u);
 
-            const prio = c.duckdb_value_uint8(&result, 3, i);
+            const identifier_val = if (c.duckdb_value_is_null(&result, 3, i)) null else blk: {
+                const identifier_ptr = c.duckdb_value_varchar(&result, 3, i);
+                break :blk try self.allocator.dupe(u8, std.mem.span(identifier_ptr));
+            };
+            errdefer if (identifier_val) |identifier| self.allocator.free(identifier);
 
-            const message_ptr = c.duckdb_value_varchar(&result, 4, i);
+            const systemd_unit_val = if (c.duckdb_value_is_null(&result, 4, i)) null else blk: {
+                const systemd_unit_ptr = c.duckdb_value_varchar(&result, 4, i);
+                break :blk try self.allocator.dupe(u8, std.mem.span(systemd_unit_ptr));
+            };
+            errdefer if (systemd_unit_val) |systemd_unit| self.allocator.free(systemd_unit);
+
+            const prio = c.duckdb_value_uint8(&result, 5, i);
+
+            const message_ptr = c.duckdb_value_varchar(&result, 6, i);
             const message = try self.allocator.dupe(u8, std.mem.span(message_ptr));
             errdefer self.allocator.free(message);
 
-            const pid_val = if (c.duckdb_value_is_null(&result, 5, i)) null else c.duckdb_value_uint32(&result, 5, i);
+            const pid_val = if (c.duckdb_value_is_null(&result, 7, i)) null else c.duckdb_value_uint32(&result, 7, i);
 
             entries[i] = LogEntry{
                 .timestamp = timestamp,
                 .source = source,
                 .unit = unit_val,
+                .identifier = identifier_val,
+                .systemd_unit = systemd_unit_val,
                 .priority = prio,
                 .message = message,
                 .pid = pid_val,
@@ -785,7 +817,9 @@ test "Storage: insert and query logs" {
     const entry = LogEntry{
         .timestamp = std.time.timestamp(),
         .source = "test_source",
-        .unit = "test.service",
+        .unit = "test",
+        .identifier = "test",
+        .systemd_unit = "test.service",
         .priority = 6,
         .message = "Test log message",
         .pid = 5678,
@@ -798,6 +832,8 @@ test "Storage: insert and query logs" {
         for (log_entries) |log| {
             allocator.free(log.source);
             if (log.unit) |u| allocator.free(u);
+            if (log.identifier) |identifier| allocator.free(identifier);
+            if (log.systemd_unit) |systemd_unit| allocator.free(systemd_unit);
             allocator.free(log.message);
         }
         allocator.free(log_entries);
@@ -806,6 +842,8 @@ test "Storage: insert and query logs" {
     try std.testing.expect(log_entries.len == 1);
     try std.testing.expectEqualStrings(entry.source, log_entries[0].source);
     try std.testing.expectEqualStrings(entry.unit.?, log_entries[0].unit.?);
+    try std.testing.expectEqualStrings(entry.identifier.?, log_entries[0].identifier.?);
+    try std.testing.expectEqualStrings(entry.systemd_unit.?, log_entries[0].systemd_unit.?);
     try std.testing.expect(entry.priority == log_entries[0].priority);
     try std.testing.expect(entry.pid.? == log_entries[0].pid.?);
 }

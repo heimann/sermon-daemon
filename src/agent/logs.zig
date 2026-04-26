@@ -6,7 +6,9 @@ const ChildProcess = std.process.Child;
 pub const LogEntry = struct {
     timestamp: i64, // Unix timestamp (seconds)
     source: []const u8, // "systemd" or file path
-    unit: ?[]const u8, // systemd unit name (null for file logs)
+    unit: ?[]const u8, // Back-compat grouping key: identifier if present, otherwise systemd_unit
+    identifier: ?[]const u8, // SYSLOG_IDENTIFIER for journald entries
+    systemd_unit: ?[]const u8, // _SYSTEMD_UNIT for journald entries
     priority: u8, // syslog priority 0-7 (0=emerg, 7=debug)
     message: []const u8, // log message content
     pid: ?u32, // process ID if available
@@ -15,6 +17,12 @@ pub const LogEntry = struct {
         allocator.free(self.source);
         if (self.unit) |unit| {
             allocator.free(unit);
+        }
+        if (self.identifier) |identifier| {
+            allocator.free(identifier);
+        }
+        if (self.systemd_unit) |systemd_unit| {
+            allocator.free(systemd_unit);
         }
         allocator.free(self.message);
     }
@@ -206,13 +214,26 @@ const JournalTailer = struct {
         else
             std.time.timestamp();
 
-        // Extract unit name
-        const unit: ?[]const u8 = if (obj.get("SYSLOG_IDENTIFIER")) |id|
+        // Extract identity fields. Keep unit as the historical grouping key.
+        const identifier: ?[]const u8 = if (obj.get("SYSLOG_IDENTIFIER")) |id|
             try self.allocator.dupe(u8, id.string)
-        else if (obj.get("_SYSTEMD_UNIT")) |unit_name|
+        else
+            null;
+        errdefer if (identifier) |value| self.allocator.free(value);
+
+        const systemd_unit: ?[]const u8 = if (obj.get("_SYSTEMD_UNIT")) |unit_name|
             try self.allocator.dupe(u8, unit_name.string)
         else
             null;
+        errdefer if (systemd_unit) |value| self.allocator.free(value);
+
+        const unit: ?[]const u8 = if (identifier) |value|
+            try self.allocator.dupe(u8, value)
+        else if (systemd_unit) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (unit) |value| self.allocator.free(value);
 
         // Extract priority (default to 6 = INFO)
         const priority: u8 = if (obj.get("PRIORITY")) |prio|
@@ -238,6 +259,8 @@ const JournalTailer = struct {
             .timestamp = timestamp,
             .source = source,
             .unit = unit,
+            .identifier = identifier,
+            .systemd_unit = systemd_unit,
             .priority = priority,
             .message = message,
             .pid = pid,
@@ -361,6 +384,8 @@ const FileTailer = struct {
                 .timestamp = timestamp,
                 .source = source,
                 .unit = null,
+                .identifier = null,
+                .systemd_unit = null,
                 .priority = 6, // INFO level by default
                 .message = message,
                 .pid = null,
@@ -378,7 +403,9 @@ test "LogEntry memory management" {
     var entry = LogEntry{
         .timestamp = 1234567890,
         .source = try allocator.dupe(u8, "systemd"),
-        .unit = try allocator.dupe(u8, "nginx.service"),
+        .unit = try allocator.dupe(u8, "nginx"),
+        .identifier = try allocator.dupe(u8, "nginx"),
+        .systemd_unit = try allocator.dupe(u8, "nginx.service"),
         .priority = 3,
         .message = try allocator.dupe(u8, "Test message"),
         .pid = 1234,
@@ -387,7 +414,9 @@ test "LogEntry memory management" {
 
     try std.testing.expectEqual(@as(i64, 1234567890), entry.timestamp);
     try std.testing.expectEqualStrings("systemd", entry.source);
-    try std.testing.expectEqualStrings("nginx.service", entry.unit.?);
+    try std.testing.expectEqualStrings("nginx", entry.unit.?);
+    try std.testing.expectEqualStrings("nginx", entry.identifier.?);
+    try std.testing.expectEqualStrings("nginx.service", entry.systemd_unit.?);
 }
 
 test "LogSource types" {
