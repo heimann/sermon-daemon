@@ -3,6 +3,10 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Sermon Daemon version") orelse "dev";
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
 
     // ── Shared modules for cross-imports ──
     const collector_mod = b.createModule(.{
@@ -23,6 +27,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     push_mod.addImport("collector", collector_mod);
+    push_mod.addImport("logs", logs_mod);
+    push_mod.addOptions("build_options", options);
 
     const storage_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/storage.zig"),
@@ -127,6 +133,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     push_test_mod.addImport("collector", collector_mod);
+    push_test_mod.addImport("logs", logs_mod);
+    push_test_mod.addOptions("build_options", options);
 
     const push_tests = b.addTest(.{
         .root_module = push_test_mod,

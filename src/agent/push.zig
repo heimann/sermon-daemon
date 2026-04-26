@@ -1,14 +1,21 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const collector_mod = @import("collector");
+const logs_mod = @import("logs");
 
 const Allocator = std.mem.Allocator;
 
+const max_logs_per_payload = 100;
+const max_log_message_bytes = 4_096;
+
 const Payload = struct {
     hostname: []const u8,
+    daemon_version: []const u8,
     collected_at: i64,
     metrics: MetricsPayload,
     processes: []const ProcessPayload,
     disks: []const DiskPayload,
+    logs: []const LogPayload,
 };
 
 const MetricsPayload = struct {
@@ -41,6 +48,15 @@ const DiskPayload = struct {
     percent: f32,
 };
 
+const LogPayload = struct {
+    timestamp: i64,
+    source: []const u8,
+    unit: ?[]const u8,
+    priority: u8,
+    pid: ?u32,
+    message: []const u8,
+};
+
 pub fn buildPayload(
     allocator: Allocator,
     hostname: []const u8,
@@ -48,6 +64,7 @@ pub fn buildPayload(
     metrics: collector_mod.SystemMetrics,
     procs: []const collector_mod.ProcessInfo,
     disks: []const collector_mod.DiskInfo,
+    log_entries: []const logs_mod.LogEntry,
 ) ![]u8 {
     var sorted_procs = try allocator.dupe(collector_mod.ProcessInfo, procs);
     defer allocator.free(sorted_procs);
@@ -91,8 +108,25 @@ pub fn buildPayload(
         };
     }
 
+    const log_count = @min(log_entries.len, max_logs_per_payload);
+    const log_start = log_entries.len - log_count;
+    const payload_logs = try allocator.alloc(LogPayload, log_count);
+    defer allocator.free(payload_logs);
+
+    for (payload_logs, log_entries[log_start..]) |*dest, src| {
+        dest.* = .{
+            .timestamp = src.timestamp,
+            .source = src.source,
+            .unit = src.unit,
+            .priority = src.priority,
+            .pid = src.pid,
+            .message = truncateUtf8(src.message, max_log_message_bytes),
+        };
+    }
+
     const payload = Payload{
         .hostname = hostname,
+        .daemon_version = build_options.version,
         .collected_at = timestamp,
         .metrics = .{
             .cpu_percent = metrics.cpu_percent,
@@ -107,9 +141,22 @@ pub fn buildPayload(
         },
         .processes = payload_procs,
         .disks = payload_disks,
+        .logs = payload_logs,
     };
 
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(payload, .{})});
+}
+
+fn truncateUtf8(value: []const u8, max_bytes: usize) []const u8 {
+    if (value.len <= max_bytes) return value;
+
+    var end = max_bytes;
+    while (end > 0) : (end -= 1) {
+        const candidate = value[0..end];
+        if (std.unicode.utf8ValidateSlice(candidate)) return candidate;
+    }
+
+    return value[0..0];
 }
 
 pub fn pushMetrics(
@@ -184,7 +231,7 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
         },
     };
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks);
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -193,10 +240,59 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
     const root = parsed.value.object;
     const processes = root.get("processes").?.array;
 
+    try std.testing.expectEqualStrings("dev", root.get("daemon_version").?.string);
     try std.testing.expectEqual(@as(usize, 25), processes.items.len);
     try std.testing.expectEqual(@as(i64, 30), processes.items[0].object.get("pid").?.integer);
     try std.testing.expectEqual(@as(i64, 6), processes.items[24].object.get("pid").?.integer);
     try std.testing.expect(processes.items[0].object.get("cmdline") == null);
+}
+
+test "buildPayload includes capped truncated logs" {
+    const allocator = std.testing.allocator;
+
+    const metrics = collector_mod.SystemMetrics{
+        .cpu_percent = 1.0,
+        .cpu_user = 1.0,
+        .cpu_system = 0.0,
+        .cpu_iowait = 0.0,
+        .mem_total = 16_000,
+        .mem_used = 8_000,
+        .mem_percent = 50.0,
+        .swap_total = 2_000,
+        .swap_used = 100,
+    };
+    const procs = [_]collector_mod.ProcessInfo{};
+    const disks = [_]collector_mod.DiskInfo{};
+
+    const long_message = try allocator.alloc(u8, 5_000);
+    defer allocator.free(long_message);
+    @memset(long_message, 'x');
+
+    var entries: [101]logs_mod.LogEntry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{
+            .timestamp = 1_739_443_000 + @as(i64, @intCast(i)),
+            .source = "systemd",
+            .unit = "ssh.service",
+            .priority = 4,
+            .message = long_message,
+            .pid = 123,
+        };
+    }
+
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries);
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const log_values = root.get("logs").?.array;
+
+    try std.testing.expectEqual(@as(usize, 100), log_values.items.len);
+    try std.testing.expectEqual(@as(i64, 1_739_443_001), log_values.items[0].object.get("timestamp").?.integer);
+    try std.testing.expectEqualStrings("ssh.service", log_values.items[0].object.get("unit").?.string);
+    try std.testing.expectEqual(@as(usize, 4_096), log_values.items[0].object.get("message").?.string.len);
 }
 
 test "buildIngestUrl trims trailing slash" {

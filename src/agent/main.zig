@@ -234,6 +234,14 @@ pub fn main() !void {
             allocator.free(disks);
         }
 
+        var push_logs = std.ArrayList(logs_mod.LogEntry){};
+        defer {
+            for (push_logs.items) |*entry| {
+                entry.deinit(allocator);
+            }
+            push_logs.deinit(allocator);
+        }
+
         // Open DB, write everything, close DB
         {
             var storage = storage_mod.Storage.init(allocator, final_db_path) catch |err| {
@@ -260,12 +268,17 @@ pub fn main() !void {
             if (log_tailer) |*lt| {
                 var log_count: u32 = 0;
                 while (log_count < 1000) : (log_count += 1) {
-                    var entry = lt.next() catch break;
-                    if (entry == null) break;
-                    storage.insertLog(entry.?) catch |err| {
+                    const maybe_entry = lt.next() catch break;
+                    if (maybe_entry == null) break;
+                    const entry = maybe_entry.?;
+                    storage.insertLog(entry) catch |err| {
                         std.debug.print("Warning: log insert failed: {}\n", .{err});
                     };
-                    entry.?.deinit(allocator);
+                    push_logs.append(allocator, entry) catch |err| {
+                        var owned_entry = entry;
+                        owned_entry.deinit(allocator);
+                        return err;
+                    };
                 }
             }
 
@@ -282,7 +295,7 @@ pub fn main() !void {
 
         if (server_url) |url| {
             if (api_key) |key| {
-                const maybe_payload = push_mod.buildPayload(allocator, hostname, now, metrics, procs, disks) catch |err| blk: {
+                const maybe_payload = push_mod.buildPayload(allocator, hostname, now, metrics, procs, disks, push_logs.items) catch |err| blk: {
                     std.debug.print("Warning: payload build failed: {}\n", .{err});
                     break :blk null;
                 };

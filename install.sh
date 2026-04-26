@@ -212,25 +212,29 @@ rm -rf "${old_dir}"
 
 mkdir -p "${CONFIG_DIR}" "$(dirname "${DB_PATH}")" "${UNIT_DIR}"
 
-config_tmp="${CONFIG_DIR}/config.json.tmp"
-umask 077
-cat >"${config_tmp}" <<EOF
+if [[ -n "${INGESTION_KEY}" || ! -f "${CONFIG_DIR}/config.json" ]]; then
+  config_tmp="${CONFIG_DIR}/config.json.tmp"
+  umask 077
+  cat >"${config_tmp}" <<EOF
 {
   "db_path": "$(json_escape "${DB_PATH}")",
   "interval": 10,
   "retention": 604800
 EOF
-if [[ -n "${INGESTION_KEY}" ]]; then
-  cat >>"${config_tmp}" <<EOF
+  if [[ -n "${INGESTION_KEY}" ]]; then
+    cat >>"${config_tmp}" <<EOF
   ,"server_url": "$(json_escape "${SERVER_URL}")",
   "api_key": "$(json_escape "${INGESTION_KEY}")"
 EOF
-fi
-cat >>"${config_tmp}" <<EOF
+  fi
+  cat >>"${config_tmp}" <<EOF
 }
 EOF
-mv "${config_tmp}" "${CONFIG_DIR}/config.json"
-chmod 600 "${CONFIG_DIR}/config.json"
+  mv "${config_tmp}" "${CONFIG_DIR}/config.json"
+  chmod 600 "${CONFIG_DIR}/config.json"
+else
+  log "preserving existing config at ${CONFIG_DIR}/config.json"
+fi
 
 quoted_exec="$(shell_quote "${INSTALL_DIR}/bin/sermon-agent")"
 quoted_config="$(shell_quote "${CONFIG_DIR}/config.json")"
