@@ -5,7 +5,7 @@ const logs_mod = @import("logs");
 
 const Allocator = std.mem.Allocator;
 
-const max_logs_per_payload = 100;
+const max_logs_per_payload = 20;
 const max_log_message_bytes = 4_096;
 
 const Payload = struct {
@@ -16,6 +16,7 @@ const Payload = struct {
     processes: []const ProcessPayload,
     disks: []const DiskPayload,
     logs: []const LogPayload,
+    log_stats: LogStatsPayload,
 };
 
 const MetricsPayload = struct {
@@ -46,6 +47,12 @@ const DiskPayload = struct {
     total_bytes: u64,
     used_bytes: u64,
     percent: f32,
+};
+
+const LogStatsPayload = struct {
+    seen: usize,
+    uploaded: usize,
+    dropped: usize,
 };
 
 const LogPayload = struct {
@@ -110,23 +117,12 @@ pub fn buildPayload(
         };
     }
 
-    const log_count = @min(log_entries.len, max_logs_per_payload);
-    const log_start = log_entries.len - log_count;
-    const payload_logs = try allocator.alloc(LogPayload, log_count);
+    const max_log_count = @min(log_entries.len, max_logs_per_payload);
+    const payload_logs = try allocator.alloc(LogPayload, max_log_count);
     defer allocator.free(payload_logs);
 
-    for (payload_logs, log_entries[log_start..]) |*dest, src| {
-        dest.* = .{
-            .timestamp = src.timestamp,
-            .source = src.source,
-            .unit = src.unit,
-            .identifier = src.identifier,
-            .systemd_unit = src.systemd_unit,
-            .priority = src.priority,
-            .pid = src.pid,
-            .message = truncateUtf8(src.message, max_log_message_bytes),
-        };
-    }
+    const uploaded_logs = selectLogsForUpload(payload_logs, log_entries);
+    const dropped_logs = log_entries.len - uploaded_logs.len;
 
     const payload = Payload{
         .hostname = hostname,
@@ -145,10 +141,52 @@ pub fn buildPayload(
         },
         .processes = payload_procs,
         .disks = payload_disks,
-        .logs = payload_logs,
+        .logs = uploaded_logs,
+        .log_stats = .{
+            .seen = log_entries.len,
+            .uploaded = uploaded_logs.len,
+            .dropped = dropped_logs,
+        },
     };
 
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(payload, .{})});
+}
+
+fn selectLogsForUpload(dest: []LogPayload, entries: []const logs_mod.LogEntry) []LogPayload {
+    var count: usize = 0;
+
+    var idx = entries.len;
+    while (idx > 0 and count < dest.len) {
+        idx -= 1;
+        if (entries[idx].priority <= 4) {
+            dest[count] = logPayload(entries[idx]);
+            count += 1;
+        }
+    }
+
+    idx = entries.len;
+    while (idx > 0 and count < dest.len) {
+        idx -= 1;
+        if (entries[idx].priority > 4) {
+            dest[count] = logPayload(entries[idx]);
+            count += 1;
+        }
+    }
+
+    return dest[0..count];
+}
+
+fn logPayload(src: logs_mod.LogEntry) LogPayload {
+    return .{
+        .timestamp = src.timestamp,
+        .source = src.source,
+        .unit = src.unit,
+        .identifier = src.identifier,
+        .systemd_unit = src.systemd_unit,
+        .priority = src.priority,
+        .pid = src.pid,
+        .message = truncateUtf8(src.message, max_log_message_bytes),
+    };
 }
 
 fn truncateUtf8(value: []const u8, max_bytes: usize) []const u8 {
@@ -295,12 +333,15 @@ test "buildPayload includes capped truncated logs" {
     const root = parsed.value.object;
     const log_values = root.get("logs").?.array;
 
-    try std.testing.expectEqual(@as(usize, 100), log_values.items.len);
-    try std.testing.expectEqual(@as(i64, 1_739_443_001), log_values.items[0].object.get("timestamp").?.integer);
+    try std.testing.expectEqual(@as(usize, 20), log_values.items.len);
+    try std.testing.expectEqual(@as(i64, 1_739_443_100), log_values.items[0].object.get("timestamp").?.integer);
     try std.testing.expectEqualStrings("sshd", log_values.items[0].object.get("unit").?.string);
     try std.testing.expectEqualStrings("sshd", log_values.items[0].object.get("identifier").?.string);
     try std.testing.expectEqualStrings("ssh.service", log_values.items[0].object.get("systemd_unit").?.string);
     try std.testing.expectEqual(@as(usize, 4_096), log_values.items[0].object.get("message").?.string.len);
+    try std.testing.expectEqual(@as(i64, 101), root.get("log_stats").?.object.get("seen").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), root.get("log_stats").?.object.get("uploaded").?.integer);
+    try std.testing.expectEqual(@as(i64, 81), root.get("log_stats").?.object.get("dropped").?.integer);
 }
 
 test "buildIngestUrl trims trailing slash" {
