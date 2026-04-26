@@ -435,6 +435,18 @@ fn printLogsJson(writer: Writer, logs: []const LogEntry) !void {
             try writer.print("    \"unit\": null,\n", .{});
         }
 
+        if (log.identifier) |identifier| {
+            try writer.print("    \"identifier\": \"{s}\",\n", .{identifier});
+        } else {
+            try writer.print("    \"identifier\": null,\n", .{});
+        }
+
+        if (log.systemd_unit) |systemd_unit| {
+            try writer.print("    \"systemd_unit\": \"{s}\",\n", .{systemd_unit});
+        } else {
+            try writer.print("    \"systemd_unit\": null,\n", .{});
+        }
+
         try writer.print("    \"priority\": {d},\n", .{log.priority});
         try writer.print("    \"message\": \"{s}\"", .{log.message});
 
@@ -451,16 +463,20 @@ fn printLogsJson(writer: Writer, logs: []const LogEntry) !void {
 }
 
 fn printLogsCsv(writer: Writer, logs: []const LogEntry) !void {
-    try writer.print("timestamp,source,unit,priority,message,pid\n", .{});
+    try writer.print("timestamp,source,unit,identifier,systemd_unit,priority,message,pid\n", .{});
 
     for (logs) |log| {
         const unit_str = log.unit orelse "";
+        const identifier_str = log.identifier orelse "";
+        const systemd_unit_str = log.systemd_unit orelse "";
         const pid_str = if (log.pid) |pid| pid else 0;
 
-        try writer.print("{d},\"{s}\",\"{s}\",{d},\"{s}\",{d}\n", .{
+        try writer.print("{d},\"{s}\",\"{s}\",\"{s}\",\"{s}\",{d},\"{s}\",{d}\n", .{
             log.timestamp,
             log.source,
             unit_str,
+            identifier_str,
+            systemd_unit_str,
             log.priority,
             log.message,
             pid_str,

@@ -52,6 +52,8 @@ const LogPayload = struct {
     timestamp: i64,
     source: []const u8,
     unit: ?[]const u8,
+    identifier: ?[]const u8,
+    systemd_unit: ?[]const u8,
     priority: u8,
     pid: ?u32,
     message: []const u8,
@@ -118,6 +120,8 @@ pub fn buildPayload(
             .timestamp = src.timestamp,
             .source = src.source,
             .unit = src.unit,
+            .identifier = src.identifier,
+            .systemd_unit = src.systemd_unit,
             .priority = src.priority,
             .pid = src.pid,
             .message = truncateUtf8(src.message, max_log_message_bytes),
@@ -273,7 +277,9 @@ test "buildPayload includes capped truncated logs" {
         entry.* = .{
             .timestamp = 1_739_443_000 + @as(i64, @intCast(i)),
             .source = "systemd",
-            .unit = "ssh.service",
+            .unit = "sshd",
+            .identifier = "sshd",
+            .systemd_unit = "ssh.service",
             .priority = 4,
             .message = long_message,
             .pid = 123,
@@ -291,7 +297,9 @@ test "buildPayload includes capped truncated logs" {
 
     try std.testing.expectEqual(@as(usize, 100), log_values.items.len);
     try std.testing.expectEqual(@as(i64, 1_739_443_001), log_values.items[0].object.get("timestamp").?.integer);
-    try std.testing.expectEqualStrings("ssh.service", log_values.items[0].object.get("unit").?.string);
+    try std.testing.expectEqualStrings("sshd", log_values.items[0].object.get("unit").?.string);
+    try std.testing.expectEqualStrings("sshd", log_values.items[0].object.get("identifier").?.string);
+    try std.testing.expectEqualStrings("ssh.service", log_values.items[0].object.get("systemd_unit").?.string);
     try std.testing.expectEqual(@as(usize, 4_096), log_values.items[0].object.get("message").?.string.len);
 }
 
