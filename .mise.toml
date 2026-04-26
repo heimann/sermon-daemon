@@ -1,0 +1,28 @@
+[tools]
+zig = "0.15.2"
+
+[tasks.bootstrap]
+description = "Download pinned DuckDB runtime library"
+run = "./scripts/bootstrap-duckdb.sh --arch x86_64 >/dev/null"
+
+[tasks.preflight]
+description = "Run shell/script preflight checks"
+run = "./scripts/preflight.sh"
+
+[tasks.test]
+description = "Run Zig unit tests"
+run = "./scripts/bootstrap-duckdb.sh --arch x86_64 >/dev/null && LD_LIBRARY_PATH=lib zig build test"
+
+[tasks.bench]
+description = "Run resource benchmark"
+run = "./scripts/bootstrap-duckdb.sh --arch x86_64 >/dev/null && LD_LIBRARY_PATH=lib zig build bench"
+
+[tasks.verify]
+description = "Run preflight, build, tests, and benchmark"
+run = [
+  "./scripts/bootstrap-duckdb.sh --arch x86_64 >/dev/null",
+  "./scripts/preflight.sh",
+  "zig build",
+  "LD_LIBRARY_PATH=lib zig build test",
+  "LD_LIBRARY_PATH=lib zig build bench",
+]
