@@ -1,0 +1,5 @@
+{
+  "db_path": "~/.local/share/sermon/metrics.db",
+  "interval": 10,
+  "retention": 604800
+}

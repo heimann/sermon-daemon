@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Bootstrap DuckDB
+        run: ./scripts/bootstrap-duckdb.sh
+
+      - name: Preflight
+        run: ./scripts/preflight.sh
+
+      - name: Build
+        run: zig build
+
+      - name: Unit tests
+        run: LD_LIBRARY_PATH=lib zig build test
+
+      - name: Resource benchmark
+        run: LD_LIBRARY_PATH=lib zig build bench

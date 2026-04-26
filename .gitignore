@@ -1,0 +1,18 @@
+# Build output
+.zig-cache/
+zig-out/
+
+# DuckDB runtime libs downloaded by scripts/bootstrap-duckdb.sh
+lib/libduckdb.so
+
+# Local runtime state
+*.db
+*.db.wal
+*.db.tmp
+.env
+
+# Test artifacts
+test_io
+
+# Editor/OS
+.DS_Store
