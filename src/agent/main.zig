@@ -1,6 +1,7 @@
 const std = @import("std");
 const collector_mod = @import("collector");
 const logs_mod = @import("logs");
+const proc_self_mod = @import("proc_self");
 const push_mod = @import("push");
 const storage_mod = @import("storage");
 
@@ -200,6 +201,7 @@ pub fn main() !void {
     std.Thread.sleep(1 * std.time.ns_per_s);
 
     var retention_counter: u64 = 0;
+    var self_state = proc_self_mod.State.init();
 
     // Main collection loop
     while (running) {
@@ -287,9 +289,22 @@ pub fn main() !void {
             }
         }
 
+        const self_sample = proc_self_mod.sample(&self_state) catch |err| sblk: {
+            std.debug.print("Warning: proc_self sample failed: {}\n", .{err});
+            break :sblk proc_self_mod.Sample{
+                .cpu_percent = 0,
+                .rss_kb = 0,
+                .vsize_kb = 0,
+                .threads = 0,
+                .voluntary_ctxt_switches = 0,
+                .nonvoluntary_ctxt_switches = 0,
+                .uptime_seconds = 0,
+            };
+        };
+
         if (server_url) |url| {
             if (api_key) |key| {
-                const maybe_payload = push_mod.buildPayload(allocator, hostname, now, metrics, procs, disks, push_logs.items) catch |err| blk: {
+                const maybe_payload = push_mod.buildPayload(allocator, hostname, now, metrics, procs, disks, push_logs.items, self_sample) catch |err| blk: {
                     std.debug.print("Warning: payload build failed: {}\n", .{err});
                     break :blk null;
                 };

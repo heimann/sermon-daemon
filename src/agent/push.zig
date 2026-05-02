@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const collector_mod = @import("collector");
 const logs_mod = @import("logs");
+const proc_self_mod = @import("proc_self");
 
 const Allocator = std.mem.Allocator;
 
@@ -17,6 +18,17 @@ const Payload = struct {
     disks: []const DiskPayload,
     logs: []const LogPayload,
     log_stats: LogStatsPayload,
+    daemon_self: DaemonSelfPayload,
+};
+
+const DaemonSelfPayload = struct {
+    cpu_percent: f32,
+    rss_kb: u64,
+    vsize_kb: u64,
+    threads: u32,
+    voluntary_ctxt_switches: u64,
+    nonvoluntary_ctxt_switches: u64,
+    uptime_seconds: u64,
 };
 
 const MetricsPayload = struct {
@@ -74,6 +86,7 @@ pub fn buildPayload(
     procs: []const collector_mod.ProcessInfo,
     disks: []const collector_mod.DiskInfo,
     log_entries: []const logs_mod.LogEntry,
+    daemon_self: proc_self_mod.Sample,
 ) ![]u8 {
     var sorted_procs = try allocator.dupe(collector_mod.ProcessInfo, procs);
     defer allocator.free(sorted_procs);
@@ -146,6 +159,15 @@ pub fn buildPayload(
             .seen = log_entries.len,
             .uploaded = uploaded_logs.len,
             .dropped = dropped_logs,
+        },
+        .daemon_self = .{
+            .cpu_percent = daemon_self.cpu_percent,
+            .rss_kb = daemon_self.rss_kb,
+            .vsize_kb = daemon_self.vsize_kb,
+            .threads = daemon_self.threads,
+            .voluntary_ctxt_switches = daemon_self.voluntary_ctxt_switches,
+            .nonvoluntary_ctxt_switches = daemon_self.nonvoluntary_ctxt_switches,
+            .uptime_seconds = daemon_self.uptime_seconds,
         },
     };
 
@@ -233,6 +255,18 @@ fn buildIngestUrl(allocator: Allocator, server_url: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/api/ingest", .{trimmed});
 }
 
+fn testSelfSample() proc_self_mod.Sample {
+    return .{
+        .cpu_percent = 0.42,
+        .rss_kb = 38_000,
+        .vsize_kb = 311_000,
+        .threads = 1,
+        .voluntary_ctxt_switches = 100,
+        .nonvoluntary_ctxt_switches = 10,
+        .uptime_seconds = 60,
+    };
+}
+
 test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
     const allocator = std.testing.allocator;
 
@@ -273,7 +307,7 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
         },
     };
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{});
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, testSelfSample());
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -287,6 +321,12 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
     try std.testing.expectEqual(@as(i64, 30), processes.items[0].object.get("pid").?.integer);
     try std.testing.expectEqual(@as(i64, 6), processes.items[24].object.get("pid").?.integer);
     try std.testing.expect(processes.items[0].object.get("cmdline") == null);
+
+    const daemon_self = root.get("daemon_self").?.object;
+    try std.testing.expectEqual(@as(i64, 38_000), daemon_self.get("rss_kb").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), daemon_self.get("threads").?.integer);
+    try std.testing.expectEqual(@as(i64, 60), daemon_self.get("uptime_seconds").?.integer);
+    try std.testing.expect(daemon_self.get("cpu_percent") != null);
 }
 
 test "buildPayload includes capped truncated logs" {
@@ -324,7 +364,7 @@ test "buildPayload includes capped truncated logs" {
         };
     }
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries);
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, testSelfSample());
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
