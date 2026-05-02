@@ -161,11 +161,11 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
-    // Verify storage works at startup (creates schema)
-    {
-        var storage = try storage_mod.Storage.init(allocator, final_db_path);
-        storage.deinit();
-    }
+    // Open storage once for the daemon's lifetime. Reopening per-cycle
+    // mmaps the entire DB on every collection tick and pegs CPU on
+    // populated databases (~400 MB and up). See scripts/bench/.
+    var storage = try storage_mod.Storage.init(allocator, final_db_path);
+    defer storage.deinit();
 
     std.debug.print("sermon-agent started (db={s}, interval={d}s)\n", .{ final_db_path, interval });
 
@@ -242,14 +242,8 @@ pub fn main() !void {
             push_logs.deinit(allocator);
         }
 
-        // Open DB, write everything, close DB
+        // Write everything (storage held open across cycles)
         {
-            var storage = storage_mod.Storage.init(allocator, final_db_path) catch |err| {
-                std.debug.print("Warning: storage open failed: {}\n", .{err});
-                continue;
-            };
-            defer storage.deinit();
-
             storage.insertMetrics(now, metrics) catch |err| {
                 std.debug.print("Warning: metrics insert failed: {}\n", .{err});
             };
