@@ -452,6 +452,8 @@ pub const Storage = struct {
             std.log.err("Insert log error: {s}", .{err_msg});
             return error.QueryError;
         }
+
+        self.consecutive_insert_failures = 0;
     }
 
     pub fn getLatestMetrics(self: *Storage) !?SystemMetrics {

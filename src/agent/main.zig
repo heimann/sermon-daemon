@@ -295,10 +295,16 @@ pub fn main() !void {
                     "DuckDB inserts failed {d} cycles in a row, reconnecting",
                     .{storage.consecutive_insert_failures},
                 );
-                storage.reconnect() catch |err| {
-                    std.log.err("DuckDB reconnect failed: {}", .{err});
-                };
-                storage.consecutive_insert_failures = 0;
+                if (storage.reconnect()) |_| {
+                    storage.consecutive_insert_failures = 0;
+                } else |err| {
+                    // reconnect() tore down the old handles before failing to
+                    // open new ones; storage now holds closed handles and any
+                    // further insert would be UB. Exit cleanly so systemd
+                    // restarts us with a fresh process.
+                    std.log.err("DuckDB reconnect failed: {}, exiting for restart", .{err});
+                    running = false;
+                }
             }
         }
 
