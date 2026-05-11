@@ -287,6 +287,19 @@ pub fn main() !void {
                 };
                 retention_counter = 0;
             }
+
+            // If inserts have been failing in a row, the persistent connection is
+            // probably wedged. Tear it down and re-init.
+            if (storage.consecutive_insert_failures >= storage_mod.Storage.reconnect_failure_threshold) {
+                std.log.warn(
+                    "DuckDB inserts failed {d} cycles in a row, reconnecting",
+                    .{storage.consecutive_insert_failures},
+                );
+                storage.reconnect() catch |err| {
+                    std.log.err("DuckDB reconnect failed: {}", .{err});
+                };
+                storage.consecutive_insert_failures = 0;
+            }
         }
 
         const self_sample = proc_self_mod.sample(&self_state) catch |err| sblk: {
@@ -304,7 +317,18 @@ pub fn main() !void {
 
         if (server_url) |url| {
             if (api_key) |key| {
-                const maybe_payload = push_mod.buildPayload(allocator, hostname, now, metrics, procs, disks, push_logs.items, self_sample) catch |err| blk: {
+                const maybe_payload = push_mod.buildPayload(
+                    allocator,
+                    hostname,
+                    now,
+                    metrics,
+                    procs,
+                    disks,
+                    push_logs.items,
+                    self_sample,
+                    storage.consecutive_insert_failures,
+                    storage.dbSizeBytes(),
+                ) catch |err| blk: {
                     std.debug.print("Warning: payload build failed: {}\n", .{err});
                     break :blk null;
                 };

@@ -49,8 +49,20 @@ pub const QueryResult = struct {
 
 pub const Storage = struct {
     db: c.duckdb_database,
+    // DuckDB connections are NOT thread-safe. Single-thread-only.
     conn: c.duckdb_connection,
     allocator: std.mem.Allocator,
+    // Path the database was opened with, kept so reconnect() can re-init in place.
+    db_path: []u8,
+    read_only: bool,
+    // Counter for consecutive insert failures. The main loop checks this each
+    // cycle and calls reconnect() when it crosses reconnect_failure_threshold.
+    consecutive_insert_failures: u32 = 0,
+
+    /// After this many consecutive insert failures the daemon should reconnect
+    /// to DuckDB once. A handful of transient failures shouldn't reset the
+    /// connection; sustained failure means it's wedged.
+    pub const reconnect_failure_threshold: u32 = 5;
 
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !Storage {
         return initWithMode(allocator, db_path, false);
@@ -91,6 +103,20 @@ pub const Storage = struct {
             if (open_state == c.DuckDBError) {
                 return error.DatabaseError;
             }
+
+            // Restrict the on-disk DuckDB file to 0600 so an unprivileged user
+            // on the host can't read collected metrics/logs. Skip for in-memory
+            // and non-absolute paths. Best-effort.
+            if (!std.mem.eql(u8, db_path, ":memory:") and std.fs.path.isAbsolute(db_path)) {
+                if (std.fs.openFileAbsolute(db_path, .{})) |file| {
+                    defer file.close();
+                    file.chmod(0o600) catch |err| {
+                        std.log.warn("DuckDB chmod 0600 failed for {s}: {}", .{ db_path, err });
+                    };
+                } else |err| {
+                    std.log.warn("DuckDB chmod open failed for {s}: {}", .{ db_path, err });
+                }
+            }
         }
 
         // Create connection
@@ -100,10 +126,32 @@ pub const Storage = struct {
             return error.ConnectionError;
         }
 
+        // Bound the buffer pool. DuckDB defaults to ~80% of system RAM, which
+        // grows unboundedly under the daemon's persistent connection as inserts
+        // touch more pages. 128MB is plenty for routine inserts + the hourly
+        // retention DELETE; larger working sets spill to a temp file.
+        {
+            var pragma_result: c.duckdb_result = undefined;
+            const pragma_state = c.duckdb_query(conn, "PRAGMA memory_limit='128MB'", &pragma_result);
+            defer c.duckdb_destroy_result(&pragma_result);
+            if (pragma_state == c.DuckDBError) {
+                const err_msg = c.duckdb_result_error(&pragma_result);
+                std.log.err("DuckDB memory_limit pragma failed: {s}", .{std.mem.span(err_msg)});
+                c.duckdb_disconnect(&conn);
+                c.duckdb_close(&db);
+                return error.DatabaseError;
+            }
+        }
+
+        const db_path_owned = try allocator.dupe(u8, db_path);
+        errdefer allocator.free(db_path_owned);
+
         var storage = Storage{
             .db = db,
             .conn = conn,
             .allocator = allocator,
+            .db_path = db_path_owned,
+            .read_only = read_only,
         };
 
         // Initialize schema (skip for read-only mode)
@@ -117,6 +165,59 @@ pub const Storage = struct {
     pub fn deinit(self: *Storage) void {
         c.duckdb_disconnect(&self.conn);
         c.duckdb_close(&self.db);
+        self.allocator.free(self.db_path);
+    }
+
+    /// On-disk size of the main DuckDB file in bytes. Reads `stat` on the
+    /// `db_path`; returns 0 if the path can't be statted (in-memory DBs,
+    /// transient FS errors). The WAL and tmp/ sidecar are intentionally
+    /// excluded - the checkpoint-OOM failure mode is driven by the main
+    /// file's size, which is what alerting cares about.
+    pub fn dbSizeBytes(self: *const Storage) u64 {
+        if (std.mem.eql(u8, self.db_path, ":memory:")) return 0;
+        const stat = std.fs.cwd().statFile(self.db_path) catch return 0;
+        return stat.size;
+    }
+
+    /// Tear down the existing duckdb connection + database handle and re-open
+    /// them from `self.db_path`. Called by the main loop when consecutive
+    /// insert failures cross `reconnect_failure_threshold`. The caller should
+    /// reset `consecutive_insert_failures` after calling this so a single
+    /// re-init burst doesn't immediately re-trigger.
+    pub fn reconnect(self: *Storage) !void {
+        c.duckdb_disconnect(&self.conn);
+        c.duckdb_close(&self.db);
+
+        const c_path = try self.allocator.dupeZ(u8, self.db_path);
+        defer self.allocator.free(c_path);
+
+        var new_db: c.duckdb_database = undefined;
+        var new_conn: c.duckdb_connection = undefined;
+
+        const open_state = c.duckdb_open(c_path.ptr, &new_db);
+        if (open_state == c.DuckDBError) {
+            return error.DatabaseError;
+        }
+        errdefer c.duckdb_close(&new_db);
+
+        const conn_state = c.duckdb_connect(new_db, &new_conn);
+        if (conn_state == c.DuckDBError) {
+            return error.ConnectionError;
+        }
+        errdefer c.duckdb_disconnect(&new_conn);
+
+        // Re-apply the buffer-pool bound (matches initWithMode).
+        var pragma_result: c.duckdb_result = undefined;
+        const pragma_state = c.duckdb_query(new_conn, "PRAGMA memory_limit='128MB'", &pragma_result);
+        defer c.duckdb_destroy_result(&pragma_result);
+        if (pragma_state == c.DuckDBError) {
+            const err_msg = c.duckdb_result_error(&pragma_result);
+            std.log.err("DuckDB memory_limit pragma failed on reconnect: {s}", .{std.mem.span(err_msg)});
+            return error.DatabaseError;
+        }
+
+        self.db = new_db;
+        self.conn = new_conn;
     }
 
     fn initSchema(self: *Storage) !void {
@@ -189,6 +290,8 @@ pub const Storage = struct {
     }
 
     pub fn insertMetrics(self: *Storage, timestamp: i64, metrics: SystemMetrics) !void {
+        errdefer self.consecutive_insert_failures +|= 1;
+
         const sql = "INSERT INTO metrics VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
         var stmt: c.duckdb_prepared_statement = undefined;
@@ -218,9 +321,13 @@ pub const Storage = struct {
             std.log.err("Insert metrics error: {s}", .{err_msg});
             return error.QueryError;
         }
+
+        self.consecutive_insert_failures = 0;
     }
 
     pub fn insertProcesses(self: *Storage, timestamp: i64, procs: []const ProcessInfo) !void {
+        errdefer self.consecutive_insert_failures +|= 1;
+
         var appender: c.duckdb_appender = undefined;
         var state = c.duckdb_appender_create(self.conn, null, "processes", &appender);
         if (state == c.DuckDBError) {
@@ -254,9 +361,13 @@ pub const Storage = struct {
             std.log.err("Flush processes error: {s}", .{err});
             return error.QueryError;
         }
+
+        self.consecutive_insert_failures = 0;
     }
 
     pub fn insertDisks(self: *Storage, timestamp: i64, disks: []const DiskInfo) !void {
+        errdefer self.consecutive_insert_failures +|= 1;
+
         var appender: c.duckdb_appender = undefined;
         var state = c.duckdb_appender_create(self.conn, null, "disks", &appender);
         if (state == c.DuckDBError) {
@@ -286,9 +397,13 @@ pub const Storage = struct {
             std.log.err("Flush disks error: {s}", .{err});
             return error.QueryError;
         }
+
+        self.consecutive_insert_failures = 0;
     }
 
     pub fn insertLog(self: *Storage, entry: LogEntry) !void {
+        errdefer self.consecutive_insert_failures +|= 1;
+
         const sql = "INSERT INTO logs (timestamp, source, unit, identifier, systemd_unit, priority, message, pid) VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8)";
 
         var stmt: c.duckdb_prepared_statement = undefined;

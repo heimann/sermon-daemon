@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const proxmox_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/proxmox.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const push_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/push.zig"),
         .target = target,
@@ -35,6 +41,7 @@ pub fn build(b: *std.Build) void {
     push_mod.addImport("collector", collector_mod);
     push_mod.addImport("logs", logs_mod);
     push_mod.addImport("proc_self", proc_self_mod);
+    push_mod.addImport("proxmox", proxmox_mod);
     push_mod.addOptions("build_options", options);
 
     const storage_mod = b.createModule(.{
@@ -45,6 +52,7 @@ pub fn build(b: *std.Build) void {
     });
     storage_mod.addImport("collector", collector_mod);
     storage_mod.addImport("logs", logs_mod);
+    storage_mod.addImport("proxmox", proxmox_mod);
     storage_mod.addIncludePath(b.path("lib"));
     storage_mod.addLibraryPath(b.path("lib"));
     storage_mod.linkSystemLibrary("duckdb", .{});
@@ -59,6 +67,7 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("collector", collector_mod);
     agent_mod.addImport("logs", logs_mod);
     agent_mod.addImport("proc_self", proc_self_mod);
+    agent_mod.addImport("proxmox", proxmox_mod);
     agent_mod.addImport("push", push_mod);
     agent_mod.addImport("storage", storage_mod);
     agent_mod.addIncludePath(b.path("lib"));
@@ -109,6 +118,7 @@ pub fn build(b: *std.Build) void {
     });
     storage_test_mod.addImport("collector", collector_mod);
     storage_test_mod.addImport("logs", logs_mod);
+    storage_test_mod.addImport("proxmox", proxmox_mod);
     storage_test_mod.addIncludePath(b.path("lib"));
     storage_test_mod.addLibraryPath(b.path("lib"));
     storage_test_mod.linkSystemLibrary("duckdb", .{});
@@ -143,6 +153,7 @@ pub fn build(b: *std.Build) void {
     push_test_mod.addImport("collector", collector_mod);
     push_test_mod.addImport("logs", logs_mod);
     push_test_mod.addImport("proc_self", proc_self_mod);
+    push_test_mod.addImport("proxmox", proxmox_mod);
     push_test_mod.addOptions("build_options", options);
 
     const push_tests = b.addTest(.{
@@ -157,12 +168,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const proxmox_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agent/proxmox.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);
     test_step.dependOn(&b.addRunArtifact(collector_tests).step);
     test_step.dependOn(&b.addRunArtifact(logs_tests).step);
     test_step.dependOn(&b.addRunArtifact(push_tests).step);
     test_step.dependOn(&b.addRunArtifact(proc_self_tests).step);
+    test_step.dependOn(&b.addRunArtifact(proxmox_tests).step);
 
     // ── Bench (resource usage check) ──
     const bench = b.addSystemCommand(&.{ "bash", "bench.sh" });

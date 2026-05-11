@@ -29,6 +29,8 @@ const DaemonSelfPayload = struct {
     voluntary_ctxt_switches: u64,
     nonvoluntary_ctxt_switches: u64,
     uptime_seconds: u64,
+    consecutive_insert_failures: u32,
+    db_size_bytes: u64,
 };
 
 const MetricsPayload = struct {
@@ -87,6 +89,8 @@ pub fn buildPayload(
     disks: []const collector_mod.DiskInfo,
     log_entries: []const logs_mod.LogEntry,
     daemon_self: proc_self_mod.Sample,
+    consecutive_insert_failures: u32,
+    db_size_bytes: u64,
 ) ![]u8 {
     var sorted_procs = try allocator.dupe(collector_mod.ProcessInfo, procs);
     defer allocator.free(sorted_procs);
@@ -168,6 +172,8 @@ pub fn buildPayload(
             .voluntary_ctxt_switches = daemon_self.voluntary_ctxt_switches,
             .nonvoluntary_ctxt_switches = daemon_self.nonvoluntary_ctxt_switches,
             .uptime_seconds = daemon_self.uptime_seconds,
+            .consecutive_insert_failures = consecutive_insert_failures,
+            .db_size_bytes = db_size_bytes,
         },
     };
 
@@ -307,7 +313,7 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
         },
     };
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, testSelfSample());
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, testSelfSample(), 0, 0);
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -327,6 +333,45 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
     try std.testing.expectEqual(@as(i64, 1), daemon_self.get("threads").?.integer);
     try std.testing.expectEqual(@as(i64, 60), daemon_self.get("uptime_seconds").?.integer);
     try std.testing.expect(daemon_self.get("cpu_percent") != null);
+}
+
+test "buildPayload exposes consecutive_insert_failures and db_size_bytes" {
+    const allocator = std.testing.allocator;
+
+    const metrics = collector_mod.SystemMetrics{
+        .cpu_percent = 1.0,
+        .cpu_user = 1.0,
+        .cpu_system = 0.0,
+        .cpu_iowait = 0.0,
+        .mem_total = 16_000,
+        .mem_used = 8_000,
+        .mem_percent = 50.0,
+        .swap_total = 2_000,
+        .swap_used = 100,
+    };
+    const procs = [_]collector_mod.ProcessInfo{};
+    const disks = [_]collector_mod.DiskInfo{};
+
+    const payload = try buildPayload(
+        allocator,
+        "host-a",
+        1_739_443_200,
+        metrics,
+        &procs,
+        &disks,
+        &.{},
+        testSelfSample(),
+        7,
+        1_234_567,
+    );
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const daemon_self = parsed.value.object.get("daemon_self").?.object;
+    try std.testing.expectEqual(@as(i64, 7), daemon_self.get("consecutive_insert_failures").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_234_567), daemon_self.get("db_size_bytes").?.integer);
 }
 
 test "buildPayload includes capped truncated logs" {
@@ -364,7 +409,7 @@ test "buildPayload includes capped truncated logs" {
         };
     }
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, testSelfSample());
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, testSelfSample(), 0, 0);
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
