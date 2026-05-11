@@ -185,9 +185,6 @@ pub const Storage = struct {
     /// reset `consecutive_insert_failures` after calling this so a single
     /// re-init burst doesn't immediately re-trigger.
     pub fn reconnect(self: *Storage) !void {
-        c.duckdb_disconnect(&self.conn);
-        c.duckdb_close(&self.db);
-
         const c_path = try self.allocator.dupeZ(u8, self.db_path);
         defer self.allocator.free(c_path);
 
@@ -216,8 +213,24 @@ pub const Storage = struct {
             return error.DatabaseError;
         }
 
+        var replacement = Storage{
+            .db = new_db,
+            .conn = new_conn,
+            .allocator = self.allocator,
+            .db_path = self.db_path,
+            .read_only = self.read_only,
+            .consecutive_insert_failures = self.consecutive_insert_failures,
+        };
+        if (!replacement.read_only) {
+            try replacement.initSchema();
+        }
+
+        var old_conn = self.conn;
+        var old_db = self.db;
         self.db = new_db;
         self.conn = new_conn;
+        c.duckdb_disconnect(&old_conn);
+        c.duckdb_close(&old_db);
     }
 
     fn initSchema(self: *Storage) !void {
@@ -858,6 +871,56 @@ test "Storage: init and schema creation" {
 
         try std.testing.expect(state == c.DuckDBSuccess);
     }
+}
+
+test "Storage: failed reconnect leaves existing handles usable" {
+    const allocator = std.testing.allocator;
+    var storage = try Storage.init(allocator, ":memory:");
+    defer storage.deinit();
+
+    const original_path = storage.db_path;
+    const bad_path = try allocator.dupe(u8, "/nonexistent/sermon-daemon-test/db.duckdb");
+    storage.db_path = bad_path;
+    defer {
+        allocator.free(storage.db_path);
+        storage.db_path = original_path;
+    }
+
+    try std.testing.expectError(error.DatabaseError, storage.reconnect());
+
+    const metrics = SystemMetrics{
+        .cpu_percent = 45.5,
+        .cpu_user = 30.2,
+        .cpu_system = 15.3,
+        .cpu_iowait = 2.5,
+        .mem_total = 16000000000,
+        .mem_used = 8000000000,
+        .mem_percent = 50.0,
+        .swap_total = 4000000000,
+        .swap_used = 1000000000,
+    };
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+}
+
+test "Storage: reconnect initializes schema on fresh database" {
+    const allocator = std.testing.allocator;
+    var storage = try Storage.init(allocator, ":memory:");
+    defer storage.deinit();
+
+    try storage.reconnect();
+
+    const metrics = SystemMetrics{
+        .cpu_percent = 45.5,
+        .cpu_user = 30.2,
+        .cpu_system = 15.3,
+        .cpu_iowait = 2.5,
+        .mem_total = 16000000000,
+        .mem_used = 8000000000,
+        .mem_percent = 50.0,
+        .swap_total = 4000000000,
+        .swap_used = 1000000000,
+    };
+    try storage.insertMetrics(std.time.timestamp(), metrics);
 }
 
 test "Storage: insert and retrieve metrics" {

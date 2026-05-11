@@ -298,10 +298,8 @@ pub fn main() !void {
                 if (storage.reconnect()) |_| {
                     storage.consecutive_insert_failures = 0;
                 } else |err| {
-                    // reconnect() tore down the old handles before failing to
-                    // open new ones; storage now holds closed handles and any
-                    // further insert would be UB. Exit cleanly so systemd
-                    // restarts us with a fresh process.
+                    // Keep trying through systemd rather than continuing to
+                    // sample into a storage layer that could not be refreshed.
                     std.log.err("DuckDB reconnect failed: {}, exiting for restart", .{err});
                     running = false;
                 }
