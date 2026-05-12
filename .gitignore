@@ -16,3 +16,6 @@ test_io
 
 # Editor/OS
 .DS_Store
+
+# Local worktrees
+.worktrees/
