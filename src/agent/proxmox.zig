@@ -496,6 +496,150 @@ fn dupCapped(allocator: Allocator, s: []const u8) ![]u8 {
     return allocator.dupe(u8, capped);
 }
 
+// ============================================================================
+// Per-container metrics (cgroup v2)
+// ============================================================================
+//
+// V1 minimum: cpu_pct, mem_current, mem_max. PSI/OOM/IO/PIDs deferred to a
+// follow-up - the dashboard panel only needs CPU + memory to surface "this
+// container is hot." The richer signals are valuable but easier to add once
+// John tells us which questions he's actually asking.
+
+pub const ContainerMetrics = struct {
+    vmid: u32,
+    /// CPU% over the interval since the previous sample. NaN if no prior
+    /// sample exists for this vmid (first cycle after CT start, or daemon
+    /// restart). Computed from cpu.stat:usage_usec deltas vs wall-clock.
+    cpu_pct: f64,
+    /// Bytes currently used (memory.current).
+    mem_current: u64,
+    /// Memory limit in bytes (memory.max). null when set to "max" - common
+    /// for unprivileged CTs without a cgroup memory limit.
+    mem_max: ?u64,
+};
+
+/// Holds the previous sample for each running container so cpu_pct can be
+/// computed as a delta. Keyed by vmid; entries for stopped/removed CTs age
+/// out naturally because we only insert when a container shows up in the
+/// current cycle.
+pub const ContainerMetricsState = struct {
+    prev: std.AutoHashMap(u32, PrevSample),
+
+    const PrevSample = struct {
+        cpu_usage_usec: u64,
+        wall_ns: i128,
+    };
+
+    pub fn init(allocator: Allocator) ContainerMetricsState {
+        return .{ .prev = std.AutoHashMap(u32, PrevSample).init(allocator) };
+    }
+
+    pub fn deinit(self: *ContainerMetricsState) void {
+        self.prev.deinit();
+    }
+};
+
+/// Read per-container metrics for every running container in `containers`.
+/// Stopped containers contribute no row (their cgroup files don't exist).
+/// Caller owns the returned slice.
+pub fn collectContainerMetrics(
+    allocator: Allocator,
+    state: *ContainerMetricsState,
+    containers: []const ContainerEntry,
+) ![]ContainerMetrics {
+    var out = std.ArrayList(ContainerMetrics){};
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, containers.len);
+
+    const now_ns = std.time.nanoTimestamp();
+
+    for (containers) |entry| {
+        if (!std.mem.eql(u8, entry.status, "running")) continue;
+
+        var path_buf: [128]u8 = undefined;
+
+        const cpu_usec = readCgroupCpuUsageUsec(&path_buf, entry.vmid) catch continue;
+        const mem_current = readCgroupSingleU64(&path_buf, entry.vmid, "memory.current") catch continue;
+        const mem_max = readCgroupMemoryMax(&path_buf, entry.vmid) catch null;
+
+        const cpu_pct: f64 = if (state.prev.get(entry.vmid)) |prev| blk: {
+            const usec_delta = if (cpu_usec >= prev.cpu_usage_usec)
+                cpu_usec - prev.cpu_usage_usec
+            else
+                0; // counter wrap or restart - treat as no delta this cycle
+            const ns_delta = now_ns - prev.wall_ns;
+            if (ns_delta <= 0) break :blk std.math.nan(f64);
+            // usec_delta / (ns_delta/1000) gives CPU-usec per wall-usec, *100
+            // for percent. A single fully-pinned core reads as 100%; a
+            // 4-vCPU CT pinned across all cores reads as 400%.
+            const wall_usec: f64 = @as(f64, @floatFromInt(ns_delta)) / 1000.0;
+            break :blk @as(f64, @floatFromInt(usec_delta)) / wall_usec * 100.0;
+        } else std.math.nan(f64);
+
+        try state.prev.put(entry.vmid, .{
+            .cpu_usage_usec = cpu_usec,
+            .wall_ns = now_ns,
+        });
+
+        try out.append(allocator, .{
+            .vmid = entry.vmid,
+            .cpu_pct = cpu_pct,
+            .mem_current = mem_current,
+            .mem_max = mem_max,
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Read /sys/fs/cgroup/lxc/<vmid>/cpu.stat and parse the `usage_usec` line.
+/// Cgroup v2 file format: `key value\n` per line.
+fn readCgroupCpuUsageUsec(path_buf: []u8, vmid: u32) !u64 {
+    const path = try std.fmt.bufPrint(path_buf, "/sys/fs/cgroup/lxc/{d}/cpu.stat", .{vmid});
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var content_buf: [4096]u8 = undefined;
+    const n = try file.readAll(&content_buf);
+
+    var lines = std.mem.tokenizeScalar(u8, content_buf[0..n], '\n');
+    while (lines.next()) |line| {
+        var parts = std.mem.tokenizeScalar(u8, line, ' ');
+        const key = parts.next() orelse continue;
+        if (!std.mem.eql(u8, key, "usage_usec")) continue;
+        const val_str = parts.next() orelse continue;
+        return std.fmt.parseInt(u64, val_str, 10) catch continue;
+    }
+    return error.UsageUsecNotFound;
+}
+
+/// Read a cgroup file containing a single u64 (e.g. memory.current).
+fn readCgroupSingleU64(path_buf: []u8, vmid: u32, leaf: []const u8) !u64 {
+    const path = try std.fmt.bufPrint(path_buf, "/sys/fs/cgroup/lxc/{d}/{s}", .{ vmid, leaf });
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var content_buf: [64]u8 = undefined;
+    const n = try file.readAll(&content_buf);
+    const trimmed = std.mem.trim(u8, content_buf[0..n], " \n\t\r");
+    return std.fmt.parseInt(u64, trimmed, 10);
+}
+
+/// memory.max is either a u64 byte count or the literal "max" (unlimited,
+/// the default for unprivileged LXCs without a memory limit). Return null
+/// for "max" so the dashboard can render "no limit" rather than U64_MAX.
+fn readCgroupMemoryMax(path_buf: []u8, vmid: u32) !?u64 {
+    const path = try std.fmt.bufPrint(path_buf, "/sys/fs/cgroup/lxc/{d}/memory.max", .{vmid});
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var content_buf: [64]u8 = undefined;
+    const n = try file.readAll(&content_buf);
+    const trimmed = std.mem.trim(u8, content_buf[0..n], " \n\t\r");
+    if (std.mem.eql(u8, trimmed, "max")) return null;
+    return try std.fmt.parseInt(u64, trimmed, 10);
+}
+
 fn jsonString(v: ?std.json.Value) ?[]const u8 {
     const val = v orelse return null;
     return switch (val) {

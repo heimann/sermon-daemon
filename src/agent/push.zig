@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const collector_mod = @import("collector");
 const logs_mod = @import("logs");
 const proc_self_mod = @import("proc_self");
+const proxmox_mod = @import("proxmox");
 
 const Allocator = std.mem.Allocator;
 
@@ -19,6 +20,44 @@ const Payload = struct {
     logs: []const LogPayload,
     log_stats: LogStatsPayload,
     daemon_self: DaemonSelfPayload,
+    runtime: RuntimePayload,
+    containers: []const ContainerPayload,
+    container_metrics: []const ContainerMetricPayload,
+};
+
+// Runtime context for the host emitting this payload. `kind` discriminates
+// the rest of the fields. Hosted side can branch on `kind` to decide whether
+// to render Proxmox-specific UI (host badge, containers panel) or treat the
+// host as a plain Linux box. New `kind` values can be added without breaking
+// older hosted versions; they'll just render as plain Linux until the hosted
+// schema catches up.
+const RuntimePayload = struct {
+    kind: []const u8, // "not_proxmox" | "proxmox_host" | "proxmox_container"
+    node: ?[]const u8 = null, // proxmox_host: cluster node name
+    version: ?[]const u8 = null, // proxmox_host: pveversion line
+    vmid: ?u32 = null, // proxmox_container: container's vmid in the host's PVE
+};
+
+const ContainerPayload = struct {
+    vmid: u32,
+    name: []const u8,
+    node: []const u8,
+    type: []const u8, // "lxc" | "qemu"
+    status: []const u8, // "running" | "stopped" | "paused" | ...
+    maxmem: u64,
+    maxcpu: f64,
+    uptime: u64,
+};
+
+// Per-container point-in-time metrics. cpu_pct is null for the first cycle
+// after a CT appears (no prior delta); mem_max is null when the CT has no
+// memory limit (cgroup memory.max == "max"). Hosted side renders nulls as
+// "no data yet" / "unlimited" rather than 0.
+const ContainerMetricPayload = struct {
+    vmid: u32,
+    cpu_pct: ?f64,
+    mem_current: u64,
+    mem_max: ?u64,
 };
 
 const DaemonSelfPayload = struct {
@@ -91,6 +130,9 @@ pub fn buildPayload(
     daemon_self: proc_self_mod.Sample,
     consecutive_insert_failures: u32,
     db_size_bytes: u64,
+    runtime: proxmox_mod.Runtime,
+    containers: []const proxmox_mod.ContainerEntry,
+    container_metrics: []const proxmox_mod.ContainerMetrics,
 ) ![]u8 {
     var sorted_procs = try allocator.dupe(collector_mod.ProcessInfo, procs);
     defer allocator.free(sorted_procs);
@@ -141,6 +183,40 @@ pub fn buildPayload(
     const uploaded_logs = selectLogsForUpload(payload_logs, log_entries);
     const dropped_logs = log_entries.len - uploaded_logs.len;
 
+    const runtime_payload: RuntimePayload = switch (runtime) {
+        .not_proxmox => .{ .kind = "not_proxmox" },
+        .host => |h| .{ .kind = "proxmox_host", .node = h.node, .version = h.runtime_version },
+        .container => |ct| .{ .kind = "proxmox_container", .vmid = ct.vmid },
+    };
+
+    const payload_containers = try allocator.alloc(ContainerPayload, containers.len);
+    defer allocator.free(payload_containers);
+
+    for (payload_containers, containers) |*dest, src| {
+        dest.* = .{
+            .vmid = src.vmid,
+            .name = src.name,
+            .node = src.node,
+            .type = src.type,
+            .status = src.status,
+            .maxmem = src.maxmem,
+            .maxcpu = src.maxcpu,
+            .uptime = src.uptime,
+        };
+    }
+
+    const payload_ct_metrics = try allocator.alloc(ContainerMetricPayload, container_metrics.len);
+    defer allocator.free(payload_ct_metrics);
+
+    for (payload_ct_metrics, container_metrics) |*dest, src| {
+        dest.* = .{
+            .vmid = src.vmid,
+            .cpu_pct = if (std.math.isNan(src.cpu_pct)) null else src.cpu_pct,
+            .mem_current = src.mem_current,
+            .mem_max = src.mem_max,
+        };
+    }
+
     const payload = Payload{
         .hostname = hostname,
         .daemon_version = build_options.version,
@@ -175,6 +251,9 @@ pub fn buildPayload(
             .consecutive_insert_failures = consecutive_insert_failures,
             .db_size_bytes = db_size_bytes,
         },
+        .runtime = runtime_payload,
+        .containers = payload_containers,
+        .container_metrics = payload_ct_metrics,
     };
 
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(payload, .{})});
@@ -313,7 +392,7 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
         },
     };
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, testSelfSample(), 0, 0);
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -363,6 +442,9 @@ test "buildPayload exposes consecutive_insert_failures and db_size_bytes" {
         testSelfSample(),
         7,
         1_234_567,
+        .not_proxmox,
+        &.{},
+        &.{},
     );
     defer allocator.free(payload);
 
@@ -409,7 +491,7 @@ test "buildPayload includes capped truncated logs" {
         };
     }
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, testSelfSample(), 0, 0);
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -427,6 +509,103 @@ test "buildPayload includes capped truncated logs" {
     try std.testing.expectEqual(@as(i64, 101), root.get("log_stats").?.object.get("seen").?.integer);
     try std.testing.expectEqual(@as(i64, 20), root.get("log_stats").?.object.get("uploaded").?.integer);
     try std.testing.expectEqual(@as(i64, 81), root.get("log_stats").?.object.get("dropped").?.integer);
+}
+
+test "buildPayload emits proxmox_host runtime block + containers array" {
+    const allocator = std.testing.allocator;
+
+    const metrics = collector_mod.SystemMetrics{
+        .cpu_percent = 1.0,
+        .cpu_user = 1.0,
+        .cpu_system = 0.0,
+        .cpu_iowait = 0.0,
+        .mem_total = 16_000,
+        .mem_used = 8_000,
+        .mem_percent = 50.0,
+        .swap_total = 2_000,
+        .swap_used = 100,
+    };
+    const procs = [_]collector_mod.ProcessInfo{};
+    const disks = [_]collector_mod.DiskInfo{};
+
+    const runtime = proxmox_mod.Runtime{
+        .host = .{ .node = "aniara", .runtime_version = "pve-manager/9.1.1/abc" },
+    };
+    const containers = [_]proxmox_mod.ContainerEntry{
+        .{
+            .vmid = 100,
+            .name = "docker",
+            .node = "aniara",
+            .type = "lxc",
+            .status = "running",
+            .maxmem = 8_589_934_592,
+            .maxcpu = 4.0,
+            .uptime = 11_335_313,
+        },
+        .{
+            .vmid = 103,
+            .name = "clawdbot",
+            .node = "aniara",
+            .type = "lxc",
+            .status = "stopped",
+            .maxmem = 2_147_483_648,
+            .maxcpu = 2.0,
+            .uptime = 0,
+        },
+    };
+
+    // Per-CT metrics: one running CT with both fields, one with NaN cpu_pct
+    // (first cycle, no prior delta) to verify the null serialization path.
+    const ct_metrics = [_]proxmox_mod.ContainerMetrics{
+        .{ .vmid = 100, .cpu_pct = 12.5, .mem_current = 2_500_000_000, .mem_max = 8_589_934_592 },
+        .{ .vmid = 101, .cpu_pct = std.math.nan(f64), .mem_current = 100_000_000, .mem_max = null },
+    };
+
+    const payload = try buildPayload(
+        allocator,
+        "aniara",
+        1_739_443_200,
+        metrics,
+        &procs,
+        &disks,
+        &.{},
+        testSelfSample(),
+        0,
+        0,
+        runtime,
+        &containers,
+        &ct_metrics,
+    );
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    const runtime_obj = root.get("runtime").?.object;
+    try std.testing.expectEqualStrings("proxmox_host", runtime_obj.get("kind").?.string);
+    try std.testing.expectEqualStrings("aniara", runtime_obj.get("node").?.string);
+    try std.testing.expectEqualStrings("pve-manager/9.1.1/abc", runtime_obj.get("version").?.string);
+
+    const ct_array = root.get("containers").?.array;
+    try std.testing.expectEqual(@as(usize, 2), ct_array.items.len);
+    const first = ct_array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 100), first.get("vmid").?.integer);
+    try std.testing.expectEqualStrings("docker", first.get("name").?.string);
+    try std.testing.expectEqualStrings("lxc", first.get("type").?.string);
+    try std.testing.expectEqualStrings("running", first.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 8_589_934_592), first.get("maxmem").?.integer);
+
+    const ctm_array = root.get("container_metrics").?.array;
+    try std.testing.expectEqual(@as(usize, 2), ctm_array.items.len);
+    const m_first = ctm_array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 100), m_first.get("vmid").?.integer);
+    try std.testing.expectEqual(@as(f64, 12.5), m_first.get("cpu_pct").?.float);
+    try std.testing.expectEqual(@as(i64, 2_500_000_000), m_first.get("mem_current").?.integer);
+    const m_second = ctm_array.items[1].object;
+    try std.testing.expectEqual(std.json.Value.null, m_second.get("cpu_pct").?);
+    try std.testing.expectEqual(std.json.Value.null, m_second.get("mem_max").?);
 }
 
 test "buildIngestUrl trims trailing slash" {
