@@ -2,6 +2,7 @@ const std = @import("std");
 const collector_mod = @import("collector");
 const logs_mod = @import("logs");
 const proc_self_mod = @import("proc_self");
+const proxmox_mod = @import("proxmox");
 const push_mod = @import("push");
 const storage_mod = @import("storage");
 
@@ -177,6 +178,23 @@ pub fn main() !void {
     const hostname = try readHostname(allocator);
     defer allocator.free(hostname);
 
+    // Detect Proxmox runtime context. Held across the loop so per-cycle code
+    // (inventory in V1 item 2, per-CT metrics in item 3) can branch on it
+    // without re-shelling out to pveversion / re-reading /proc/self/cgroup.
+    var runtime = proxmox_mod.detectRuntime(allocator);
+    defer runtime.deinit(allocator);
+    switch (runtime) {
+        .not_proxmox => {},
+        .host => |h| std.debug.print(
+            "proxmox.detect: host node={s} runtime_version={s}\n",
+            .{ h.node, h.runtime_version },
+        ),
+        .container => |c| std.debug.print(
+            "proxmox.detect: container vmid={d}\n",
+            .{c.vmid},
+        ),
+    }
+
     // Initialize log tailer (systemd journal)
     const log_sources = [_]logs_mod.LogSource{.systemd};
     var log_tailer: ?logs_mod.LogTailer = null;
@@ -202,6 +220,8 @@ pub fn main() !void {
 
     var retention_counter: u64 = 0;
     var self_state = proc_self_mod.State.init();
+    var ct_metrics_state = proxmox_mod.ContainerMetricsState.init(allocator);
+    defer ct_metrics_state.deinit();
 
     // Main collection loop
     while (running) {
@@ -236,6 +256,35 @@ pub fn main() !void {
             allocator.free(disks);
         }
 
+        // Container inventory: only on Proxmox hosts. Failures are non-fatal
+        // and intentionally not warning-logged per cycle (would spam the
+        // journal on a wedged Corosync ring); empty slice means "skip
+        // containers this cycle, hosted side will keep last-known rows."
+        const containers: []proxmox_mod.ContainerEntry = blk: {
+            switch (runtime) {
+                .host => {
+                    break :blk proxmox_mod.collectInventory(allocator) catch |err| inv_err: {
+                        std.log.warn("proxmox.inventory: collection failed: {}", .{err});
+                        break :inv_err &[_]proxmox_mod.ContainerEntry{};
+                    };
+                },
+                else => break :blk &[_]proxmox_mod.ContainerEntry{},
+            }
+        };
+        defer if (containers.len > 0) proxmox_mod.freeContainers(allocator, containers);
+
+        // Per-container CPU/memory metrics. Only populated when we have a
+        // running container; first cycle for each new CT yields cpu_pct=NaN
+        // (no prior delta), serialized as JSON null downstream.
+        const ct_metrics: []proxmox_mod.ContainerMetrics = if (containers.len > 0)
+            proxmox_mod.collectContainerMetrics(allocator, &ct_metrics_state, containers) catch |err| ctm_err: {
+                std.log.warn("proxmox.container_metrics: collection failed: {}", .{err});
+                break :ctm_err &[_]proxmox_mod.ContainerMetrics{};
+            }
+        else
+            &[_]proxmox_mod.ContainerMetrics{};
+        defer if (ct_metrics.len > 0) allocator.free(ct_metrics);
+
         var push_logs = std.ArrayList(logs_mod.LogEntry){};
         defer {
             for (push_logs.items) |*entry| {
@@ -257,6 +306,16 @@ pub fn main() !void {
             if (disks.len > 0) {
                 storage.insertDisks(now, disks) catch |err| {
                     std.debug.print("Warning: disk insert failed: {}\n", .{err});
+                };
+            }
+            if (containers.len > 0) {
+                storage.insertContainers(now, containers) catch |err| {
+                    std.debug.print("Warning: container insert failed: {}\n", .{err});
+                };
+            }
+            if (ct_metrics.len > 0) {
+                storage.insertContainerMetrics(now, ct_metrics) catch |err| {
+                    std.debug.print("Warning: container_metrics insert failed: {}\n", .{err});
                 };
             }
 
@@ -332,6 +391,9 @@ pub fn main() !void {
                     self_sample,
                     storage.consecutive_insert_failures,
                     storage.dbSizeBytes(),
+                    runtime,
+                    containers,
+                    ct_metrics,
                 ) catch |err| blk: {
                     std.debug.print("Warning: payload build failed: {}\n", .{err});
                     break :blk null;

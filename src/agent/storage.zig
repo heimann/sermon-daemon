@@ -8,11 +8,14 @@ const c = @cImport({
 // Import types from other modules (named modules via build.zig)
 const collector = @import("collector");
 const logs = @import("logs");
+const proxmox = @import("proxmox");
 
 pub const SystemMetrics = collector.SystemMetrics;
 pub const ProcessInfo = collector.ProcessInfo;
 pub const DiskInfo = collector.DiskInfo;
 pub const LogEntry = logs.LogEntry;
+pub const ContainerEntry = proxmox.ContainerEntry;
+pub const ContainerMetrics = proxmox.ContainerMetrics;
 
 pub const StorageError = error{
     DatabaseError,
@@ -289,6 +292,30 @@ pub const Storage = struct {
             \\CREATE INDEX IF NOT EXISTS idx_logs_identifier ON logs(identifier);
             \\CREATE INDEX IF NOT EXISTS idx_logs_systemd_unit ON logs(systemd_unit);
             \\CREATE INDEX IF NOT EXISTS idx_logs_priority ON logs(priority);
+            \\
+            \\CREATE TABLE IF NOT EXISTS containers (
+            \\  timestamp TIMESTAMP NOT NULL,
+            \\  vmid INTEGER NOT NULL,
+            \\  name VARCHAR,
+            \\  node VARCHAR,
+            \\  type VARCHAR,
+            \\  status VARCHAR,
+            \\  maxmem BIGINT,
+            \\  maxcpu DOUBLE,
+            \\  uptime BIGINT
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_containers_ts ON containers(timestamp);
+            \\CREATE INDEX IF NOT EXISTS idx_containers_vmid ON containers(vmid);
+            \\
+            \\CREATE TABLE IF NOT EXISTS container_metrics (
+            \\  timestamp TIMESTAMP NOT NULL,
+            \\  vmid INTEGER NOT NULL,
+            \\  cpu_pct DOUBLE,
+            \\  mem_current BIGINT,
+            \\  mem_max BIGINT
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_container_metrics_ts ON container_metrics(timestamp);
+            \\CREATE INDEX IF NOT EXISTS idx_container_metrics_vmid ON container_metrics(vmid);
         ;
 
         var result: c.duckdb_result = undefined;
@@ -408,6 +435,91 @@ pub const Storage = struct {
         if (state == c.DuckDBError) {
             const err = c.duckdb_appender_error(appender);
             std.log.err("Flush disks error: {s}", .{err});
+            return error.QueryError;
+        }
+
+        self.consecutive_insert_failures = 0;
+    }
+
+    pub fn insertContainers(self: *Storage, timestamp: i64, containers: []const ContainerEntry) !void {
+        errdefer self.consecutive_insert_failures +|= 1;
+
+        var appender: c.duckdb_appender = undefined;
+        var state = c.duckdb_appender_create(self.conn, null, "containers", &appender);
+        if (state == c.DuckDBError) {
+            return error.QueryError;
+        }
+        defer _ = c.duckdb_appender_destroy(&appender);
+
+        for (containers) |entry| {
+            _ = c.duckdb_append_timestamp(appender, .{ .micros = timestamp * 1000000 });
+            _ = c.duckdb_append_uint32(appender, entry.vmid);
+            _ = c.duckdb_append_varchar_length(appender, entry.name.ptr, entry.name.len);
+            _ = c.duckdb_append_varchar_length(appender, entry.node.ptr, entry.node.len);
+            _ = c.duckdb_append_varchar_length(appender, entry.type.ptr, entry.type.len);
+            _ = c.duckdb_append_varchar_length(appender, entry.status.ptr, entry.status.len);
+            _ = c.duckdb_append_uint64(appender, entry.maxmem);
+            _ = c.duckdb_append_double(appender, entry.maxcpu);
+            _ = c.duckdb_append_uint64(appender, entry.uptime);
+
+            state = c.duckdb_appender_end_row(appender);
+            if (state == c.DuckDBError) {
+                const err = c.duckdb_appender_error(appender);
+                std.log.err("Append container row error: {s}", .{err});
+                return error.QueryError;
+            }
+        }
+
+        state = c.duckdb_appender_flush(appender);
+        if (state == c.DuckDBError) {
+            const err = c.duckdb_appender_error(appender);
+            std.log.err("Flush containers error: {s}", .{err});
+            return error.QueryError;
+        }
+
+        self.consecutive_insert_failures = 0;
+    }
+
+    pub fn insertContainerMetrics(self: *Storage, timestamp: i64, samples: []const ContainerMetrics) !void {
+        errdefer self.consecutive_insert_failures +|= 1;
+
+        var appender: c.duckdb_appender = undefined;
+        var state = c.duckdb_appender_create(self.conn, null, "container_metrics", &appender);
+        if (state == c.DuckDBError) {
+            return error.QueryError;
+        }
+        defer _ = c.duckdb_appender_destroy(&appender);
+
+        for (samples) |sample| {
+            _ = c.duckdb_append_timestamp(appender, .{ .micros = timestamp * 1000000 });
+            _ = c.duckdb_append_uint32(appender, sample.vmid);
+            // NaN sentinel = first cycle for this CT, no delta yet. Persist
+            // as NULL so the dashboard doesn't render a misleading 0% spike
+            // when a CT first appears.
+            if (std.math.isNan(sample.cpu_pct)) {
+                _ = c.duckdb_append_null(appender);
+            } else {
+                _ = c.duckdb_append_double(appender, sample.cpu_pct);
+            }
+            _ = c.duckdb_append_uint64(appender, sample.mem_current);
+            if (sample.mem_max) |m| {
+                _ = c.duckdb_append_uint64(appender, m);
+            } else {
+                _ = c.duckdb_append_null(appender);
+            }
+
+            state = c.duckdb_appender_end_row(appender);
+            if (state == c.DuckDBError) {
+                const err = c.duckdb_appender_error(appender);
+                std.log.err("Append container_metric row error: {s}", .{err});
+                return error.QueryError;
+            }
+        }
+
+        state = c.duckdb_appender_flush(appender);
+        if (state == c.DuckDBError) {
+            const err = c.duckdb_appender_error(appender);
+            std.log.err("Flush container_metrics error: {s}", .{err});
             return error.QueryError;
         }
 
@@ -825,7 +937,7 @@ pub const Storage = struct {
     }
 
     pub fn runRetention(self: *Storage, max_age_seconds: i64) !void {
-        const tables = [_][]const u8{ "metrics", "processes", "disks", "logs" };
+        const tables = [_][]const u8{ "metrics", "processes", "disks", "logs", "containers", "container_metrics" };
 
         for (tables) |table| {
             const sql = try std.fmt.allocPrint(
@@ -857,7 +969,7 @@ test "Storage: init and schema creation" {
     defer storage.deinit();
 
     // Verify tables exist by querying them
-    const tables = [_][]const u8{ "metrics", "processes", "disks", "logs" };
+    const tables = [_][]const u8{ "metrics", "processes", "disks", "logs", "containers", "container_metrics" };
     for (tables) |table| {
         const sql = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}", .{table});
         defer allocator.free(sql);
