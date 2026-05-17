@@ -142,7 +142,7 @@ const JournalTailer = struct {
 
     pub fn init(allocator: Allocator) !JournalTailer {
         var process = ChildProcess.init(&[_][]const u8{
-            "journalctl",
+            "/usr/bin/journalctl",
             "-f", // follow
             "-o", "json", // JSON output
             "--since", "now", // only new entries
