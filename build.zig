@@ -21,6 +21,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const rules_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/rules.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rules_mod.addImport("logs", logs_mod);
+
     const proc_self_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/proc_self.zig"),
         .target = target,
@@ -40,6 +47,7 @@ pub fn build(b: *std.Build) void {
     });
     push_mod.addImport("collector", collector_mod);
     push_mod.addImport("logs", logs_mod);
+    push_mod.addImport("rules", rules_mod);
     push_mod.addImport("proc_self", proc_self_mod);
     push_mod.addImport("proxmox", proxmox_mod);
     push_mod.addOptions("build_options", options);
@@ -66,6 +74,7 @@ pub fn build(b: *std.Build) void {
     });
     agent_mod.addImport("collector", collector_mod);
     agent_mod.addImport("logs", logs_mod);
+    agent_mod.addImport("rules", rules_mod);
     agent_mod.addImport("proc_self", proc_self_mod);
     agent_mod.addImport("proxmox", proxmox_mod);
     agent_mod.addImport("push", push_mod);
@@ -163,6 +172,7 @@ pub fn build(b: *std.Build) void {
     });
     push_test_mod.addImport("collector", collector_mod);
     push_test_mod.addImport("logs", logs_mod);
+    push_test_mod.addImport("rules", rules_mod);
     push_test_mod.addImport("proc_self", proc_self_mod);
     push_test_mod.addImport("proxmox", proxmox_mod);
     push_test_mod.addOptions("build_options", options);
