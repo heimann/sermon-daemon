@@ -3,32 +3,36 @@
 # ///
 """Analyze a sermon-agent RSS sample series for buffer-pool / heap leaks.
 
-Usage: analyze_rss.py <samples_csv> <warmup_cycles> <ceiling_mb> [slope_kb_per_cycle]
+Usage: analyze_rss.py <samples_csv> <warmup_cycles> <ceiling_mb> [slope_kb_per_sample]
 
-  samples_csv:        one "<cycle>,<rss_kb>" line per collection cycle, as
-                      written by buffer_pool_soak.sh
-  warmup_cycles:      leading cycles to drop before the slope is measured.
-                      The DuckDB buffer pool warms for hundreds of cycles;
-                      its slope during warmup is not a leak.
-  ceiling_mb:         coarse, mode-specific safety net. Peak RSS over the
-                      whole run must stay below this. Catches a gross
-                      runaway only - the slope is the precise gate.
-  slope_kb_per_cycle: the regression gate. If given, the linear slope of
-                      the post-warmup region must stay below it. Omit (or
-                      pass a negative value) to report the slope only.
+  samples_csv:         one "<n>,<rss_kb>" line per RSS sample (the sampler
+                       takes one sample per ~1s, written by
+                       buffer_pool_soak.sh). The sampler and the daemon's
+                       collection loop are not phase-locked, so a sample is
+                       not exactly one collection cycle - it is one
+                       ~1s-spaced reading.
+  warmup_cycles:       leading samples to drop before the slope is measured.
+                       The DuckDB buffer pool warms for hundreds of samples;
+                       its slope during warmup is not a leak.
+  ceiling_mb:          coarse, mode-specific safety net. Peak RSS over the
+                       whole run must stay below this. Catches a gross
+                       runaway only - the slope is the precise gate.
+  slope_kb_per_sample: the regression gate. If given, the linear slope of
+                       the post-warmup region must stay below it. Omit (or
+                       pass a negative value) to report the slope only.
 
 Why the slope is the gate, not an absolute ceiling:
 
   The daemon bounds DuckDB's working set with PRAGMA memory_limit='128MB',
   but that pragma governs DuckDB's buffer manager, not process RSS. RSS
   also carries allocator overhead and pages glibc has not returned to the
-  OS. Measured over a 2600-cycle clean run, RSS climbs the whole time -
-  from ~42 MB past 200 MB - and never plateaus. So there is no flat
-  steady-state RSS to anchor an absolute ceiling against.
+  OS. In a single 2600-cycle clean run (n=1), RSS climbed the whole time -
+  from ~42 MB past 200 MB - and never plateaued. So there is no observed
+  flat steady-state RSS to anchor an absolute ceiling against.
 
   What is stable is the post-warmup *slope*: once the buffer pool has
-  warmed, clean code rises at a measured ~40-61 KB/cycle. A genuine leak -
-  the PR #96 buffer-pool leak that grew RSS ~5-9 MB/hour - adds a per-cycle
+  warmed, clean code rises at a measured ~40-61 KB/sample. A genuine leak -
+  the PR #96 buffer-pool leak that grew RSS ~5-9 MB/hour - adds a per-sample
   increment on top of that, so it shows up as a steeper slope. The bench
   fails when the post-warmup slope exceeds a threshold set well above the
   measured clean-code slope.
@@ -93,14 +97,22 @@ def main(argv: list[str]) -> int:
 
     peak_kb = max(rss)
     measured = rss[warmup_cycles:]
-    slope = linfit_slope(measured)  # KB per cycle
-    first_mb = sum(measured[: len(measured) // 4]) / (len(measured) // 4) / 1024
-    last_mb = sum(measured[-len(measured) // 4 :]) / (len(measured) // 4) / 1024
+    if len(measured) < 4:
+        print(
+            f"FAIL: only {len(measured)} post-warmup samples, need >= 4 to "
+            f"compute the first/last bands",
+            file=sys.stderr,
+        )
+        return 2
+    slope = linfit_slope(measured)  # KB per sample
+    q = len(measured) // 4
+    first_mb = sum(measured[:q]) / q / 1024
+    last_mb = sum(measured[-q:]) / q / 1024
 
-    print(f"samples            : {len(rss)} cycles")
-    print(f"warmup dropped     : {warmup_cycles} cycles")
+    print(f"samples            : {len(rss)} samples")
+    print(f"warmup dropped     : {warmup_cycles} samples")
     print(f"peak RSS           : {peak_kb / 1024:.1f} MB (ceiling {ceiling_kb / 1024:.0f} MB)")
-    print(f"post-warmup slope  : {slope:.1f} KB/cycle")
+    print(f"post-warmup slope  : {slope:.1f} KB/sample")
     print(f"post-warmup band   : {first_mb:.1f} MB -> {last_mb:.1f} MB")
 
     failed = False
@@ -113,8 +125,8 @@ def main(argv: list[str]) -> int:
         failed = True
     if slope_gate >= 0 and slope > slope_gate:
         print(
-            f"FAIL: post-warmup slope {slope:.1f} KB/cycle exceeds "
-            f"{slope_gate:.0f} KB/cycle - sustained growth past buffer-pool warmup"
+            f"FAIL: post-warmup slope {slope:.1f} KB/sample exceeds "
+            f"{slope_gate:.0f} KB/sample - sustained growth past buffer-pool warmup"
         )
         failed = True
 

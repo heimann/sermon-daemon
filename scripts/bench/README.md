@@ -100,11 +100,13 @@ many cycles and fails if resident memory grows past a ceiling.
 The pieces:
 
 - **`buffer_pool_soak.sh`** - starts the daemon at the 1s minimum
-  interval, samples `VmRSS` once per collection cycle into a CSV, then
-  hands the CSV to `analyze_rss.py`. Two modes via `BENCH_MODE`.
+  interval, samples `VmRSS` once per second into a CSV, then hands the
+  CSV to `analyze_rss.py`. The sampler and the daemon's collection loop
+  are not phase-locked, so a sample is one ~1s reading rather than
+  exactly one collection cycle. Two modes via `BENCH_MODE`.
 - **`analyze_rss.py`** - reads the RSS series, drops a warmup prefix,
   and applies the ceiling and slope gates. Exit 0 on pass, 1 on a
-  threshold breach.
+  threshold breach, 2 on bad input.
 
 ### Running it
 
@@ -127,37 +129,40 @@ memory_limit='128MB'`, but that pragma governs DuckDB's buffer manager,
 not process RSS. RSS also carries allocator overhead and pages glibc
 has not returned to the OS.
 
-The measurement that drove the design: a 2600-cycle clean run of
-current `origin/main` code. RSS does **not** plateau - it climbs the
-whole time, from ~42 MB at start past **207 MB** at cycle 2600, with
-200-cycle window means stepping 55, 76, 91, 101, 109, 114, 120, 134,
-142, 150, 160, 168 MB. There is no flat steady-state RSS. So an
-absolute ceiling derived from a "settled" RSS does not exist - any
-fixed ceiling that passes a short run is breached by a long one.
+The measurement that drove the design: a single 2600-cycle clean run
+(n=1) of current `origin/main` code. In that run RSS did **not**
+plateau - it climbed the whole time, from ~42 MB at start past **207
+MB** at cycle 2600, with 200-cycle window means stepping 55, 76, 91,
+101, 109, 114, 120, 134, 142, 150, 160, 168 MB. That one run showed no
+flat steady-state RSS, which is why the gate is built on the slope
+rather than an absolute ceiling: a fixed ceiling that passes a short
+run would be breached by a long one. This is a single observation, not
+a fully characterised distribution - the slope gates below are set
+with wide margins partly to absorb that uncertainty.
 
-What **is** stable is the post-warmup *slope*. Once the buffer pool has
-warmed (after ~900 cycles) clean code rises at a measured 40-61
-KB/cycle across runs. A genuine leak - PR #96's buffer-pool leak that
-grew RSS ~5-9 MB/hour - adds a per-cycle increment on top, so it shows
+What looks stable is the post-warmup *slope*. Once the buffer pool has
+warmed (after ~900 cycles) clean code rose at a measured 40-61
+KB/sample across runs. A genuine leak - PR #96's buffer-pool leak that
+grew RSS ~5-9 MB/hour - adds a per-sample increment on top, so it shows
 up as a steeper slope. The slope is the regression gate; the peak-RSS
 ceiling is only a coarse, mode-specific safety net for a gross runaway.
 
 Thresholds (all set from measurement, not guessed):
 
-- **Fast-mode slope gate = 600 KB/cycle.** Over 45 cycles the daemon is
+- **Fast-mode slope gate = 600 KB/sample.** Over 45 cycles the daemon is
   still in buffer-pool warmup; the warmup slope measured 151-225
-  KB/cycle across clean runs. 600 KB/cycle is ~2.7x that clean
-  ceiling, so fast mode catches a leak of roughly >= 375 KB/cycle.
+  KB/sample across clean runs. 600 KB/sample is ~2.7x that clean
+  ceiling, so fast mode catches a leak of roughly >= 375 KB/sample.
 - **Fast-mode ceiling = 90 MB.** Clean-code peak RSS over the first 45
   cycles measured 48.5-50.5 MB; 90 MB is a ~1.8x safety net.
-- **Soak-mode slope gate = 300 KB/cycle.** Measured post-warmup
-  (cycles 900+) clean-code slope is 40-61 KB/cycle; 300 KB/cycle is
+- **Soak-mode slope gate = 300 KB/sample.** Measured post-warmup
+  (cycles 900+) clean-code slope is 40-61 KB/sample; 300 KB/sample is
   ~5x that. This is the real regression gate.
 - **Soak-mode ceiling = 200 MB.** Clean-code peak RSS over 1200 cycles
   measured 130 MB; 200 MB is a ~1.5x safety net.
 
 Fast mode is a CI smoke test, like the existing `bench.sh`. It cannot
-catch a PR #96-scale leak (~1.4-2.5 KB/cycle at 1s sampling - below
+catch a PR #96-scale leak (~1.4-2.5 KB/sample at 1s sampling - below
 measurement noise); soak mode, where the pool has warmed and the slope
 is stable, is the real gate.
 
@@ -168,10 +173,10 @@ synthetic per-cycle allocation that is never freed (a `memset` 1 MB
 buffer at the top of the collection loop in `src/agent/main.zig`).
 With the leak in:
 
-- fast mode failed - post-warmup slope 1047 KB/cycle vs the 600
-  KB/cycle gate (clean code: ~200 KB/cycle);
-- a soak-style run failed both gates - slope 973 KB/cycle vs the 300
-  KB/cycle gate, and peak RSS 280 MB vs the 200 MB safety net.
+- fast mode failed - post-warmup slope 1047 KB/sample vs the 600
+  KB/sample gate (clean code: ~200 KB/sample);
+- a soak-style run failed both gates - slope 973 KB/sample vs the 300
+  KB/sample gate, and peak RSS 280 MB vs the 200 MB safety net.
 
 The injection was then reverted; the committed daemon code has no
 leak and both modes pass clean.
