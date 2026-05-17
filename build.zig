@@ -189,4 +189,17 @@ pub fn build(b: *std.Build) void {
     bench.step.dependOn(&agent.step);
     const bench_step = b.step("bench", "Check agent resource usage (RSS < 50MB, CPU < 2%)");
     bench_step.dependOn(&bench.step);
+
+    // ── Buffer-pool regression bench ──
+    // Exercises the collection / buffer-pool loop over many cycles and
+    // fails if resident-memory growth outruns a measured slope threshold.
+    // Defaults to fast mode (< 1 min); set BENCH_MODE=soak for the long
+    // run. See scripts/bench/README.md.
+    const bench_bufferpool = b.addSystemCommand(&.{ "bash", "scripts/bench/buffer_pool_soak.sh" });
+    bench_bufferpool.step.dependOn(&agent.step);
+    const bench_bufferpool_step = b.step(
+        "bench-buffer-pool",
+        "Check daemon RSS does not leak across collection cycles",
+    );
+    bench_bufferpool_step.dependOn(&bench_bufferpool.step);
 }

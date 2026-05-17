@@ -17,6 +17,10 @@ run = "./scripts/bootstrap-duckdb.sh --arch x86_64 >/dev/null && LD_LIBRARY_PATH
 description = "Run resource benchmark"
 run = "./scripts/bootstrap-duckdb.sh --arch x86_64 >/dev/null && LD_LIBRARY_PATH=lib zig build bench"
 
+[tasks.bench-buffer-pool]
+description = "Run buffer-pool RSS regression bench (fast mode; BENCH_MODE=soak for the long run)"
+run = "./scripts/bootstrap-duckdb.sh --arch x86_64 >/dev/null && LD_LIBRARY_PATH=lib zig build bench-buffer-pool"
+
 [tasks.verify]
 description = "Run preflight, build, tests, and benchmark"
 run = [

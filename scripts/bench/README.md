@@ -1,5 +1,14 @@
 # scripts/bench
 
+This directory holds two regression harnesses:
+
+- the **CPU harness** (`measure_cpu.sh` + `compare_builds.py` +
+  `populate_metrics_db.py`), documented immediately below; and
+- the **buffer-pool RSS harness** (`buffer_pool_soak.sh` +
+  `analyze_rss.py`), documented near the end of this file.
+
+## CPU regression harness
+
 Daemon CPU regression harness. Pairs with the v0.0.1-rc7 fix - the
 daemon used to open and close DuckDB on every collection cycle, which
 pegged a CPU core on populated databases. We caught it because David
@@ -80,3 +89,89 @@ remains. If it's > 5%, extend this harness with:
 - A long-soak mode (24h+) to surface accumulated state issues
 - A fake-process generator (spawn N idle bash sleeps before measuring)
   to simulate contabo's process count
+
+## Buffer-pool RSS regression harness
+
+Pairs with PR #96, which leaked the DuckDB buffer pool and grew daemon
+RSS ~5-9 MB/hour over a multi-hour run. No automated test caught it.
+This harness exercises the daemon's collection / buffer-pool loop over
+many cycles and fails if resident memory grows past a ceiling.
+
+The pieces:
+
+- **`buffer_pool_soak.sh`** - starts the daemon at the 1s minimum
+  interval, samples `VmRSS` once per collection cycle into a CSV, then
+  hands the CSV to `analyze_rss.py`. Two modes via `BENCH_MODE`.
+- **`analyze_rss.py`** - reads the RSS series, drops a warmup prefix,
+  and applies the ceiling and slope gates. Exit 0 on pass, 1 on a
+  threshold breach.
+
+### Running it
+
+```fish
+# fast mode (default): ~45 cycles, completes in well under a minute
+LD_LIBRARY_PATH=lib zig build bench-buffer-pool
+# or: mise run bench-buffer-pool
+
+# soak mode: 1200 cycles (~20 min), the real regression gate
+BENCH_MODE=soak LD_LIBRARY_PATH=lib zig build bench-buffer-pool
+```
+
+Knobs (env vars): `BENCH_MODE` (`fast` | `soak`), `BENCH_CYCLES`,
+`BENCH_WARMUP`, `BENCH_CEILING_MB`, `BENCH_SLOPE_KB`.
+
+### How the thresholds were derived
+
+The daemon bounds DuckDB's working set with `PRAGMA
+memory_limit='128MB'`, but that pragma governs DuckDB's buffer manager,
+not process RSS. RSS also carries allocator overhead and pages glibc
+has not returned to the OS.
+
+The measurement that drove the design: a 2600-cycle clean run of
+current `origin/main` code. RSS does **not** plateau - it climbs the
+whole time, from ~42 MB at start past **207 MB** at cycle 2600, with
+200-cycle window means stepping 55, 76, 91, 101, 109, 114, 120, 134,
+142, 150, 160, 168 MB. There is no flat steady-state RSS. So an
+absolute ceiling derived from a "settled" RSS does not exist - any
+fixed ceiling that passes a short run is breached by a long one.
+
+What **is** stable is the post-warmup *slope*. Once the buffer pool has
+warmed (after ~900 cycles) clean code rises at a measured 40-61
+KB/cycle across runs. A genuine leak - PR #96's buffer-pool leak that
+grew RSS ~5-9 MB/hour - adds a per-cycle increment on top, so it shows
+up as a steeper slope. The slope is the regression gate; the peak-RSS
+ceiling is only a coarse, mode-specific safety net for a gross runaway.
+
+Thresholds (all set from measurement, not guessed):
+
+- **Fast-mode slope gate = 600 KB/cycle.** Over 45 cycles the daemon is
+  still in buffer-pool warmup; the warmup slope measured 151-225
+  KB/cycle across clean runs. 600 KB/cycle is ~2.7x that clean
+  ceiling, so fast mode catches a leak of roughly >= 375 KB/cycle.
+- **Fast-mode ceiling = 90 MB.** Clean-code peak RSS over the first 45
+  cycles measured 48.5-50.5 MB; 90 MB is a ~1.8x safety net.
+- **Soak-mode slope gate = 300 KB/cycle.** Measured post-warmup
+  (cycles 900+) clean-code slope is 40-61 KB/cycle; 300 KB/cycle is
+  ~5x that. This is the real regression gate.
+- **Soak-mode ceiling = 200 MB.** Clean-code peak RSS over 1200 cycles
+  measured 130 MB; 200 MB is a ~1.5x safety net.
+
+Fast mode is a CI smoke test, like the existing `bench.sh`. It cannot
+catch a PR #96-scale leak (~1.4-2.5 KB/cycle at 1s sampling - below
+measurement noise); soak mode, where the pool has warmed and the slope
+is stable, is the real gate.
+
+### Leak-injection proof
+
+The bench was verified to catch a leak by temporarily injecting a
+synthetic per-cycle allocation that is never freed (a `memset` 1 MB
+buffer at the top of the collection loop in `src/agent/main.zig`).
+With the leak in:
+
+- fast mode failed - post-warmup slope 1047 KB/cycle vs the 600
+  KB/cycle gate (clean code: ~200 KB/cycle);
+- a soak-style run failed both gates - slope 973 KB/cycle vs the 300
+  KB/cycle gate, and peak RSS 280 MB vs the 200 MB safety net.
+
+The injection was then reverted; the committed daemon code has no
+leak and both modes pass clean.
