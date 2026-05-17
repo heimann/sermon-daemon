@@ -145,6 +145,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const rules_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/rules.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rules_test_mod.addImport("logs", logs_mod);
+
+    const rules_tests = b.addTest(.{
+        .root_module = rules_test_mod,
+    });
+
     const push_test_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/push.zig"),
         .target = target,
@@ -180,6 +191,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);
     test_step.dependOn(&b.addRunArtifact(collector_tests).step);
     test_step.dependOn(&b.addRunArtifact(logs_tests).step);
+    test_step.dependOn(&b.addRunArtifact(rules_tests).step);
     test_step.dependOn(&b.addRunArtifact(push_tests).step);
     test_step.dependOn(&b.addRunArtifact(proc_self_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxmox_tests).step);
