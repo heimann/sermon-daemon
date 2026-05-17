@@ -91,15 +91,47 @@ pub fn matches(rule: LogRule, entry: logs.LogEntry) bool {
     return true;
 }
 
-/// First matching rule wins. No match defaults to `.keep`.
-pub fn decide(rules: []const LogRule, entry: logs.LogEntry) Decision {
-    for (rules) |rule| {
-        if (matches(rule, entry)) {
-            return .{ .action = rule.action, .keep_one_in = rule.keep_one_in };
-        }
+/// Index of the first rule matching `entry`, or null if none match.
+pub fn matchIndex(rules: []const LogRule, entry: logs.LogEntry) ?usize {
+    for (rules, 0..) |rule, i| {
+        if (matches(rule, entry)) return i;
     }
-    return .{};
+    return null;
 }
+
+/// First matching rule wins. No match defaults to `.keep`. Pure - does not
+/// advance sample counters; see `RuleSet.eligible` for the stateful path.
+pub fn decide(rules: []const LogRule, entry: logs.LogEntry) Decision {
+    const i = matchIndex(rules, entry) orelse return .{};
+    return .{ .action = rules[i].action, .keep_one_in = rules[i].keep_one_in };
+}
+
+/// A rule list paired with the mutable per-rule counters that `.sample` rules
+/// need. `sample_counts` is indexed parallel to `rules` and persists across
+/// push cycles, so "keep 1 in N" thins the whole stream rather than each
+/// collection cycle in isolation.
+pub const RuleSet = struct {
+    rules: []const LogRule = &.{},
+    sample_counts: []u64 = &.{},
+
+    /// Whether `entry` should be uploaded, advancing sample counters as a
+    /// side effect. A `.sample` rule keeps every Nth matching entry; `.keep`
+    /// and `.drop` are returned directly; an entry matching no rule defaults
+    /// to keep.
+    pub fn eligible(self: RuleSet, entry: logs.LogEntry) bool {
+        const i = matchIndex(self.rules, entry) orelse return true;
+        return switch (self.rules[i].action) {
+            .keep => true,
+            .drop => false,
+            .sample => blk: {
+                if (i >= self.sample_counts.len) break :blk true; // no counter slot
+                const n: u64 = @max(self.rules[i].keep_one_in, 1);
+                self.sample_counts[i] += 1;
+                break :blk self.sample_counts[i] % n == 0;
+            },
+        };
+    }
+};
 
 // ── Tests ──
 
@@ -265,4 +297,55 @@ test "sample decision carries keep_one_in" {
     const decision = decide(&rules, testEntry());
     try std.testing.expectEqual(Action.sample, decision.action);
     try std.testing.expectEqual(@as(u32, 100), decision.keep_one_in);
+}
+
+test "matchIndex returns the first matching rule" {
+    const rules = [_]LogRule{
+        .{ .match = &.{cond(.systemd_unit, .eq, "other.service")}, .action = .drop },
+        .{ .match = &.{cond(.identifier, .eq, "nginx")}, .action = .keep },
+        .{ .match = &.{cond(.identifier, .eq, "nginx")}, .action = .drop },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), matchIndex(&rules, testEntry()));
+    try std.testing.expectEqual(@as(?usize, null), matchIndex(&.{}, testEntry()));
+}
+
+test "RuleSet.eligible keeps unmatched entries and applies keep/drop" {
+    const rules = [_]LogRule{
+        .{ .match = &.{cond(.systemd_unit, .eq, "nginx.service")}, .action = .drop },
+    };
+    var counts = [_]u64{0};
+    const set = RuleSet{ .rules = &rules, .sample_counts = &counts };
+
+    try std.testing.expect(!set.eligible(testEntry())); // matches the drop rule
+
+    var other = testEntry();
+    other.systemd_unit = "postgres.service";
+    try std.testing.expect(set.eligible(other)); // matches nothing -> keep
+}
+
+test "RuleSet.eligible samples - keeps every Nth match" {
+    const rules = [_]LogRule{
+        .{ .match = &.{cond(.identifier, .eq, "nginx")}, .action = .sample, .keep_one_in = 3 },
+    };
+    var counts = [_]u64{0};
+    const set = RuleSet{ .rules = &rules, .sample_counts = &counts };
+
+    var kept: usize = 0;
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        if (set.eligible(testEntry())) kept += 1;
+    }
+    // 9 matching entries at keep_one_in = 3 -> the 3rd, 6th, 9th survive.
+    try std.testing.expectEqual(@as(usize, 3), kept);
+}
+
+test "RuleSet.eligible: a sample rule with default keep_one_in keeps all" {
+    const rules = [_]LogRule{
+        .{ .match = &.{cond(.identifier, .eq, "nginx")}, .action = .sample },
+    };
+    var counts = [_]u64{0};
+    const set = RuleSet{ .rules = &rules, .sample_counts = &counts };
+
+    try std.testing.expect(set.eligible(testEntry()));
+    try std.testing.expect(set.eligible(testEntry()));
 }
