@@ -145,20 +145,23 @@ pub const Storage = struct {
             return error.ConnectionError;
         }
 
-        // Bound the buffer pool. DuckDB defaults to ~80% of system RAM, which
-        // grows unboundedly under the daemon's persistent connection as inserts
-        // touch more pages. The cap must still leave room for a checkpoint to
-        // allocate within it; larger working sets spill to a temp file.
+        // Bound the buffer pool: DuckDB otherwise defaults to ~80% of system
+        // RAM and grows unboundedly under the daemon's persistent connection.
         applyMemoryLimit(conn, memory_limit_mb) catch |err| {
             c.duckdb_disconnect(&conn);
             c.duckdb_close(&db);
             return err;
         };
 
+        // Initialize schema (skip for read-only mode)
+        if (!read_only) {
+            try initSchema(conn);
+        }
+
         const db_path_owned = try allocator.dupe(u8, db_path);
         errdefer allocator.free(db_path_owned);
 
-        var storage = Storage{
+        return Storage{
             .db = db,
             .conn = conn,
             .allocator = allocator,
@@ -166,13 +169,6 @@ pub const Storage = struct {
             .read_only = read_only,
             .memory_limit_mb = memory_limit_mb,
         };
-
-        // Initialize schema (skip for read-only mode)
-        if (!read_only) {
-            try storage.initSchema();
-        }
-
-        return storage;
     }
 
     pub fn deinit(self: *Storage) void {
@@ -184,12 +180,14 @@ pub const Storage = struct {
     /// Apply the DuckDB buffer-pool cap to a freshly opened connection.
     /// Shared by initWithMode() and reconnect() so the two stay in sync.
     fn applyMemoryLimit(conn: c.duckdb_connection, memory_limit_mb: u32) !void {
+        // 48 bytes fits the 25-char literal plus any u32 (10 digits) and NUL,
+        // so bufPrintZ cannot fail here.
         var sql_buf: [48]u8 = undefined;
         const sql = std.fmt.bufPrintZ(
             &sql_buf,
             "PRAGMA memory_limit='{d}MB'",
             .{memory_limit_mb},
-        ) catch return error.DatabaseError;
+        ) catch unreachable;
 
         var result: c.duckdb_result = undefined;
         const state = c.duckdb_query(conn, sql.ptr, &result);
@@ -250,24 +248,18 @@ pub const Storage = struct {
         // Re-apply the buffer-pool bound (matches initWithMode).
         try applyMemoryLimit(new_conn, self.memory_limit_mb);
 
-        var replacement = Storage{
-            .db = new_db,
-            .conn = new_conn,
-            .allocator = self.allocator,
-            .db_path = self.db_path,
-            .read_only = self.read_only,
-            .memory_limit_mb = self.memory_limit_mb,
-            .consecutive_insert_failures = self.consecutive_insert_failures,
-        };
-        if (!replacement.read_only) {
-            try replacement.initSchema();
+        // Init schema on the new connection before committing it to self: on
+        // failure the errdefers close new_conn/new_db and self stays null
+        // from the close above, so deinit() remains a safe no-op.
+        if (!self.read_only) {
+            try initSchema(new_conn);
         }
 
         self.db = new_db;
         self.conn = new_conn;
     }
 
-    fn initSchema(self: *Storage) !void {
+    fn initSchema(conn: c.duckdb_connection) !void {
         const schema_sql =
             \\CREATE TABLE IF NOT EXISTS metrics (
             \\  timestamp TIMESTAMP NOT NULL,
@@ -350,7 +342,7 @@ pub const Storage = struct {
         ;
 
         var result: c.duckdb_result = undefined;
-        const state = c.duckdb_query(self.conn, schema_sql.ptr, &result);
+        const state = c.duckdb_query(conn, schema_sql.ptr, &result);
         defer c.duckdb_destroy_result(&result);
 
         if (state == c.DuckDBError) {
@@ -1029,12 +1021,8 @@ test "Storage: failed reconnect stays safe to deinit" {
         storage.db_path = original_path;
     }
 
-    // reconnect() closes the old handles before re-opening - the old and new
-    // instances must never both be live on one file. A failed re-open
-    // therefore leaves the storage unusable, and the daemon's main loop
-    // responds by exiting for a systemd restart. deinit() must still be a
-    // safe no-op afterwards: duckdb_close/duckdb_disconnect null their
-    // handles, so the defer above does not double-free.
+    // After a failed reconnect the handles are already closed; deinit() (the
+    // defer above) must stay a safe no-op and not double-free.
     try std.testing.expectError(error.DatabaseError, storage.reconnect());
 }
 
