@@ -88,6 +88,69 @@ Remote push example:
 }
 ```
 
+## Log filtering rules
+
+By default every collected log line is eligible for hosted upload (subject
+to a per-cycle cap). Log rules let you cut the noise: drop a chatty unit,
+keep only the error lines from an app, or sample a high-volume source down
+to a fraction.
+
+Rules gate **hosted upload only**. Every log line is still written to local
+DuckDB at full fidelity, so anything a rule drops is still queryable on the
+host with `sermon ... logs` or `sermon ... query`.
+
+Rules live in `log_rules.json` next to `config.json` - so
+`~/.config/sermon/log_rules.json`, or `/etc/sermon/log_rules.json` for a
+root install. The file is optional; without it nothing is filtered. A
+malformed file is logged as a warning and ignored rather than partially
+applied. See `config/log_rules.example.json` for a starting point.
+
+```json
+{
+  "version": 1,
+  "log_rules": [
+    {
+      "name": "keep-app-errors",
+      "match": [
+        { "field": "systemd_unit", "op": "eq", "value": "my-app.service" },
+        { "field": "message", "op": "contains", "value": "error" }
+      ],
+      "action": "keep"
+    },
+    {
+      "name": "drop-app-noise",
+      "match": [{ "field": "systemd_unit", "op": "eq", "value": "my-app.service" }],
+      "action": "drop"
+    },
+    {
+      "name": "thin-nginx-access",
+      "match": [{ "field": "identifier", "op": "eq", "value": "nginx" }],
+      "action": "sample",
+      "keep_one_in": 100
+    }
+  ]
+}
+```
+
+Each rule has:
+
+- `match` - a list of conditions, all of which must hold (AND). Each is
+  `{ field, op, value }`. `field` is one of `source`, `identifier`,
+  `systemd_unit`, `message`; `op` is `eq`, `contains`, or `not_contains`,
+  all case-sensitive. An empty `match` list matches every entry.
+- `action` - `keep`, `drop`, or `sample`.
+- `keep_one_in` - for `sample` only: keep 1 in every N matching entries.
+- `name`, `description` - optional, for your own reference.
+
+Rules are evaluated **first-match-wins**: the first rule whose conditions
+all hold decides the entry, and an entry matching no rule is kept. In the
+example above, listing `keep-app-errors` before `drop-app-noise` keeps the
+error lines and drops everything else from that unit.
+
+A rule can never bury a real error: log entries at syslog priority 3 or
+lower (error, critical, alert, emergency) are **always** uploaded,
+regardless of the rules.
+
 ## Build from source
 
 Requirements:

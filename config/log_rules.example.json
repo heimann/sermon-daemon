@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "log_rules": [
+    {
+      "name": "keep-app-errors",
+      "description": "surface only the error lines from my-app",
+      "match": [
+        { "field": "systemd_unit", "op": "eq", "value": "my-app.service" },
+        { "field": "message", "op": "contains", "value": "error" }
+      ],
+      "action": "keep"
+    },
+    {
+      "name": "drop-app-noise",
+      "description": "drop the rest of my-app's chatter (errors kept by the rule above)",
+      "match": [{ "field": "systemd_unit", "op": "eq", "value": "my-app.service" }],
+      "action": "drop"
+    },
+    {
+      "name": "thin-nginx-access",
+      "description": "nginx access logs are high-volume; keep a 1-in-100 sample",
+      "match": [{ "field": "identifier", "op": "eq", "value": "nginx" }],
+      "action": "sample",
+      "keep_one_in": 100
+    }
+  ]
+}
