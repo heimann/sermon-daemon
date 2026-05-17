@@ -133,7 +133,7 @@ pub fn buildPayload(
     procs: []const collector_mod.ProcessInfo,
     disks: []const collector_mod.DiskInfo,
     log_entries: []const logs_mod.LogEntry,
-    log_rules: []const rules_mod.LogRule,
+    rule_set: rules_mod.RuleSet,
     daemon_self: proc_self_mod.Sample,
     consecutive_insert_failures: u32,
     db_size_bytes: u64,
@@ -187,7 +187,7 @@ pub fn buildPayload(
     const payload_logs = try allocator.alloc(LogPayload, max_log_count);
     defer allocator.free(payload_logs);
 
-    const uploaded_logs = selectLogsForUpload(payload_logs, log_entries, log_rules);
+    const uploaded_logs = selectLogsForUpload(payload_logs, log_entries, rule_set);
     const dropped_logs = log_entries.len - uploaded_logs.len;
 
     const runtime_payload: RuntimePayload = switch (runtime) {
@@ -269,14 +269,14 @@ pub fn buildPayload(
 fn selectLogsForUpload(
     dest: []LogPayload,
     entries: []const logs_mod.LogEntry,
-    log_rules: []const rules_mod.LogRule,
+    rule_set: rules_mod.RuleSet,
 ) []LogPayload {
     var count: usize = 0;
 
     var idx = entries.len;
     while (idx > 0 and count < dest.len) {
         idx -= 1;
-        if (entries[idx].priority <= 4 and pushEligible(entries[idx], log_rules)) {
+        if (entries[idx].priority <= 4 and pushEligible(entries[idx], rule_set)) {
             dest[count] = logPayload(entries[idx]);
             count += 1;
         }
@@ -285,7 +285,7 @@ fn selectLogsForUpload(
     idx = entries.len;
     while (idx > 0 and count < dest.len) {
         idx -= 1;
-        if (entries[idx].priority > 4 and pushEligible(entries[idx], log_rules)) {
+        if (entries[idx].priority > 4 and pushEligible(entries[idx], rule_set)) {
             dest[count] = logPayload(entries[idx]);
             count += 1;
         }
@@ -295,12 +295,11 @@ fn selectLogsForUpload(
 }
 
 /// Whether an entry may be uploaded. Errors (priority <= always_push_priority)
-/// always pass; everything else is subject to the rules, where a `.drop`
-/// decision blocks the upload. `.sample` is treated as `.keep` for now -
-/// stream-wide 1-in-N sampling is a later change.
-fn pushEligible(entry: logs_mod.LogEntry, log_rules: []const rules_mod.LogRule) bool {
+/// always pass; everything else is decided by the rule set, which may keep,
+/// drop, or sample (keep every Nth match).
+fn pushEligible(entry: logs_mod.LogEntry, rule_set: rules_mod.RuleSet) bool {
     if (entry.priority <= always_push_priority) return true;
-    return rules_mod.decide(log_rules, entry).action != .drop;
+    return rule_set.eligible(entry);
 }
 
 fn logPayload(src: logs_mod.LogEntry) LogPayload {
@@ -412,7 +411,7 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
         },
     };
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, &.{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, .{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -459,7 +458,7 @@ test "buildPayload exposes consecutive_insert_failures and db_size_bytes" {
         &procs,
         &disks,
         &.{},
-        &.{},
+        .{},
         testSelfSample(),
         7,
         1_234_567,
@@ -512,7 +511,7 @@ test "buildPayload includes capped truncated logs" {
         };
     }
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, &.{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, .{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -590,7 +589,7 @@ test "buildPayload emits proxmox_host runtime block + containers array" {
         &procs,
         &disks,
         &.{},
-        &.{},
+        .{},
         testSelfSample(),
         0,
         0,
@@ -659,7 +658,7 @@ test "selectLogsForUpload with no rules uploads every entry" {
         testLog(2, 4, "warning two"),
     };
 
-    const selected = selectLogsForUpload(&dest, &entries, &.{});
+    const selected = selectLogsForUpload(&dest, &entries, .{});
     try std.testing.expectEqual(@as(usize, 2), selected.len);
 }
 
@@ -677,12 +676,37 @@ test "a drop rule suppresses noise but the severity floor keeps errors" {
             .action = .drop,
         },
     };
+    var counts = [_]u64{0};
+    const rule_set = rules_mod.RuleSet{ .rules = &log_rules, .sample_counts = &counts };
 
-    const selected = selectLogsForUpload(&dest, &entries, &log_rules);
+    const selected = selectLogsForUpload(&dest, &entries, rule_set);
 
     // The info line is dropped by the rule; the priority-3 error survives
     // the severity floor that no rule can override.
     try std.testing.expectEqual(@as(usize, 1), selected.len);
     try std.testing.expectEqual(@as(i64, 2), selected[0].timestamp);
     try std.testing.expectEqual(@as(u8, 3), selected[0].priority);
+}
+
+test "a sample rule thins a noisy unit" {
+    var dest: [max_logs_per_payload]LogPayload = undefined;
+    var entries: [6]logs_mod.LogEntry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = testLog(@intCast(i), 6, "access log line");
+    }
+
+    // Keep 1 in 2 lines from nginx.
+    const log_rules = [_]rules_mod.LogRule{
+        .{
+            .match = &.{.{ .field = .identifier, .op = .eq, .value = "nginx" }},
+            .action = .sample,
+            .keep_one_in = 2,
+        },
+    };
+    var counts = [_]u64{0};
+    const rule_set = rules_mod.RuleSet{ .rules = &log_rules, .sample_counts = &counts };
+
+    const selected = selectLogsForUpload(&dest, &entries, rule_set);
+    // 6 priority-6 entries sampled 1-in-2 -> 3 survive.
+    try std.testing.expectEqual(@as(usize, 3), selected.len);
 }

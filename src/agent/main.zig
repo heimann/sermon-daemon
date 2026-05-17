@@ -123,6 +123,14 @@ pub fn main() !void {
     const log_rules: []const rules_mod.LogRule =
         if (rules_parsed) |r| r.value.log_rules else &.{};
 
+    // Per-rule sample counters, parallel to log_rules, persisting across push
+    // cycles so a "keep 1 in N" rule thins the whole stream rather than each
+    // cycle in isolation.
+    const sample_counts = try allocator.alloc(u64, log_rules.len);
+    defer allocator.free(sample_counts);
+    @memset(sample_counts, 0);
+    const rule_set = rules_mod.RuleSet{ .rules = log_rules, .sample_counts = sample_counts };
+
     var db_path: []const u8 = if (config) |c| c.value.db_path orelse default_db_path else default_db_path;
     var interval: u64 = if (config) |c| c.value.interval orelse default_interval else default_interval;
     var server_url: ?[]const u8 = if (config) |c| c.value.server_url else null;
@@ -442,7 +450,7 @@ pub fn main() !void {
                     procs,
                     disks,
                     push_logs.items,
-                    log_rules,
+                    rule_set,
                     self_sample,
                     storage.consecutive_insert_failures,
                     storage.dbSizeBytes(),
