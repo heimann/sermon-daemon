@@ -180,8 +180,8 @@ pub const Storage = struct {
     /// Apply the DuckDB buffer-pool cap to a freshly opened connection.
     /// Shared by initWithMode() and reconnect() so the two stay in sync.
     fn applyMemoryLimit(conn: c.duckdb_connection, memory_limit_mb: u32) !void {
-        // 48 bytes fits the 25-char literal plus any u32 (10 digits) and NUL,
-        // so bufPrintZ cannot fail here.
+        // 48 bytes comfortably fits the PRAGMA literal, any u32 (10 digits)
+        // and the NUL, so bufPrintZ cannot fail here.
         var sql_buf: [48]u8 = undefined;
         const sql = std.fmt.bufPrintZ(
             &sql_buf,
@@ -215,6 +215,10 @@ pub const Storage = struct {
     /// insert failures cross `reconnect_failure_threshold`. The caller should
     /// reset `consecutive_insert_failures` after calling this so a single
     /// re-init burst doesn't immediately re-trigger.
+    ///
+    /// On error the old handles are already closed and not replaced: the
+    /// Storage is dead and must only be `deinit`'d, never reused. The daemon
+    /// treats a failed reconnect as terminal and exits for a systemd restart.
     pub fn reconnect(self: *Storage) !void {
         const c_path = try self.allocator.dupeZ(u8, self.db_path);
         defer self.allocator.free(c_path);
