@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const collector_mod = @import("collector");
 const logs_mod = @import("logs");
+const rules_mod = @import("rules");
 const proc_self_mod = @import("proc_self");
 const proxmox_mod = @import("proxmox");
 
@@ -9,6 +10,11 @@ const Allocator = std.mem.Allocator;
 
 const max_logs_per_payload = 20;
 const max_log_message_bytes = 4_096;
+
+/// Log entries at or below this syslog priority (err/crit/alert/emerg) are
+/// always eligible for push - no rule can drop them. A safety floor so a
+/// mistaken or AI-authored rule cannot bury a real error in the hosted view.
+const always_push_priority = 3;
 
 const Payload = struct {
     hostname: []const u8,
@@ -127,6 +133,7 @@ pub fn buildPayload(
     procs: []const collector_mod.ProcessInfo,
     disks: []const collector_mod.DiskInfo,
     log_entries: []const logs_mod.LogEntry,
+    log_rules: []const rules_mod.LogRule,
     daemon_self: proc_self_mod.Sample,
     consecutive_insert_failures: u32,
     db_size_bytes: u64,
@@ -180,7 +187,7 @@ pub fn buildPayload(
     const payload_logs = try allocator.alloc(LogPayload, max_log_count);
     defer allocator.free(payload_logs);
 
-    const uploaded_logs = selectLogsForUpload(payload_logs, log_entries);
+    const uploaded_logs = selectLogsForUpload(payload_logs, log_entries, log_rules);
     const dropped_logs = log_entries.len - uploaded_logs.len;
 
     const runtime_payload: RuntimePayload = switch (runtime) {
@@ -259,13 +266,17 @@ pub fn buildPayload(
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(payload, .{})});
 }
 
-fn selectLogsForUpload(dest: []LogPayload, entries: []const logs_mod.LogEntry) []LogPayload {
+fn selectLogsForUpload(
+    dest: []LogPayload,
+    entries: []const logs_mod.LogEntry,
+    log_rules: []const rules_mod.LogRule,
+) []LogPayload {
     var count: usize = 0;
 
     var idx = entries.len;
     while (idx > 0 and count < dest.len) {
         idx -= 1;
-        if (entries[idx].priority <= 4) {
+        if (entries[idx].priority <= 4 and pushEligible(entries[idx], log_rules)) {
             dest[count] = logPayload(entries[idx]);
             count += 1;
         }
@@ -274,13 +285,22 @@ fn selectLogsForUpload(dest: []LogPayload, entries: []const logs_mod.LogEntry) [
     idx = entries.len;
     while (idx > 0 and count < dest.len) {
         idx -= 1;
-        if (entries[idx].priority > 4) {
+        if (entries[idx].priority > 4 and pushEligible(entries[idx], log_rules)) {
             dest[count] = logPayload(entries[idx]);
             count += 1;
         }
     }
 
     return dest[0..count];
+}
+
+/// Whether an entry may be uploaded. Errors (priority <= always_push_priority)
+/// always pass; everything else is subject to the rules, where a `.drop`
+/// decision blocks the upload. `.sample` is treated as `.keep` for now -
+/// stream-wide 1-in-N sampling is a later change.
+fn pushEligible(entry: logs_mod.LogEntry, log_rules: []const rules_mod.LogRule) bool {
+    if (entry.priority <= always_push_priority) return true;
+    return rules_mod.decide(log_rules, entry).action != .drop;
 }
 
 fn logPayload(src: logs_mod.LogEntry) LogPayload {
@@ -392,7 +412,7 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
         },
     };
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, &.{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -438,6 +458,7 @@ test "buildPayload exposes consecutive_insert_failures and db_size_bytes" {
         metrics,
         &procs,
         &disks,
+        &.{},
         &.{},
         testSelfSample(),
         7,
@@ -491,7 +512,7 @@ test "buildPayload includes capped truncated logs" {
         };
     }
 
-    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
+    const payload = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &entries, &.{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -569,6 +590,7 @@ test "buildPayload emits proxmox_host runtime block + containers array" {
         &procs,
         &disks,
         &.{},
+        &.{},
         testSelfSample(),
         0,
         0,
@@ -615,4 +637,52 @@ test "buildIngestUrl trims trailing slash" {
     defer allocator.free(url);
 
     try std.testing.expectEqualStrings("http://localhost:4000/api/ingest", url);
+}
+
+fn testLog(timestamp: i64, priority: u8, message: []const u8) logs_mod.LogEntry {
+    return .{
+        .timestamp = timestamp,
+        .source = "systemd",
+        .unit = "nginx",
+        .identifier = "nginx",
+        .systemd_unit = "nginx.service",
+        .priority = priority,
+        .message = message,
+        .pid = null,
+    };
+}
+
+test "selectLogsForUpload with no rules uploads every entry" {
+    var dest: [max_logs_per_payload]LogPayload = undefined;
+    const entries = [_]logs_mod.LogEntry{
+        testLog(1, 6, "info one"),
+        testLog(2, 4, "warning two"),
+    };
+
+    const selected = selectLogsForUpload(&dest, &entries, &.{});
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+}
+
+test "a drop rule suppresses noise but the severity floor keeps errors" {
+    var dest: [max_logs_per_payload]LogPayload = undefined;
+    const entries = [_]logs_mod.LogEntry{
+        testLog(1, 6, "GET /health 200"), // noisy info line
+        testLog(2, 3, "upstream connection refused"), // real error
+    };
+
+    // Drop everything from nginx.service.
+    const log_rules = [_]rules_mod.LogRule{
+        .{
+            .match = &.{.{ .field = .systemd_unit, .op = .eq, .value = "nginx.service" }},
+            .action = .drop,
+        },
+    };
+
+    const selected = selectLogsForUpload(&dest, &entries, &log_rules);
+
+    // The info line is dropped by the rule; the priority-3 error survives
+    // the severity floor that no rule can override.
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqual(@as(i64, 2), selected[0].timestamp);
+    try std.testing.expectEqual(@as(u8, 3), selected[0].priority);
 }

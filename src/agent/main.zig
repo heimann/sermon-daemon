@@ -1,6 +1,7 @@
 const std = @import("std");
 const collector_mod = @import("collector");
 const logs_mod = @import("logs");
+const rules_mod = @import("rules");
 const proc_self_mod = @import("proc_self");
 const proxmox_mod = @import("proxmox");
 const push_mod = @import("push");
@@ -10,6 +11,10 @@ const default_db_path = "~/.local/share/sermon/metrics.db";
 const default_config_path = "~/.config/sermon/config.json";
 const default_interval: u64 = 10;
 const default_retention: i64 = 7 * 24 * 60 * 60; // 7 days
+const default_rules_filename = "log_rules.json";
+// Rules live in their own file (not config.json) partly because the config
+// loader reads into a fixed 4 KiB buffer; a rule set can be much larger.
+const max_rules_file_bytes = 256 * 1024;
 
 const Config = struct {
     db_path: ?[]const u8 = null,
@@ -35,6 +40,39 @@ fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.P
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return null;
+}
+
+/// Load push-time log rules from `log_rules.json` next to the config file.
+/// A missing file is silent (no rules); a present-but-unparseable file warns
+/// and is ignored, so the daemon never half-applies a broken rule set.
+fn loadRules(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(rules_mod.RuleFile) {
+    const dir = std.fs.path.dirname(config_path) orelse return null;
+    const rules_path_raw = std.fs.path.join(allocator, &.{ dir, default_rules_filename }) catch return null;
+    defer allocator.free(rules_path_raw);
+
+    const path = expandPath(allocator, rules_path_raw) catch return null;
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    const stat = file.stat() catch return null;
+    if (stat.size > max_rules_file_bytes) {
+        std.debug.print("Warning: {s} exceeds {d} bytes - log rules ignored\n", .{ path, max_rules_file_bytes });
+        return null;
+    }
+
+    const contents = allocator.alloc(u8, @intCast(stat.size)) catch return null;
+    defer allocator.free(contents);
+    const len = file.readAll(contents) catch return null;
+
+    return std.json.parseFromSlice(rules_mod.RuleFile, allocator, contents[0..len], .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| {
+        std.debug.print("Warning: failed to parse {s}: {} - log rules disabled\n", .{ path, err });
+        return null;
+    };
 }
 
 var running: bool = true;
@@ -77,6 +115,13 @@ pub fn main() !void {
         std.process.exit(1);
     }
     defer if (config) |c| c.deinit();
+
+    // Push-time log rules live in log_rules.json next to the config file.
+    // Optional - a missing file just means no filtering.
+    const rules_parsed = loadRules(allocator, config_path);
+    defer if (rules_parsed) |r| r.deinit();
+    const log_rules: []const rules_mod.LogRule =
+        if (rules_parsed) |r| r.value.log_rules else &.{};
 
     var db_path: []const u8 = if (config) |c| c.value.db_path orelse default_db_path else default_db_path;
     var interval: u64 = if (config) |c| c.value.interval orelse default_interval else default_interval;
@@ -176,6 +221,9 @@ pub fn main() !void {
     defer storage.deinit();
 
     std.debug.print("sermon-agent started (db={s}, interval={d}s, memory_limit={d}MB)\n", .{ final_db_path, interval, memory_limit_mb });
+    if (log_rules.len > 0) {
+        std.debug.print("loaded {d} log rule(s)\n", .{log_rules.len});
+    }
 
     // Initialize collector
     var coll = try collector_mod.Collector.init(allocator);
@@ -394,6 +442,7 @@ pub fn main() !void {
                     procs,
                     disks,
                     push_logs.items,
+                    log_rules,
                     self_sample,
                     storage.consecutive_insert_failures,
                     storage.dbSizeBytes(),
