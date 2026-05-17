@@ -67,9 +67,14 @@ Standalone example:
 {
   "db_path": "~/.local/share/sermon/metrics.db",
   "interval": 10,
-  "retention": 604800
+  "retention": 604800,
+  "memory_limit_mb": 512
 }
 ```
+
+`memory_limit_mb` caps the DuckDB buffer pool (default 512). It must stay
+large enough for a checkpoint to allocate within - too low and a populated
+database can never checkpoint, wedging the write-ahead log.
 
 Remote push example:
 
