@@ -142,7 +142,7 @@ const JournalTailer = struct {
 
     pub fn init(allocator: Allocator) !JournalTailer {
         var process = ChildProcess.init(&[_][]const u8{
-            "/usr/bin/journalctl",
+            "/usr/bin/journalctl", // absolute path: standard on Proxmox/modern systemd distros (/bin -> /usr/bin)
             "-f", // follow
             "-o", "json", // JSON output
             "--since", "now", // only new entries
