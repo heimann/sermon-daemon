@@ -17,6 +17,8 @@ const Config = struct {
     retention: ?i64 = null,
     server_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
+    // DuckDB buffer-pool cap (MB). See Storage.default_memory_limit_mb.
+    memory_limit_mb: ?u32 = null,
 };
 
 fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(Config) {
@@ -80,6 +82,10 @@ pub fn main() !void {
     var interval: u64 = if (config) |c| c.value.interval orelse default_interval else default_interval;
     var server_url: ?[]const u8 = if (config) |c| c.value.server_url else null;
     var api_key: ?[]const u8 = if (config) |c| c.value.api_key else null;
+    const memory_limit_mb: u32 = if (config) |c|
+        c.value.memory_limit_mb orelse storage_mod.Storage.default_memory_limit_mb
+    else
+        storage_mod.Storage.default_memory_limit_mb;
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -166,10 +172,10 @@ pub fn main() !void {
     // Open storage once for the daemon's lifetime. Reopening per-cycle
     // mmaps the entire DB on every collection tick and pegs CPU on
     // populated databases (~400 MB and up). See scripts/bench/.
-    var storage = try storage_mod.Storage.init(allocator, final_db_path);
+    var storage = try storage_mod.Storage.initWithMemoryLimit(allocator, final_db_path, memory_limit_mb);
     defer storage.deinit();
 
-    std.debug.print("sermon-agent started (db={s}, interval={d}s)\n", .{ final_db_path, interval });
+    std.debug.print("sermon-agent started (db={s}, interval={d}s, memory_limit={d}MB)\n", .{ final_db_path, interval, memory_limit_mb });
 
     // Initialize collector
     var coll = try collector_mod.Collector.init(allocator);
