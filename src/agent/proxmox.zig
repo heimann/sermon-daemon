@@ -216,7 +216,7 @@ fn readPveVersion(allocator: Allocator) ![]u8 {
     var stdout_buf: [1024]u8 = undefined;
     const n = runPveShell(
         allocator,
-        &[_][]const u8{"/usr/bin/pveversion"},
+        &[_][]const u8{"/usr/bin/pveversion"}, // absolute path: standard on Proxmox (/bin -> /usr/bin)
         &stdout_buf,
     ) catch return allocator.dupe(u8, "unknown");
 
@@ -319,7 +319,7 @@ fn runPveShell(allocator: Allocator, argv: []const []const u8, out_buf: []u8) !u
 /// won't exist and the call will error.
 pub fn collectInventory(allocator: Allocator) ![]ContainerEntry {
     const argv = [_][]const u8{
-        "/usr/bin/pvesh",
+        "/usr/bin/pvesh", // absolute path: standard on Proxmox (/bin -> /usr/bin)
         "get",
         "/cluster/resources",
         "--type",
