@@ -133,6 +133,41 @@ pub const RuleSet = struct {
     }
 };
 
+/// The result of rebuilding a combined rule set from local and server rules.
+/// Caller frees `rules` and `counts` (e.g. when the next refresh replaces
+/// them). The local prefix of `counts` is preserved from `prev_counts`; the
+/// server suffix starts at zero so newly-pushed sample rules begin fresh.
+pub const CombinedRules = struct {
+    rules: []LogRule,
+    counts: []u64,
+};
+
+/// Concatenate `local` rules and `server` rules into a freshly-allocated
+/// combined slice, with parallel counters. Local first means an operator's
+/// hand-edited rules are evaluated before server-pushed ones - "operator
+/// override the control plane."
+pub fn combineRules(
+    allocator: std.mem.Allocator,
+    local: []const LogRule,
+    server: []const LogRule,
+    prev_counts: []const u64,
+) !CombinedRules {
+    const total = local.len + server.len;
+    const rules = try allocator.alloc(LogRule, total);
+    errdefer allocator.free(rules);
+    const counts = try allocator.alloc(u64, total);
+    errdefer allocator.free(counts);
+
+    @memcpy(rules[0..local.len], local);
+    @memcpy(rules[local.len..], server);
+
+    const preserve_n = @min(local.len, prev_counts.len);
+    @memcpy(counts[0..preserve_n], prev_counts[0..preserve_n]);
+    @memset(counts[preserve_n..], 0);
+
+    return .{ .rules = rules, .counts = counts };
+}
+
 // ── Tests ──
 
 fn testEntry() logs.LogEntry {
@@ -348,4 +383,57 @@ test "RuleSet.eligible: a sample rule with default keep_one_in keeps all" {
 
     try std.testing.expect(set.eligible(testEntry()));
     try std.testing.expect(set.eligible(testEntry()));
+}
+
+test "combineRules concatenates local then server and preserves local counts" {
+    const allocator = std.testing.allocator;
+    const local = [_]LogRule{
+        .{ .match = &.{cond(.identifier, .eq, "nginx")}, .action = .sample, .keep_one_in = 10 },
+    };
+    const server = [_]LogRule{
+        .{ .match = &.{cond(.systemd_unit, .eq, "cron.service")}, .action = .drop },
+    };
+    const prev_counts = [_]u64{42};
+
+    const combined = try combineRules(allocator, &local, &server, &prev_counts);
+    defer allocator.free(combined.rules);
+    defer allocator.free(combined.counts);
+
+    // Local first, then server.
+    try std.testing.expectEqual(@as(usize, 2), combined.rules.len);
+    try std.testing.expectEqual(Action.sample, combined.rules[0].action);
+    try std.testing.expectEqual(Action.drop, combined.rules[1].action);
+    // Local counter preserved, server counter starts fresh.
+    try std.testing.expectEqual(@as(u64, 42), combined.counts[0]);
+    try std.testing.expectEqual(@as(u64, 0), combined.counts[1]);
+}
+
+test "combineRules handles an empty local list" {
+    const allocator = std.testing.allocator;
+    const server = [_]LogRule{
+        .{ .match = &.{}, .action = .drop },
+    };
+    const prev_counts: [0]u64 = .{};
+
+    const combined = try combineRules(allocator, &.{}, &server, &prev_counts);
+    defer allocator.free(combined.rules);
+    defer allocator.free(combined.counts);
+
+    try std.testing.expectEqual(@as(usize, 1), combined.rules.len);
+    try std.testing.expectEqual(@as(u64, 0), combined.counts[0]);
+}
+
+test "combineRules handles an empty server list" {
+    const allocator = std.testing.allocator;
+    const local = [_]LogRule{
+        .{ .match = &.{cond(.identifier, .eq, "nginx")}, .action = .keep },
+    };
+    const prev_counts = [_]u64{7};
+
+    const combined = try combineRules(allocator, &local, &.{}, &prev_counts);
+    defer allocator.free(combined.rules);
+    defer allocator.free(combined.counts);
+
+    try std.testing.expectEqual(@as(usize, 1), combined.rules.len);
+    try std.testing.expectEqual(@as(u64, 7), combined.counts[0]);
 }
