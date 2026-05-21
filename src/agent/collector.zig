@@ -262,7 +262,29 @@ pub const Collector = struct {
             }
         }
 
+        // Drop CPU-delta baselines for PIDs that no longer exist. Without this
+        // prev_processes grows unbounded as PIDs cycle, leaking ~tens of bytes
+        // per dead process every interval.
+        try self.pruneDeadProcesses(allocator, processes.items);
+
         return processes.toOwnedSlice(allocator);
+    }
+
+    fn pruneDeadProcesses(self: *Collector, allocator: Allocator, alive: []const ProcessInfo) !void {
+        if (self.prev_processes.count() <= alive.len) return;
+
+        var seen = std.AutoHashMap(u32, void).init(allocator);
+        defer seen.deinit();
+        try seen.ensureTotalCapacity(@intCast(alive.len));
+        for (alive) |proc| seen.putAssumeCapacity(proc.pid, {});
+
+        var stale = std.ArrayList(u32){};
+        defer stale.deinit(allocator);
+        var it = self.prev_processes.keyIterator();
+        while (it.next()) |key_ptr| {
+            if (!seen.contains(key_ptr.*)) try stale.append(allocator, key_ptr.*);
+        }
+        for (stale.items) |pid| _ = self.prev_processes.remove(pid);
     }
 
     fn collectProcess(self: *Collector, allocator: Allocator, pid: u32, current_time: i64) !ProcessInfo {
@@ -620,6 +642,32 @@ test "collect processes" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "prunes dead pids from prev_processes" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    // Seed baselines for PIDs that cannot exist (above pid_max).
+    const fake_pids = [_]u32{ 4_000_000_001, 4_000_000_002, 4_000_000_003 };
+    for (fake_pids) |pid| {
+        try collector.prev_processes.put(pid, .{ .utime = 1, .stime = 1, .timestamp = 0 });
+    }
+
+    const processes = try collector.collectProcesses(allocator);
+    defer {
+        for (processes) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+        }
+        allocator.free(processes);
+    }
+
+    // Dead PIDs must be gone; the map should not exceed the live process count.
+    for (fake_pids) |pid| try std.testing.expect(!collector.prev_processes.contains(pid));
+    try std.testing.expect(collector.prev_processes.count() <= processes.len);
 }
 
 test "collect disks" {
