@@ -337,17 +337,28 @@ fn truncateUtf8(value: []const u8, max_bytes: usize) []const u8 {
     return value[0..0];
 }
 
+/// The fields the daemon cares about in an `/api/ingest` 200 response body.
+/// `log_rules` defaults to empty so a pre-step-B web server (whose response
+/// has no `log_rules` key) parses cleanly with no server-pushed rules.
+pub const IngestResponse = struct {
+    log_rules: []const rules_mod.LogRule = &.{},
+};
+
 pub fn pushMetrics(
     allocator: Allocator,
     server_url: []const u8,
     api_key: []const u8,
     payload: []const u8,
-) !void {
+) !std.json.Parsed(IngestResponse) {
     const ingest_url = try buildIngestUrl(allocator, server_url);
     defer allocator.free(ingest_url);
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
+
+    // Capture the response body so we can lift server-pushed log rules out.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
     const result = try client.fetch(.{
         .location = .{ .url = ingest_url },
@@ -357,11 +368,18 @@ pub fn pushMetrics(
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "x-sermon-ingestion-key", .value = api_key },
         },
+        .response_writer = &aw.writer,
     });
 
     if (result.status.class() != .success) {
         return error.IngestRejected;
     }
+
+    const body = aw.writer.buffer[0..aw.writer.end];
+    return std.json.parseFromSlice(IngestResponse, allocator, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
 }
 
 fn buildIngestUrl(allocator: Allocator, server_url: []const u8) ![]u8 {
@@ -728,4 +746,42 @@ test "a sample rule thins a noisy unit" {
     const selected = selectLogsForUpload(&dest, &entries, rule_set);
     // 6 priority-6 entries sampled 1-in-2 -> 3 survive.
     try std.testing.expectEqual(@as(usize, 3), selected.len);
+}
+
+test "IngestResponse lifts log_rules out of the /api/ingest response body" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"status":"ok","server_id":"abc","sample_id":"def","log_count":3,
+        \\ "log_rules":[
+        \\   {"name":"drop-cron","match":[{"field":"systemd_unit","op":"eq","value":"cron.service"}],"action":"drop"},
+        \\   {"name":"thin-nginx","match":[{"field":"identifier","op":"eq","value":"nginx"}],"action":"sample","keep_one_in":100}
+        \\ ]}
+    ;
+
+    const parsed = try std.json.parseFromSlice(IngestResponse, allocator, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.log_rules.len);
+    try std.testing.expectEqualStrings("drop-cron", parsed.value.log_rules[0].name.?);
+    try std.testing.expectEqual(rules_mod.Action.drop, parsed.value.log_rules[0].action);
+    try std.testing.expectEqual(rules_mod.Action.sample, parsed.value.log_rules[1].action);
+    try std.testing.expectEqual(@as(u32, 100), parsed.value.log_rules[1].keep_one_in);
+}
+
+test "IngestResponse treats a missing log_rules key as empty (old web)" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"status":"ok","server_id":"abc","sample_id":"def","log_count":0}
+    ;
+
+    const parsed = try std.json.parseFromSlice(IngestResponse, allocator, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.log_rules.len);
 }

@@ -165,13 +165,26 @@ pub fn main() !void {
     const log_rules: []const rules_mod.LogRule =
         if (rules_parsed) |r| r.value.log_rules else &.{};
 
-    // Per-rule sample counters, parallel to log_rules, persisting across push
-    // cycles so a "keep 1 in N" rule thins the whole stream rather than each
-    // cycle in isolation.
-    const sample_counts = try allocator.alloc(u64, log_rules.len);
-    defer allocator.free(sample_counts);
-    @memset(sample_counts, 0);
-    const rule_set = rules_mod.RuleSet{ .rules = log_rules, .sample_counts = sample_counts };
+    // The effective rule set is `local ++ server-pushed`, mutable across the
+    // loop's lifetime. Local first means a hand-edited log_rules.json always
+    // wins over what the control plane ships. `combined_counts` carries the
+    // per-rule sample counters; the local prefix is preserved when server
+    // rules get refreshed, the server suffix resets to zero.
+    var combined_rules = try allocator.alloc(rules_mod.LogRule, log_rules.len);
+    defer allocator.free(combined_rules);
+    @memcpy(combined_rules, log_rules);
+
+    var combined_counts = try allocator.alloc(u64, log_rules.len);
+    defer allocator.free(combined_counts);
+    @memset(combined_counts, 0);
+
+    var rule_set = rules_mod.RuleSet{ .rules = combined_rules, .sample_counts = combined_counts };
+
+    // The most recent ingest response; held so server-pushed rule slices
+    // stay valid for `combined_rules` to reference across cycles. Replaced
+    // (old deinited) whenever a fresh response brings new rules.
+    var server_rules_parsed: ?std.json.Parsed(push_mod.IngestResponse) = null;
+    defer if (server_rules_parsed) |p| p.deinit();
 
     var db_path: []const u8 = if (config) |c| c.value.db_path orelse default_db_path else default_db_path;
     var interval: u64 = if (config) |c| c.value.interval orelse default_interval else default_interval;
@@ -689,9 +702,28 @@ pub fn main() !void {
 
                 if (maybe_payload) |payload| {
                     defer allocator.free(payload);
-                    push_mod.pushMetrics(allocator, url, key, payload) catch |err| {
+                    const maybe_response = push_mod.pushMetrics(allocator, url, key, payload) catch |err| push_blk: {
                         std.debug.print("Warning: metrics push failed: {}\n", .{err});
+                        break :push_blk null;
                     };
+
+                    if (maybe_response) |response| {
+                        // Rebuild the effective rule set from local + server-
+                        // pushed. On alloc failure, keep the previous rule_set
+                        // and discard the new response.
+                        if (rules_mod.combineRules(allocator, log_rules, response.value.log_rules, combined_counts)) |combined| {
+                            allocator.free(combined_rules);
+                            allocator.free(combined_counts);
+                            combined_rules = combined.rules;
+                            combined_counts = combined.counts;
+                            rule_set = .{ .rules = combined_rules, .sample_counts = combined_counts };
+                            if (server_rules_parsed) |old| old.deinit();
+                            server_rules_parsed = response;
+                        } else |err| {
+                            std.debug.print("Warning: rule set update failed: {}\n", .{err});
+                            response.deinit();
+                        }
+                    }
                 }
             }
         }
