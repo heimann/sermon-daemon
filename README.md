@@ -68,13 +68,22 @@ Standalone example:
   "db_path": "~/.local/share/sermon/metrics.db",
   "interval": 10,
   "retention": 604800,
-  "memory_limit_mb": 512
+  "memory_limit_mb": 512,
+  "max_processes": 20
 }
 ```
 
 `memory_limit_mb` caps the DuckDB buffer pool (default 512). It must stay
 large enough for a checkpoint to allocate within - too low and a populated
 database can never checkpoint, wedging the write-ahead log.
+
+`max_processes` caps how many processes are stored per collection cycle
+(default 20). Each cycle keeps the union of the top-N by CPU and the top-N by
+memory - the processes an operator actually queries - which cuts process-table
+row growth (the dominant source of DB size) by roughly 5-15x and shrinks the
+remote push payload. CPU deltas and dead-process pruning still run against the
+full set first, so accuracy is unaffected. Set `max_processes` to `0` to store
+every process (the original behavior).
 
 Remote push example:
 
