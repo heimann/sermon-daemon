@@ -12,6 +12,11 @@ const default_config_path = "~/.config/sermon/config.json";
 const default_interval: u64 = 10;
 const default_retention: i64 = 7 * 24 * 60 * 60; // 7 days
 const default_rules_filename = "log_rules.json";
+// Processes stored per cycle when config.max_processes is unset. Snapshotting
+// every process is the dominant source of DB growth (millions of rows/week);
+// keeping the top-N by CPU and memory cuts that ~5-15x. Set max_processes to 0
+// to keep all (Collector.keep_all_processes).
+const default_max_processes: u32 = 20;
 // Rules live in their own file (not config.json) partly because the config
 // loader reads into a fixed 4 KiB buffer; a rule set can be much larger.
 const max_rules_file_bytes = 256 * 1024;
@@ -24,6 +29,9 @@ const Config = struct {
     api_key: ?[]const u8 = null,
     // DuckDB buffer-pool cap (MB). See Storage.default_memory_limit_mb.
     memory_limit_mb: ?u32 = null,
+    // Max processes stored per cycle (top-N by CPU and memory). 0 keeps every
+    // process (old behavior). See default_max_processes / keep_all_processes.
+    max_processes: ?u32 = null,
 };
 
 fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(Config) {
@@ -139,6 +147,10 @@ pub fn main() !void {
         c.value.memory_limit_mb orelse storage_mod.Storage.default_memory_limit_mb
     else
         storage_mod.Storage.default_memory_limit_mb;
+    const max_processes: u32 = if (config) |c|
+        c.value.max_processes orelse default_max_processes
+    else
+        default_max_processes;
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -228,13 +240,16 @@ pub fn main() !void {
     var storage = try storage_mod.Storage.initWithMemoryLimit(allocator, final_db_path, memory_limit_mb);
     defer storage.deinit();
 
-    std.debug.print("sermon-agent started (db={s}, interval={d}s, memory_limit={d}MB)\n", .{ final_db_path, interval, memory_limit_mb });
+    std.debug.print("sermon-agent started (db={s}, interval={d}s, memory_limit={d}MB, max_processes={d})\n", .{ final_db_path, interval, memory_limit_mb, max_processes });
     if (log_rules.len > 0) {
         std.debug.print("loaded {d} log rule(s)\n", .{log_rules.len});
     }
 
-    // Initialize collector
+    // Initialize collector. max_processes caps how many processes each cycle
+    // stores (top-N by CPU and memory); set on the collector so both the
+    // baseline and loop calls to collectProcesses trim identically.
     var coll = try collector_mod.Collector.init(allocator);
+    coll.max_processes = max_processes;
     defer coll.deinit();
 
     const hostname = try readHostname(allocator);
