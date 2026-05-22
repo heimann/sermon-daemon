@@ -70,6 +70,14 @@ pub const Collector = struct {
     prev_processes: std.AutoHashMap(u32, ProcessStats),
     clock_ticks: u64,
     page_size: u64,
+    // Cap on processes returned per cycle. collectProcesses keeps the union of
+    // the top-N by CPU and top-N by memory; everything else is dropped before
+    // being returned. keep_all_processes disables trimming (stores every
+    // process, the original behavior).
+    max_processes: u32,
+
+    /// Sentinel for `max_processes`: keep every process, no trimming.
+    pub const keep_all_processes: u32 = 0;
 
     pub fn init(allocator: Allocator) !Collector {
         const clock_ticks = readClockTicks() catch 100;
@@ -80,6 +88,7 @@ pub const Collector = struct {
             .prev_processes = std.AutoHashMap(u32, ProcessStats).init(allocator),
             .clock_ticks = clock_ticks,
             .page_size = @intCast(std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE))),
+            .max_processes = keep_all_processes,
         };
     }
 
@@ -262,10 +271,19 @@ pub const Collector = struct {
             }
         }
 
-        // Drop CPU-delta baselines for PIDs that no longer exist. Without this
-        // prev_processes grows unbounded as PIDs cycle, leaking ~tens of bytes
-        // per dead process every interval.
+        // Drop CPU-delta baselines for PIDs that no longer exist before any
+        // returned/stored-process trimming. Pruning must see the full live set.
         try self.pruneDeadProcesses(allocator, processes.items);
+
+        // Trim to the most interesting processes for this cycle. This must run
+        // AFTER the full list is built and pruned: collectProcess updates
+        // prev_processes (the CPU-delta baseline) for every PID, so trimming
+        // earlier would starve future cycles of deltas and break pruning.
+        if (self.max_processes != keep_all_processes and
+            processes.items.len > self.max_processes)
+        {
+            try self.trimToTopN(allocator, &processes, self.max_processes);
+        }
 
         return processes.toOwnedSlice(allocator);
     }
@@ -287,6 +305,65 @@ pub const Collector = struct {
         for (stale.items) |pid| _ = self.prev_processes.remove(pid);
     }
 
+    /// Keep the union of the top `n` processes by CPU and the top `n` by
+    /// resident memory, deduplicated by PID, and free the owned strings of
+    /// everything dropped. On return `processes` holds only the kept entries,
+    /// each still fully owned by the caller.
+    fn trimToTopN(self: *Collector, allocator: Allocator, processes: *std.ArrayList(ProcessInfo), n: u32) !void {
+        _ = self;
+        const items = processes.items;
+
+        // First-seen processes have NaN cpu_percent (no prior delta). Treat NaN
+        // as 0 so ranking is total and they sort to the bottom on CPU.
+        const cpuKey = struct {
+            fn key(p: ProcessInfo) f32 {
+                return if (std.math.isNan(p.cpu_percent)) 0.0 else p.cpu_percent;
+            }
+        }.key;
+
+        // Mark the PIDs we keep. An index set avoids mutating the list while we
+        // still need the original ordering to pick winners.
+        var keep = try std.DynamicBitSet.initEmpty(allocator, items.len);
+        defer keep.deinit();
+
+        // Order is a scratch index array we re-sort twice (by CPU, then by mem).
+        const order = try allocator.alloc(usize, items.len);
+        defer allocator.free(order);
+        for (order, 0..) |*o, i| o.* = i;
+
+        const SortCtx = struct {
+            items: []const ProcessInfo,
+            by_cpu: bool,
+            fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                if (ctx.by_cpu) {
+                    return cpuKey(ctx.items[a]) > cpuKey(ctx.items[b]);
+                }
+                return ctx.items[a].mem_rss > ctx.items[b].mem_rss;
+            }
+        };
+
+        std.mem.sort(usize, order, SortCtx{ .items = items, .by_cpu = true }, SortCtx.lessThan);
+        for (order[0..n]) |idx| keep.set(idx);
+
+        std.mem.sort(usize, order, SortCtx{ .items = items, .by_cpu = false }, SortCtx.lessThan);
+        for (order[0..n]) |idx| keep.set(idx);
+
+        // Compact in place: free dropped entries' owned strings, shift kept
+        // ones down. The trailing slots past `kept` are stale duplicates we
+        // must not free again, so shrink the list to drop them.
+        var kept: usize = 0;
+        for (items, 0..) |proc, i| {
+            if (keep.isSet(i)) {
+                items[kept] = proc;
+                kept += 1;
+            } else {
+                allocator.free(proc.name);
+                allocator.free(proc.cmdline);
+                allocator.free(proc.username);
+            }
+        }
+        processes.shrinkRetainingCapacity(kept);
+    }
     fn collectProcess(self: *Collector, allocator: Allocator, pid: u32, current_time: i64) !ProcessInfo {
         // Read /proc/[pid]/stat
         var stat_path_buf: [64]u8 = undefined;
@@ -668,6 +745,89 @@ test "prunes dead pids from prev_processes" {
     // Dead PIDs must be gone; the map should not exceed the live process count.
     for (fake_pids) |pid| try std.testing.expect(!collector.prev_processes.contains(pid));
     try std.testing.expect(collector.prev_processes.count() <= processes.len);
+}
+
+test "collect processes top-n trimming end to end" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    const n: u32 = 5;
+    collector.max_processes = n;
+
+    const processes = try collector.collectProcesses(allocator);
+    defer {
+        for (processes) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+        }
+        allocator.free(processes);
+    }
+
+    // Real hosts run far more than 2*n processes, so trimming must engage and
+    // the union of top-n-by-cpu and top-n-by-mem caps the result at 2*n.
+    try std.testing.expect(processes.len > 0);
+    try std.testing.expect(processes.len <= 2 * n);
+}
+
+// Drives trimToTopN with a synthetic list so the selection invariant is
+// deterministic: the global highest-cpu and highest-mem entries must survive,
+// dropped entries' strings are freed, and the result is the deduplicated union.
+test "trimToTopN keeps top cpu and top mem" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    const Spec = struct { pid: u32, cpu: f32, mem: u64 };
+    const specs = [_]Spec{
+        .{ .pid = 1, .cpu = 90.0, .mem = 100 }, // top cpu
+        .{ .pid = 2, .cpu = 1.0, .mem = 9000 }, // top mem
+        .{ .pid = 3, .cpu = std.math.nan(f32), .mem = 50 }, // NaN cpu -> ranks as 0
+        .{ .pid = 4, .cpu = 5.0, .mem = 200 },
+        .{ .pid = 5, .cpu = 2.0, .mem = 300 },
+        .{ .pid = 6, .cpu = 0.5, .mem = 10 }, // should be dropped
+        .{ .pid = 7, .cpu = 0.1, .mem = 5 }, // should be dropped
+    };
+
+    var processes = try std.ArrayList(ProcessInfo).initCapacity(allocator, specs.len);
+    defer {
+        for (processes.items) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+        }
+        processes.deinit(allocator);
+    }
+    for (specs) |s| {
+        try processes.append(allocator, .{
+            .pid = s.pid,
+            .name = try allocator.dupe(u8, "p"),
+            .cmdline = try allocator.dupe(u8, "c"),
+            .username = try allocator.dupe(u8, "u"),
+            .state = 'R',
+            .cpu_percent = s.cpu,
+            .mem_rss = s.mem,
+            .threads = 1,
+        });
+    }
+
+    const n: u32 = 2;
+    try collector.trimToTopN(allocator, &processes, n);
+
+    // Top-2 by cpu = {1, 4}; top-2 by mem = {2, 5}; union = 4 entries.
+    try std.testing.expectEqual(@as(usize, 4), processes.items.len);
+
+    var has_top_cpu = false;
+    var has_top_mem = false;
+    for (processes.items) |proc| {
+        if (proc.pid == 1) has_top_cpu = true;
+        if (proc.pid == 2) has_top_mem = true;
+        // The two lowest-ranked entries must have been dropped.
+        try std.testing.expect(proc.pid != 6 and proc.pid != 7);
+    }
+    try std.testing.expect(has_top_cpu);
+    try std.testing.expect(has_top_mem);
 }
 
 test "collect disks" {
