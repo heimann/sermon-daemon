@@ -263,6 +263,85 @@ pub const Storage = struct {
         self.conn = new_conn;
     }
 
+    /// Quarantine the current DB/WAL by renaming them with a Unix-timestamp
+    /// suffix, then open a fresh database at the original path. Called by the
+    /// main loop when a normal reconnect was already attempted and the DB is
+    /// still unwritable (e.g. the file is permanently too large for memory_limit).
+    ///
+    /// On success, consecutive_insert_failures is reset to 0.
+    /// On error, handles are already closed; the Storage is dead and must only
+    /// be deinit()'d, never reused.
+    pub fn quarantineAndReopen(self: *Storage) !void {
+        if (self.read_only) return error.DatabaseError;
+        if (std.mem.eql(u8, self.db_path, ":memory:")) return error.DatabaseError;
+
+        const ts = std.time.timestamp();
+
+        // Close handles BEFORE renaming (same reason as reconnect: two live
+        // instances on the same path race on the spill dir and crash).
+        // Also safe when called after a failed reconnect (handles already null).
+        c.duckdb_disconnect(&self.conn);
+        c.duckdb_close(&self.db);
+
+        const wedged_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}.wedged-{d}",
+            .{ self.db_path, ts },
+        );
+        defer self.allocator.free(wedged_path);
+
+        // Rename main DB file to preserve it for triage. Required: if this
+        // fails, return the error (caller should exit for a systemd restart).
+        std.fs.renameAbsolute(self.db_path, wedged_path) catch |err| {
+            std.log.err("DuckDB quarantine: rename failed ({s} -> {s}): {}", .{ self.db_path, wedged_path, err });
+            return err;
+        };
+        std.log.warn("DuckDB quarantined: {s} -> {s}", .{ self.db_path, wedged_path });
+
+        // Best-effort: rename WAL file. A missing WAL is normal (DuckDB removes
+        // it on clean checkpoint). Allocation failure is treated as "skip".
+        if (std.fmt.allocPrint(self.allocator, "{s}.wal", .{self.db_path})) |wal_path| {
+            defer self.allocator.free(wal_path);
+            if (std.fmt.allocPrint(self.allocator, "{s}.wal.wedged-{d}", .{ self.db_path, ts })) |wedged_wal| {
+                defer self.allocator.free(wedged_wal);
+                std.fs.renameAbsolute(wal_path, wedged_wal) catch {};
+            } else |_| {}
+        } else |_| {}
+
+        // Open fresh DB at the original path.
+        const c_path = try self.allocator.dupeZ(u8, self.db_path);
+        defer self.allocator.free(c_path);
+
+        var new_db: c.duckdb_database = undefined;
+        const open_state = c.duckdb_open(c_path.ptr, &new_db);
+        if (open_state == c.DuckDBError) return error.DatabaseError;
+        errdefer c.duckdb_close(&new_db);
+
+        var new_conn: c.duckdb_connection = undefined;
+        const conn_state = c.duckdb_connect(new_db, &new_conn);
+        if (conn_state == c.DuckDBError) return error.ConnectionError;
+        errdefer c.duckdb_disconnect(&new_conn);
+
+        try applyMemoryLimit(new_conn, self.memory_limit_mb);
+        try initSchema(new_conn);
+
+        // Restrict the fresh file to 0600 (matches initWithMode).
+        if (std.fs.path.isAbsolute(self.db_path)) {
+            if (std.fs.openFileAbsolute(self.db_path, .{})) |file| {
+                defer file.close();
+                file.chmod(0o600) catch |err| {
+                    std.log.warn("DuckDB chmod 0600 failed for {s}: {}", .{ self.db_path, err });
+                };
+            } else |err| {
+                std.log.warn("DuckDB chmod open failed for {s}: {}", .{ self.db_path, err });
+            }
+        }
+
+        self.db = new_db;
+        self.conn = new_conn;
+        self.consecutive_insert_failures = 0;
+    }
+
     fn initSchema(conn: c.duckdb_connection) !void {
         const schema_sql =
             \\CREATE TABLE IF NOT EXISTS metrics (
@@ -1184,4 +1263,51 @@ test "Storage: retention cleanup" {
     // Verify data was deleted
     const retrieved = try storage.getLatestMetrics();
     try std.testing.expect(retrieved == null);
+}
+
+test "Storage: quarantineAndReopen renames wedged DB and opens fresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, "metrics.db" });
+    defer allocator.free(db_path);
+
+    var storage = try Storage.init(allocator, db_path);
+    defer storage.deinit();
+
+    const metrics = SystemMetrics{
+        .cpu_percent = 10.0,
+        .cpu_user = 5.0,
+        .cpu_system = 5.0,
+        .cpu_iowait = 0.0,
+        .mem_total = 1_000_000_000,
+        .mem_used = 500_000_000,
+        .mem_percent = 50.0,
+        .swap_total = 0,
+        .swap_used = 0,
+    };
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+
+    try storage.quarantineAndReopen();
+
+    // Counter should be reset and the fresh DB should be writable.
+    try std.testing.expectEqual(@as(u32, 0), storage.consecutive_insert_failures);
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+
+    // A .wedged-<timestamp> file should exist in the temp dir.
+    var found_wedged = false;
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+    var iter = iter_dir.iterate();
+    while (try iter.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "metrics.db.wedged-")) {
+            found_wedged = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_wedged);
 }
