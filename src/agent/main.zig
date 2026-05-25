@@ -295,7 +295,20 @@ pub fn main() !void {
     }
     std.Thread.sleep(1 * std.time.ns_per_s);
 
+    // Run retention once on startup to trim a pre-wedged DB before the main
+    // loop begins. Non-fatal: the main loop's failsafe handles persistent
+    // storage failures; log once and continue.
+    {
+        const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
+        storage.runRetention(retention) catch |err| {
+            std.debug.print("Warning: startup retention failed: {}\n", .{err});
+        };
+    }
+
     var retention_counter: u64 = 0;
+    // Tracks whether a reconnect has been attempted since the last successful
+    // write. Used for two-stage recovery: reconnect once, then quarantine.
+    var reconnect_attempted: bool = false;
     var self_state = proc_self_mod.State.init();
     var ct_metrics_state = proxmox_mod.ContainerMetricsState.init(allocator);
     defer ct_metrics_state.deinit();
@@ -372,40 +385,57 @@ pub fn main() !void {
 
         // Write everything (storage held open across cycles)
         {
-            storage.insertMetrics(now, metrics) catch |err| {
-                std.debug.print("Warning: metrics insert failed: {}\n", .{err});
-            };
-            if (procs.len > 0) {
+            // Firehose guard: after the first insert failure in a cycle, skip
+            // all remaining DB writes for that cycle. This caps failure logging
+            // at one line per cycle rather than up to 1000 (one per log entry).
+            // Logs are still drained from the tailer for the push path.
+            var storage_failed = false;
+
+            if (!storage_failed) {
+                storage.insertMetrics(now, metrics) catch |err| {
+                    std.debug.print("Warning: metrics insert failed: {}\n", .{err});
+                    storage_failed = true;
+                };
+            }
+            if (!storage_failed and procs.len > 0) {
                 storage.insertProcesses(now, procs) catch |err| {
                     std.debug.print("Warning: process insert failed: {}\n", .{err});
+                    storage_failed = true;
                 };
             }
-            if (disks.len > 0) {
+            if (!storage_failed and disks.len > 0) {
                 storage.insertDisks(now, disks) catch |err| {
                     std.debug.print("Warning: disk insert failed: {}\n", .{err});
+                    storage_failed = true;
                 };
             }
-            if (containers.len > 0) {
+            if (!storage_failed and containers.len > 0) {
                 storage.insertContainers(now, containers) catch |err| {
                     std.debug.print("Warning: container insert failed: {}\n", .{err});
+                    storage_failed = true;
                 };
             }
-            if (ct_metrics.len > 0) {
+            if (!storage_failed and ct_metrics.len > 0) {
                 storage.insertContainerMetrics(now, ct_metrics) catch |err| {
                     std.debug.print("Warning: container_metrics insert failed: {}\n", .{err});
+                    storage_failed = true;
                 };
             }
 
-            // Drain available log entries
+            // Drain available log entries. Push path is independent of storage
+            // health; only skip DB inserts when storage failed this cycle.
             if (log_tailer) |*lt| {
                 var log_count: u32 = 0;
                 while (log_count < 1000) : (log_count += 1) {
                     const maybe_entry = lt.next() catch break;
                     if (maybe_entry == null) break;
                     const entry = maybe_entry.?;
-                    storage.insertLog(entry) catch |err| {
-                        std.debug.print("Warning: log insert failed: {}\n", .{err});
-                    };
+                    if (!storage_failed) {
+                        storage.insertLog(entry) catch |err| {
+                            std.debug.print("Warning: log insert failed: {}\n", .{err});
+                            storage_failed = true;
+                        };
+                    }
                     push_logs.append(allocator, entry) catch |err| {
                         var owned_entry = entry;
                         owned_entry.deinit(allocator);
@@ -424,20 +454,53 @@ pub fn main() !void {
                 retention_counter = 0;
             }
 
-            // If inserts have been failing in a row, the persistent connection is
-            // probably wedged. Tear it down and re-init.
-            if (storage.consecutive_insert_failures >= storage_mod.Storage.reconnect_failure_threshold) {
-                std.log.warn(
-                    "DuckDB inserts failed {d} cycles in a row, reconnecting",
-                    .{storage.consecutive_insert_failures},
-                );
-                if (storage.reconnect()) |_| {
-                    storage.consecutive_insert_failures = 0;
-                } else |err| {
-                    // Keep trying through systemd rather than continuing to
-                    // sample into a storage layer that could not be refreshed.
-                    std.log.err("DuckDB reconnect failed: {}, exiting for restart", .{err});
-                    running = false;
+            // Two-stage recovery when inserts consistently fail:
+            //   Stage 1 - reconnect: clears the connection. Handles transient
+            //             wedges and resets the counter on success. Sets
+            //             reconnect_attempted so we don't reconnect in a loop.
+            //   Stage 2 - quarantine: if reconnect already succeeded but inserts
+            //             still fail (DB too large for memory_limit), rename the
+            //             DB/WAL aside and open a fresh one. Also used immediately
+            //             when reconnect itself fails (handles already null).
+            // Reset reconnect_attempted whenever storage is healthy.
+            if (storage.consecutive_insert_failures == 0) {
+                reconnect_attempted = false;
+            } else if (storage.consecutive_insert_failures >= storage_mod.Storage.reconnect_failure_threshold) {
+                if (!reconnect_attempted) {
+                    std.log.warn(
+                        "DuckDB inserts failed {d} cycles in a row, reconnecting",
+                        .{storage.consecutive_insert_failures},
+                    );
+                    if (storage.reconnect()) |_| {
+                        storage.consecutive_insert_failures = 0;
+                        reconnect_attempted = true;
+                    } else |err| {
+                        // Reconnect failed (DB likely permanently wedged).
+                        // Go straight to quarantine rather than looping on
+                        // null handles.
+                        std.log.warn("DuckDB reconnect failed: {}, quarantining wedged DB", .{err});
+                        if (storage.quarantineAndReopen()) |_| {
+                            storage.consecutive_insert_failures = 0;
+                            reconnect_attempted = false;
+                        } else |qerr| {
+                            std.log.err("DuckDB quarantine failed: {}, exiting for restart", .{qerr});
+                            running = false;
+                        }
+                    }
+                } else {
+                    // Reconnect succeeded but inserts are still failing:
+                    // the same DB is too large/wedged. Quarantine it.
+                    std.log.warn(
+                        "DuckDB still unwritable after reconnect ({d} failures), quarantining",
+                        .{storage.consecutive_insert_failures},
+                    );
+                    if (storage.quarantineAndReopen()) |_| {
+                        storage.consecutive_insert_failures = 0;
+                        reconnect_attempted = false;
+                    } else |err| {
+                        std.log.err("DuckDB quarantine failed: {}, exiting for restart", .{err});
+                        running = false;
+                    }
                 }
             }
         }
