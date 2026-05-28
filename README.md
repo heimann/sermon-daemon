@@ -69,7 +69,9 @@ Standalone example:
   "interval": 10,
   "retention": 604800,
   "memory_limit_mb": 512,
-  "max_processes": 20
+  "max_processes": 20,
+  "storage_refresh_interval": 14400,
+  "storage_refresh_rss_mb": 512
 }
 ```
 
@@ -84,6 +86,14 @@ row growth (the dominant source of DB size) by roughly 5-15x and shrinks the
 remote push payload. CPU deltas and dead-process pruning still run against the
 full set first, so accuracy is unaffected. Set `max_processes` to `0` to store
 every process (the original behavior).
+
+`storage_refresh_interval` controls how often the daemon refreshes its embedded
+DuckDB handles (default 14400 seconds / 4 hours; set `0` to disable). The refresh
+closes and reopens DuckDB, then asks glibc to return free heap pages. This keeps
+long-running daemon RSS bounded against DuckDB's retained anonymous heap after
+process-table writes and checkpoints. `storage_refresh_rss_mb` can trigger the
+same refresh early when daemon RSS crosses a threshold (default: `memory_limit_mb`;
+set `0` to disable the RSS trigger).
 
 Remote push example:
 
