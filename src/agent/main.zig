@@ -12,6 +12,11 @@ const default_config_path = "~/.config/sermon/config.json";
 const default_interval: u64 = 10;
 const default_retention: i64 = 7 * 24 * 60 * 60; // 7 days
 const default_rules_filename = "log_rules.json";
+// Periodic DuckDB handle refresh. Long soaks showed DuckDB can retain anonymous
+// RSS after process-table writes/checkpoints; refreshing the embedded DB every
+// few hours returns that memory without restarting the daemon process.
+const default_storage_refresh_interval: u64 = 4 * 60 * 60;
+const storage_refresh_min_interval: i64 = 15 * 60;
 // Processes stored per cycle when config.max_processes is unset. Snapshotting
 // every process is the dominant source of DB growth (millions of rows/week);
 // keeping the top-N by CPU and memory cuts that ~5-15x. Set max_processes to 0
@@ -32,6 +37,12 @@ const Config = struct {
     // Max processes stored per cycle (top-N by CPU and memory). 0 keeps every
     // process (old behavior). See default_max_processes / keep_all_processes.
     max_processes: ?u32 = null,
+    // Periodic DuckDB refresh interval in seconds. 0 disables time-based
+    // refresh. See default_storage_refresh_interval.
+    storage_refresh_interval: ?u64 = null,
+    // RSS threshold in MB that can trigger a DuckDB refresh. 0 disables the RSS
+    // trigger. Defaults to memory_limit_mb.
+    storage_refresh_rss_mb: ?u32 = null,
 };
 
 fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(Config) {
@@ -151,6 +162,14 @@ pub fn main() !void {
         c.value.max_processes orelse default_max_processes
     else
         default_max_processes;
+    const storage_refresh_interval: u64 = if (config) |c|
+        c.value.storage_refresh_interval orelse default_storage_refresh_interval
+    else
+        default_storage_refresh_interval;
+    const storage_refresh_rss_mb: u32 = if (config) |c|
+        c.value.storage_refresh_rss_mb orelse memory_limit_mb
+    else
+        memory_limit_mb;
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -240,7 +259,7 @@ pub fn main() !void {
     var storage = try storage_mod.Storage.initWithMemoryLimit(allocator, final_db_path, memory_limit_mb);
     defer storage.deinit();
 
-    std.debug.print("sermon-agent started (db={s}, interval={d}s, memory_limit={d}MB, max_processes={d})\n", .{ final_db_path, interval, memory_limit_mb, max_processes });
+    std.debug.print("sermon-agent started (db={s}, interval={d}s, memory_limit={d}MB, max_processes={d}, storage_refresh_interval={d}s, storage_refresh_rss={d}MB)\n", .{ final_db_path, interval, memory_limit_mb, max_processes, storage_refresh_interval, storage_refresh_rss_mb });
     if (log_rules.len > 0) {
         std.debug.print("loaded {d} log rule(s)\n", .{log_rules.len});
     }
@@ -306,6 +325,7 @@ pub fn main() !void {
     }
 
     var retention_counter: u64 = 0;
+    var last_storage_refresh: i64 = std.time.timestamp();
     // Tracks whether a reconnect has been attempted since the last successful
     // write. Used for two-stage recovery: reconnect once, then quarantine.
     var reconnect_attempted: bool = false;
@@ -471,9 +491,10 @@ pub fn main() !void {
                         "DuckDB inserts failed {d} cycles in a row, reconnecting",
                         .{storage.consecutive_insert_failures},
                     );
-                    if (storage.reconnect()) |_| {
+                    if (storage.refresh()) |_| {
                         storage.consecutive_insert_failures = 0;
                         reconnect_attempted = true;
+                        last_storage_refresh = now;
                     } else |err| {
                         // Reconnect failed (DB likely permanently wedged).
                         // Go straight to quarantine rather than looping on
@@ -482,6 +503,7 @@ pub fn main() !void {
                         if (storage.quarantineAndReopen()) |_| {
                             storage.consecutive_insert_failures = 0;
                             reconnect_attempted = false;
+                            last_storage_refresh = now;
                         } else |qerr| {
                             std.log.err("DuckDB quarantine failed: {}, exiting for restart", .{qerr});
                             running = false;
@@ -497,6 +519,7 @@ pub fn main() !void {
                     if (storage.quarantineAndReopen()) |_| {
                         storage.consecutive_insert_failures = 0;
                         reconnect_attempted = false;
+                        last_storage_refresh = now;
                     } else |err| {
                         std.log.err("DuckDB quarantine failed: {}, exiting for restart", .{err});
                         running = false;
@@ -517,6 +540,35 @@ pub fn main() !void {
                 .uptime_seconds = 0,
             };
         };
+
+        if (storage.consecutive_insert_failures == 0 and shouldRefreshStorage(
+            now,
+            last_storage_refresh,
+            storage_refresh_interval,
+            self_sample.rss_kb,
+            storage_refresh_rss_mb,
+        )) {
+            const elapsed = now - last_storage_refresh;
+            std.log.warn(
+                "DuckDB storage refresh triggered (elapsed={d}s, rss={d}KB)",
+                .{ elapsed, self_sample.rss_kb },
+            );
+            if (storage.refresh()) |_| {
+                storage.consecutive_insert_failures = 0;
+                reconnect_attempted = false;
+                last_storage_refresh = now;
+            } else |err| {
+                std.log.warn("DuckDB storage refresh failed: {}, quarantining wedged DB", .{err});
+                if (storage.quarantineAndReopen()) |_| {
+                    storage.consecutive_insert_failures = 0;
+                    reconnect_attempted = false;
+                    last_storage_refresh = now;
+                } else |qerr| {
+                    std.log.err("DuckDB quarantine after refresh failed: {}, exiting for restart", .{qerr});
+                    running = false;
+                }
+            }
+        }
 
         if (server_url) |url| {
             if (api_key) |key| {
@@ -558,6 +610,21 @@ pub fn main() !void {
     }
 
     std.debug.print("sermon-agent shutting down\n", .{});
+}
+
+fn shouldRefreshStorage(now: i64, last_refresh: i64, interval_seconds: u64, rss_kb: u64, rss_threshold_mb: u32) bool {
+    const elapsed = now - last_refresh;
+    if (elapsed < storage_refresh_min_interval) return false;
+
+    if (interval_seconds > 0 and elapsed >= @as(i64, @intCast(interval_seconds))) {
+        return true;
+    }
+
+    if (rss_threshold_mb > 0 and rss_kb >= @as(u64, rss_threshold_mb) * 1024) {
+        return true;
+    }
+
+    return false;
 }
 
 fn readHostname(allocator: std.mem.Allocator) ![]const u8 {

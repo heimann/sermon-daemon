@@ -3,5 +3,7 @@
   "interval": 10,
   "retention": 604800,
   "memory_limit_mb": 512,
-  "max_processes": 20
+  "max_processes": 20,
+  "storage_refresh_interval": 14400,
+  "storage_refresh_rss_mb": 512
 }

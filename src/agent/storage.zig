@@ -5,6 +5,8 @@ const c = @cImport({
     @cInclude("duckdb.h");
 });
 
+extern fn malloc_trim(pad: usize) c_int;
+
 // Import types from other modules (named modules via build.zig)
 const collector = @import("collector");
 const logs = @import("logs");
@@ -261,6 +263,15 @@ pub const Storage = struct {
 
         self.db = new_db;
         self.conn = new_conn;
+    }
+
+    /// Refresh DuckDB's connection/database handles and ask glibc to return
+    /// freed heap pages to the OS. This is used as a long-running daemon
+    /// maintenance action: DuckDB can retain anonymous RSS after process-table
+    /// writes/checkpoints even when the DB is healthy.
+    pub fn refresh(self: *Storage) !void {
+        try self.reconnect();
+        _ = malloc_trim(0);
     }
 
     /// Quarantine the current DB/WAL by renaming them with a Unix-timestamp
@@ -1263,6 +1274,36 @@ test "Storage: retention cleanup" {
     // Verify data was deleted
     const retrieved = try storage.getLatestMetrics();
     try std.testing.expect(retrieved == null);
+}
+
+test "Storage: refresh reconnects and remains writable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, "metrics.db" });
+    defer allocator.free(db_path);
+
+    var storage = try Storage.init(allocator, db_path);
+    defer storage.deinit();
+
+    const metrics = SystemMetrics{
+        .cpu_percent = 10.0,
+        .cpu_user = 5.0,
+        .cpu_system = 5.0,
+        .cpu_iowait = 0.0,
+        .mem_total = 1_000_000_000,
+        .mem_used = 500_000_000,
+        .mem_percent = 50.0,
+        .swap_total = 0,
+        .swap_used = 0,
+    };
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+    try storage.refresh();
+    try storage.insertMetrics(std.time.timestamp(), metrics);
 }
 
 test "Storage: quarantineAndReopen renames wedged DB and opens fresh" {
