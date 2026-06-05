@@ -61,6 +61,7 @@ const CpuStats = struct {
 const ProcessStats = struct {
     utime: u64,
     stime: u64,
+    starttime: u64, // /proc/[pid]/stat field 22; identifies the process across PID reuse
     timestamp: i64,
 };
 
@@ -409,8 +410,10 @@ pub const Collector = struct {
         // Skip itrealvalue
         _ = it.next() orelse return error.InvalidStat;
 
-        // Skip starttime
-        _ = it.next() orelse return error.InvalidStat;
+        // starttime (field 22): process start time in clock ticks since boot.
+        // A recycled PID gets a different starttime, so we key CPU-delta
+        // continuity on it rather than trusting the PID alone.
+        const starttime = try std.fmt.parseInt(u64, it.next() orelse return error.InvalidStat, 10);
 
         // Skip vsize (field 23)
         _ = it.next() orelse return error.InvalidStat;
@@ -423,8 +426,16 @@ pub const Collector = struct {
         var cpu_percent: f32 = 0.0;
         if (self.prev_processes.get(pid)) |prev_stats| {
             const time_delta = current_time - prev_stats.timestamp;
-            if (time_delta > 0) {
-                const cpu_delta = (utime + stime) - (prev_stats.utime + prev_stats.stime);
+            // Only compute a delta for the SAME process: a recycled PID has a
+            // different starttime, so its counters are unrelated to the stored
+            // baseline (subtracting them would be meaningless and could underflow
+            // and panic). On reuse we skip this cycle and re-baseline below.
+            if (time_delta > 0 and prev_stats.starttime == starttime) {
+                const cur_jiffies = utime + stime;
+                const prev_jiffies = prev_stats.utime + prev_stats.stime;
+                // Counters are monotonic for a live process; guard the
+                // subtraction defensively so a kernel counter reset can't wrap.
+                const cpu_delta = if (cur_jiffies >= prev_jiffies) cur_jiffies - prev_jiffies else 0;
                 cpu_percent = 100.0 * @as(f32, @floatFromInt(cpu_delta)) /
                     @as(f32, @floatFromInt(self.clock_ticks * @as(u64, @intCast(time_delta))));
             }
@@ -434,6 +445,7 @@ pub const Collector = struct {
         try self.prev_processes.put(pid, ProcessStats{
             .utime = utime,
             .stime = stime,
+            .starttime = starttime,
             .timestamp = current_time,
         });
 
@@ -729,7 +741,7 @@ test "prunes dead pids from prev_processes" {
     // Seed baselines for PIDs that cannot exist (above pid_max).
     const fake_pids = [_]u32{ 4_000_000_001, 4_000_000_002, 4_000_000_003 };
     for (fake_pids) |pid| {
-        try collector.prev_processes.put(pid, .{ .utime = 1, .stime = 1, .timestamp = 0 });
+        try collector.prev_processes.put(pid, .{ .utime = 1, .stime = 1, .starttime = 0, .timestamp = 0 });
     }
 
     const processes = try collector.collectProcesses(allocator);
