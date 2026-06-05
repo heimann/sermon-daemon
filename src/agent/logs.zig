@@ -2,6 +2,19 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ChildProcess = std.process.Child;
 
+/// Safely read a string field from a parsed JSON value. journald `-o json`
+/// renders any non-UTF8/binary field value as an ARRAY of byte integers, so a
+/// field like MESSAGE can legitimately be a `.array` (or any other tag).
+/// Accessing `.string` on the wrong union tag is illegal behavior that panics
+/// in safe builds, so route every journald field read through this guard:
+/// a missing or non-string field is treated the same as absent (null).
+fn jsonStr(v: ?std.json.Value) ?[]const u8 {
+    return switch (v orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
 /// Log entry structure - consumed by storage layer
 pub const LogEntry = struct {
     timestamp: i64, // Unix timestamp (seconds)
@@ -206,23 +219,34 @@ const JournalTailer = struct {
         };
         defer parsed.deinit();
 
-        const obj = parsed.value.object;
+        // A journald line is always a JSON object; anything else is malformed
+        // input -- skip it rather than panic on the union tag.
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return null,
+        };
 
-        // Extract timestamp (microseconds -> seconds)
-        const timestamp: i64 = if (obj.get("__REALTIME_TIMESTAMP")) |ts|
-            @divFloor(try std.fmt.parseInt(i64, ts.string, 10), 1_000_000)
-        else
-            std.time.timestamp();
+        // Extract timestamp (microseconds -> seconds). A hostile/malformed
+        // value must not abort the read loop, so fall back to now on any parse
+        // failure, consistent with the PRIORITY/_PID fields below.
+        const timestamp: i64 = blk: {
+            if (jsonStr(obj.get("__REALTIME_TIMESTAMP"))) |ts| {
+                if (std.fmt.parseInt(i64, ts, 10)) |usec| {
+                    break :blk @divFloor(usec, 1_000_000);
+                } else |_| {}
+            }
+            break :blk std.time.timestamp();
+        };
 
         // Extract identity fields. Keep unit as the historical grouping key.
-        const identifier: ?[]const u8 = if (obj.get("SYSLOG_IDENTIFIER")) |id|
-            try self.allocator.dupe(u8, id.string)
+        const identifier: ?[]const u8 = if (jsonStr(obj.get("SYSLOG_IDENTIFIER"))) |id|
+            try self.allocator.dupe(u8, id)
         else
             null;
         errdefer if (identifier) |value| self.allocator.free(value);
 
-        const systemd_unit: ?[]const u8 = if (obj.get("_SYSTEMD_UNIT")) |unit_name|
-            try self.allocator.dupe(u8, unit_name.string)
+        const systemd_unit: ?[]const u8 = if (jsonStr(obj.get("_SYSTEMD_UNIT"))) |unit_name|
+            try self.allocator.dupe(u8, unit_name)
         else
             null;
         errdefer if (systemd_unit) |value| self.allocator.free(value);
@@ -236,20 +260,20 @@ const JournalTailer = struct {
         errdefer if (unit) |value| self.allocator.free(value);
 
         // Extract priority (default to 6 = INFO)
-        const priority: u8 = if (obj.get("PRIORITY")) |prio|
-            @intCast(std.fmt.parseInt(u8, prio.string, 10) catch 6)
+        const priority: u8 = if (jsonStr(obj.get("PRIORITY"))) |prio|
+            @intCast(std.fmt.parseInt(u8, prio, 10) catch 6)
         else
             6;
 
         // Extract message
-        const message = if (obj.get("MESSAGE")) |msg|
-            try self.allocator.dupe(u8, msg.string)
+        const message = if (jsonStr(obj.get("MESSAGE"))) |msg|
+            try self.allocator.dupe(u8, msg)
         else
             try self.allocator.dupe(u8, "");
 
         // Extract PID
-        const pid: ?u32 = if (obj.get("_PID")) |pid_str|
-            std.fmt.parseInt(u32, pid_str.string, 10) catch null
+        const pid: ?u32 = if (jsonStr(obj.get("_PID"))) |pid_str|
+            std.fmt.parseInt(u32, pid_str, 10) catch null
         else
             null;
 
