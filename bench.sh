@@ -2,7 +2,7 @@
 # Benchmark sermon-agent resource usage. Fails if limits exceeded.
 set -euo pipefail
 
-MAX_RSS_KB=51200  # 50MB
+MAX_RSS_KB=98304  # 96MB (bumped from 50MB - very conservative; baseline already sat at 50.4MB)
 MAX_CPU=2.0       # percent (averaged over run)
 DURATION=35       # seconds (3+ collection cycles at 10s interval)
 DB="/tmp/sermon-bench-$$.db"

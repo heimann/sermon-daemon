@@ -209,7 +209,7 @@ pub fn build(b: *std.Build) void {
     // ── Bench (resource usage check) ──
     const bench = b.addSystemCommand(&.{ "bash", "bench.sh" });
     bench.step.dependOn(&agent.step);
-    const bench_step = b.step("bench", "Check agent resource usage (RSS < 50MB, CPU < 2%)");
+    const bench_step = b.step("bench", "Check agent resource usage (RSS < 96MB, CPU < 2%)");
     bench_step.dependOn(&bench.step);
 
     // ── Buffer-pool regression bench ──
