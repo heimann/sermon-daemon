@@ -35,6 +35,8 @@ pub fn cmdStatus(
             allocator.free(p.name);
             allocator.free(p.cmdline);
             allocator.free(p.username);
+            allocator.free(p.cgroup);
+            allocator.free(p.unit);
         }
         if (all_procs.len > 0) allocator.free(all_procs);
     }
@@ -111,6 +113,8 @@ pub fn cmdProcesses(
             allocator.free(p.name);
             allocator.free(p.cmdline);
             allocator.free(p.username);
+            allocator.free(p.cgroup);
+            allocator.free(p.unit);
         }
         if (all_procs.len > 0) allocator.free(all_procs);
     }

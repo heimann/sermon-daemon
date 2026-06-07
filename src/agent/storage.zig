@@ -378,10 +378,19 @@ pub const Storage = struct {
             \\  cpu_percent REAL,
             \\  mem_rss BIGINT,
             \\  threads INTEGER,
-            \\  username VARCHAR
+            \\  username VARCHAR,
+            \\  io_read_bytes BIGINT,
+            \\  io_write_bytes BIGINT,
+            \\  cgroup VARCHAR,
+            \\  unit VARCHAR
             \\);
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS io_read_bytes BIGINT;
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS io_write_bytes BIGINT;
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS cgroup VARCHAR;
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS unit VARCHAR;
             \\CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
             \\CREATE INDEX IF NOT EXISTS idx_processes_name ON processes(name);
+            \\CREATE INDEX IF NOT EXISTS idx_processes_unit ON processes(unit);
             \\
             \\CREATE TABLE IF NOT EXISTS disks (
             \\  timestamp TIMESTAMP NOT NULL,
@@ -503,6 +512,10 @@ pub const Storage = struct {
             _ = c.duckdb_append_uint64(appender, proc.mem_rss);
             _ = c.duckdb_append_uint32(appender, proc.threads);
             _ = c.duckdb_append_varchar_length(appender, proc.username.ptr, proc.username.len);
+            _ = c.duckdb_append_uint64(appender, proc.io_read_bytes);
+            _ = c.duckdb_append_uint64(appender, proc.io_write_bytes);
+            _ = c.duckdb_append_varchar_length(appender, proc.cgroup.ptr, proc.cgroup.len);
+            _ = c.duckdb_append_varchar_length(appender, proc.unit.ptr, proc.unit.len);
 
             state = c.duckdb_appender_end_row(appender);
             if (state == c.DuckDBError) {
@@ -835,6 +848,27 @@ pub const Storage = struct {
             const username = try self.allocator.dupe(u8, std.mem.span(username_ptr));
             errdefer self.allocator.free(username);
 
+            // Columns 9-12 were added later; on a pre-migration row DuckDB
+            // returns NULL, so guard each before reading.
+            const io_read_bytes = if (c.duckdb_value_is_null(&result, 9, i)) 0 else c.duckdb_value_uint64(&result, 9, i);
+            const io_write_bytes = if (c.duckdb_value_is_null(&result, 10, i)) 0 else c.duckdb_value_uint64(&result, 10, i);
+
+            const cgroup = if (c.duckdb_value_is_null(&result, 11, i))
+                try self.allocator.dupe(u8, "")
+            else blk: {
+                const cgroup_ptr = c.duckdb_value_varchar(&result, 11, i);
+                break :blk try self.allocator.dupe(u8, std.mem.span(cgroup_ptr));
+            };
+            errdefer self.allocator.free(cgroup);
+
+            const unit = if (c.duckdb_value_is_null(&result, 12, i))
+                try self.allocator.dupe(u8, "")
+            else blk: {
+                const unit_ptr = c.duckdb_value_varchar(&result, 12, i);
+                break :blk try self.allocator.dupe(u8, std.mem.span(unit_ptr));
+            };
+            errdefer self.allocator.free(unit);
+
             procs[i] = ProcessInfo{
                 .pid = pid,
                 .name = name,
@@ -844,6 +878,10 @@ pub const Storage = struct {
                 .mem_rss = mem_rss,
                 .threads = threads,
                 .username = username,
+                .io_read_bytes = io_read_bytes,
+                .io_write_bytes = io_write_bytes,
+                .cgroup = cgroup,
+                .unit = unit,
             };
         }
 
@@ -1185,6 +1223,10 @@ test "Storage: insert and retrieve processes" {
         .mem_rss = 50000000,
         .threads = 4,
         .username = "testuser",
+        .io_read_bytes = 111,
+        .io_write_bytes = 222,
+        .cgroup = "/system.slice/test.service",
+        .unit = "test.service",
     };
 
     const procs = [_]ProcessInfo{proc1};
@@ -1197,6 +1239,8 @@ test "Storage: insert and retrieve processes" {
             allocator.free(p.name);
             allocator.free(p.cmdline);
             allocator.free(p.username);
+            allocator.free(p.cgroup);
+            allocator.free(p.unit);
         }
         allocator.free(retrieved);
     }
@@ -1205,6 +1249,10 @@ test "Storage: insert and retrieve processes" {
     try std.testing.expect(retrieved[0].pid == proc1.pid);
     try std.testing.expectEqualStrings(proc1.name, retrieved[0].name);
     try std.testing.expect(retrieved[0].state == 'R');
+    try std.testing.expectEqual(@as(u64, 111), retrieved[0].io_read_bytes);
+    try std.testing.expectEqual(@as(u64, 222), retrieved[0].io_write_bytes);
+    try std.testing.expectEqualStrings(proc1.cgroup, retrieved[0].cgroup);
+    try std.testing.expectEqualStrings(proc1.unit, retrieved[0].unit);
 }
 
 test "Storage: insert and query logs" {

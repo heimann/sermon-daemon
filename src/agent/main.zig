@@ -309,6 +309,8 @@ pub fn main() !void {
             allocator.free(p.name);
             allocator.free(p.cmdline);
             allocator.free(p.username);
+            allocator.free(p.cgroup);
+            allocator.free(p.unit);
         }
         allocator.free(baseline_procs);
     }
@@ -351,6 +353,8 @@ pub fn main() !void {
                 allocator.free(p.name);
                 allocator.free(p.cmdline);
                 allocator.free(p.username);
+                allocator.free(p.cgroup);
+                allocator.free(p.unit);
             }
             allocator.free(procs);
         }

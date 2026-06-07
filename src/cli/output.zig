@@ -352,7 +352,11 @@ fn printProcessesJson(writer: Writer, processes: []const ProcessInfo) !void {
         try writer.print("    \"cpu_percent\": {d:.2},\n", .{proc.cpu_percent});
         try writer.print("    \"mem_rss\": {d},\n", .{proc.mem_rss});
         try writer.print("    \"threads\": {d},\n", .{proc.threads});
-        try writer.print("    \"username\": \"{s}\"\n", .{proc.username});
+        try writer.print("    \"username\": \"{s}\",\n", .{proc.username});
+        try writer.print("    \"io_read_bytes\": {d},\n", .{proc.io_read_bytes});
+        try writer.print("    \"io_write_bytes\": {d},\n", .{proc.io_write_bytes});
+        try writer.print("    \"cgroup\": \"{s}\",\n", .{proc.cgroup});
+        try writer.print("    \"unit\": \"{s}\"\n", .{proc.unit});
         try writer.print("  }}{s}\n", .{if (i < processes.len - 1) "," else ""});
     }
 
@@ -360,11 +364,11 @@ fn printProcessesJson(writer: Writer, processes: []const ProcessInfo) !void {
 }
 
 fn printProcessesCsv(writer: Writer, processes: []const ProcessInfo) !void {
-    try writer.print("pid,name,cmdline,state,cpu_percent,mem_rss,threads,username\n", .{});
+    try writer.print("pid,name,cmdline,state,cpu_percent,mem_rss,threads,username,io_read_bytes,io_write_bytes,cgroup,unit\n", .{});
 
     for (processes) |proc| {
         // Escape cmdline for CSV (replace quotes with double quotes)
-        try writer.print("{d},\"{s}\",\"{s}\",{c},{d:.2},{d},{d},\"{s}\"\n", .{
+        try writer.print("{d},\"{s}\",\"{s}\",{c},{d:.2},{d},{d},\"{s}\",{d},{d},\"{s}\",\"{s}\"\n", .{
             proc.pid,
             proc.name,
             proc.cmdline,
@@ -373,6 +377,10 @@ fn printProcessesCsv(writer: Writer, processes: []const ProcessInfo) !void {
             proc.mem_rss,
             proc.threads,
             proc.username,
+            proc.io_read_bytes,
+            proc.io_write_bytes,
+            proc.cgroup,
+            proc.unit,
         });
     }
 }
