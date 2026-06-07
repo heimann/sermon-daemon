@@ -298,6 +298,14 @@ pub const Collector = struct {
             try self.trimToTopN(allocator, &processes, self.max_processes);
         }
 
+        // Enrich only the kept set with per-process I/O + cgroup/unit. Bounded
+        // to ~max_processes reads instead of one per process on the box - this
+        // is what keeps the new signals inside the CPU budget. A pid that exited
+        // since collection just gets 0 / "".
+        for (processes.items) |*proc| {
+            try enrichProcess(allocator, proc);
+        }
+
         return processes.toOwnedSlice(allocator);
     }
 
@@ -525,20 +533,49 @@ pub const Collector = struct {
         };
         errdefer allocator.free(username);
 
-        // Per-process I/O. /proc/[pid]/io is world-readable but absent for some
-        // kernel threads and may vanish if the process exits mid-cycle; treat
-        // any failure as 0/0 so a single unreadable pid never breaks the cycle.
-        const io = readProcessIo(pid);
+        // Per-process I/O and cgroup/unit are NOT read here. Reading
+        // /proc/<pid>/{io,cgroup} for every process on the box each cycle blew
+        // the CPU budget (the box can have hundreds of processes; we only keep
+        // ~20). They are filled in by enrichProcess() AFTER trimToTopN, so the
+        // extra syscalls run only for the handful of processes we actually
+        // return. Start them empty/zero.
+        const cgroup = try allocator.dupe(u8, "");
+        errdefer allocator.free(cgroup);
 
-        // cgroup path + derived unit. cgroup is "" on failure; unit is "" when
-        // nothing friendly could be derived.
+        const unit = try allocator.dupe(u8, "");
+        errdefer allocator.free(unit);
+
+        return ProcessInfo{
+            .pid = pid,
+            .name = name,
+            .cmdline = cmdline,
+            .state = state,
+            .cpu_percent = cpu_percent,
+            .mem_rss = mem_rss,
+            .threads = threads,
+            .username = username,
+            .io_read_bytes = 0,
+            .io_write_bytes = 0,
+            .cgroup = cgroup,
+            .unit = unit,
+        };
+    }
+
+    /// Fill in the per-process I/O + cgroup/unit fields for one already-collected
+    /// process. Called only on the trimmed top-N set so the /proc/<pid>/{io,
+    /// cgroup} reads stay bounded per cycle. Replaces the empty cgroup/unit
+    /// placeholders set by collectProcess. The pid may have exited since
+    /// collection, so every read degrades to 0 / "" rather than erroring.
+    fn enrichProcess(allocator: Allocator, proc: *ProcessInfo) !void {
+        const io = readProcessIo(proc.pid);
+        proc.io_read_bytes = io.read_bytes;
+        proc.io_write_bytes = io.write_bytes;
+
         var cgroup_path_buf: [64]u8 = undefined;
-        const cgroup_path = try std.fmt.bufPrint(&cgroup_path_buf, "/proc/{d}/cgroup", .{pid});
+        const cgroup_path = std.fmt.bufPrint(&cgroup_path_buf, "/proc/{d}/cgroup", .{proc.pid}) catch return;
 
         const cgroup = blk: {
-            const cgroup_file = fs.openFileAbsolute(cgroup_path, .{}) catch {
-                break :blk try allocator.dupe(u8, "");
-            };
+            const cgroup_file = fs.openFileAbsolute(cgroup_path, .{}) catch break :blk try allocator.dupe(u8, "");
             defer cgroup_file.close();
 
             var cgroup_buf: [4096]u8 = undefined;
@@ -560,25 +597,14 @@ pub const Collector = struct {
 
             break :blk try allocator.dupe(u8, path);
         };
-        errdefer allocator.free(cgroup);
 
         const unit = try deriveUnit(allocator, cgroup);
-        errdefer allocator.free(unit);
 
-        return ProcessInfo{
-            .pid = pid,
-            .name = name,
-            .cmdline = cmdline,
-            .state = state,
-            .cpu_percent = cpu_percent,
-            .mem_rss = mem_rss,
-            .threads = threads,
-            .username = username,
-            .io_read_bytes = io.read_bytes,
-            .io_write_bytes = io.write_bytes,
-            .cgroup = cgroup,
-            .unit = unit,
-        };
+        // Replace the empty placeholders set by collectProcess.
+        allocator.free(proc.cgroup);
+        allocator.free(proc.unit);
+        proc.cgroup = cgroup;
+        proc.unit = unit;
     }
 
     const ProcessIo = struct { read_bytes: u64, write_bytes: u64 };

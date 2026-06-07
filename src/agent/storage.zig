@@ -390,7 +390,6 @@ pub const Storage = struct {
             \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS unit VARCHAR;
             \\CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
             \\CREATE INDEX IF NOT EXISTS idx_processes_name ON processes(name);
-            \\CREATE INDEX IF NOT EXISTS idx_processes_unit ON processes(unit);
             \\
             \\CREATE TABLE IF NOT EXISTS disks (
             \\  timestamp TIMESTAMP NOT NULL,
