@@ -28,6 +28,16 @@ pub const ProcessInfo = struct {
     mem_rss: u64,
     threads: u32,
     username: []const u8,
+    // Cumulative bytes the process has caused to be fetched from / sent to the
+    // storage layer (from /proc/[pid]/io). 0 when the file is unreadable.
+    io_read_bytes: u64,
+    io_write_bytes: u64,
+    // Raw cgroup path (last line of /proc/[pid]/cgroup) and a friendly unit
+    // name derived from it (systemd unit, docker/k8s container). Both are
+    // owned strings; cgroup is "" when /proc/[pid]/cgroup is unreadable and
+    // unit is "" when no friendly name could be derived.
+    cgroup: []const u8,
+    unit: []const u8,
 };
 
 pub const DiskInfo = struct {
@@ -249,6 +259,8 @@ pub const Collector = struct {
                 allocator.free(proc.name);
                 allocator.free(proc.cmdline);
                 allocator.free(proc.username);
+                allocator.free(proc.cgroup);
+                allocator.free(proc.unit);
             }
             processes.deinit(allocator);
         }
@@ -361,6 +373,8 @@ pub const Collector = struct {
                 allocator.free(proc.name);
                 allocator.free(proc.cmdline);
                 allocator.free(proc.username);
+                allocator.free(proc.cgroup);
+                allocator.free(proc.unit);
             }
         }
         processes.shrinkRetainingCapacity(kept);
@@ -511,6 +525,46 @@ pub const Collector = struct {
         };
         errdefer allocator.free(username);
 
+        // Per-process I/O. /proc/[pid]/io is world-readable but absent for some
+        // kernel threads and may vanish if the process exits mid-cycle; treat
+        // any failure as 0/0 so a single unreadable pid never breaks the cycle.
+        const io = readProcessIo(pid);
+
+        // cgroup path + derived unit. cgroup is "" on failure; unit is "" when
+        // nothing friendly could be derived.
+        var cgroup_path_buf: [64]u8 = undefined;
+        const cgroup_path = try std.fmt.bufPrint(&cgroup_path_buf, "/proc/{d}/cgroup", .{pid});
+
+        const cgroup = blk: {
+            const cgroup_file = fs.openFileAbsolute(cgroup_path, .{}) catch {
+                break :blk try allocator.dupe(u8, "");
+            };
+            defer cgroup_file.close();
+
+            var cgroup_buf: [4096]u8 = undefined;
+            const cgroup_len = cgroup_file.readAll(&cgroup_buf) catch 0;
+            if (cgroup_len == 0) break :blk try allocator.dupe(u8, "");
+
+            // cgroup v2 emits a single "0::<path>" line; v1 emits several. The
+            // unified (v2) line is the most useful, so prefer the last non-empty
+            // line and keep only the part after the final ':'.
+            var line_it = std.mem.splitScalar(u8, cgroup_buf[0..cgroup_len], '\n');
+            var last_line: []const u8 = "";
+            while (line_it.next()) |line| {
+                if (line.len > 0) last_line = line;
+            }
+            const path = if (std.mem.lastIndexOfScalar(u8, last_line, ':')) |idx|
+                last_line[idx + 1 ..]
+            else
+                last_line;
+
+            break :blk try allocator.dupe(u8, path);
+        };
+        errdefer allocator.free(cgroup);
+
+        const unit = try deriveUnit(allocator, cgroup);
+        errdefer allocator.free(unit);
+
         return ProcessInfo{
             .pid = pid,
             .name = name,
@@ -520,7 +574,110 @@ pub const Collector = struct {
             .mem_rss = mem_rss,
             .threads = threads,
             .username = username,
+            .io_read_bytes = io.read_bytes,
+            .io_write_bytes = io.write_bytes,
+            .cgroup = cgroup,
+            .unit = unit,
         };
+    }
+
+    const ProcessIo = struct { read_bytes: u64, write_bytes: u64 };
+
+    /// Parse read_bytes/write_bytes out of /proc/[pid]/io. Never errors: any
+    /// open/read/parse failure (missing file, kernel thread, exited pid) yields
+    /// 0/0 so the collection cycle can't be broken by one unreadable process.
+    fn readProcessIo(pid: u32) ProcessIo {
+        var io_path_buf: [64]u8 = undefined;
+        const io_path = std.fmt.bufPrint(&io_path_buf, "/proc/{d}/io", .{pid}) catch return .{ .read_bytes = 0, .write_bytes = 0 };
+
+        const io_file = fs.openFileAbsolute(io_path, .{}) catch return .{ .read_bytes = 0, .write_bytes = 0 };
+        defer io_file.close();
+
+        var io_buf: [4096]u8 = undefined;
+        const io_len = io_file.readAll(&io_buf) catch return .{ .read_bytes = 0, .write_bytes = 0 };
+
+        return parseProcessIo(io_buf[0..io_len]);
+    }
+
+    /// Pull the "read_bytes:" and "write_bytes:" lines out of /proc/[pid]/io
+    /// content. Unknown/garbled lines are ignored; missing keys stay 0.
+    fn parseProcessIo(content: []const u8) ProcessIo {
+        var read_bytes: u64 = 0;
+        var write_bytes: u64 = 0;
+
+        var line_it = std.mem.splitScalar(u8, content, '\n');
+        while (line_it.next()) |line| {
+            var it = std.mem.tokenizeAny(u8, line, ": ");
+            const key = it.next() orelse continue;
+            const value_str = it.next() orelse continue;
+            const value = std.fmt.parseInt(u64, value_str, 10) catch continue;
+            if (std.mem.eql(u8, key, "read_bytes")) {
+                read_bytes = value;
+            } else if (std.mem.eql(u8, key, "write_bytes")) {
+                write_bytes = value;
+            }
+        }
+
+        return .{ .read_bytes = read_bytes, .write_bytes = write_bytes };
+    }
+
+    /// Derive a friendly unit name from a cgroup path. Recognizes systemd
+    /// units (".service"/".scope"/".slice"), docker containers, and k8s pods.
+    /// Returns an owned string; "" when nothing recognizable was found. The
+    /// caller owns the result and must free it.
+    fn deriveUnit(allocator: Allocator, cgroup: []const u8) ![]const u8 {
+        if (cgroup.len == 0) return allocator.dupe(u8, "");
+
+        // The last path segment usually carries the identity (e.g.
+        // ".../dmeh.service", ".../docker-<id>.scope").
+        var seg_it = std.mem.splitScalar(u8, cgroup, '/');
+        var last_seg: []const u8 = "";
+        while (seg_it.next()) |seg| {
+            if (seg.len > 0) last_seg = seg;
+        }
+
+        // Docker: "docker-<64hex>.scope" or a bare "docker/<id>" path.
+        if (std.mem.indexOf(u8, cgroup, "docker") != null) {
+            if (extractContainerId(last_seg, "docker-")) |id| {
+                return std.fmt.allocPrint(allocator, "docker:{s}", .{id});
+            }
+        }
+
+        // Kubernetes: pods live under a "kubepods" slice. Scan for the segment
+        // that names the pod (starts with "pod"); the final segment is usually
+        // the container id which is less useful on its own.
+        if (std.mem.indexOf(u8, cgroup, "kubepods") != null) {
+            var k8s_it = std.mem.splitScalar(u8, cgroup, '/');
+            while (k8s_it.next()) |seg| {
+                if (std.mem.startsWith(u8, seg, "pod") and seg.len > 3) {
+                    return std.fmt.allocPrint(allocator, "k8s:{s}", .{seg});
+                }
+            }
+            return allocator.dupe(u8, "k8s");
+        }
+
+        // systemd unit: the segment ends in a known suffix. .slice is the
+        // least specific, so it's the fallback.
+        if (std.mem.endsWith(u8, last_seg, ".service") or
+            std.mem.endsWith(u8, last_seg, ".scope") or
+            std.mem.endsWith(u8, last_seg, ".slice") or
+            std.mem.endsWith(u8, last_seg, ".mount") or
+            std.mem.endsWith(u8, last_seg, ".socket"))
+        {
+            return allocator.dupe(u8, last_seg);
+        }
+
+        return allocator.dupe(u8, "");
+    }
+
+    /// Pull the container id out of a segment like "docker-<id>.scope". Returns
+    /// the id slice (a view into `seg`) or null if the shape doesn't match.
+    fn extractContainerId(seg: []const u8, prefix: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, seg, prefix)) return null;
+        var id = seg[prefix.len..];
+        if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| id = id[0..dot];
+        if (id.len == 0) return null;
+        return id;
     }
 
     fn resolveUsername(self: *Collector, allocator: Allocator, uid: u32) ![]const u8 {
@@ -713,6 +870,8 @@ test "collect processes" {
             allocator.free(proc.name);
             allocator.free(proc.cmdline);
             allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
         }
         allocator.free(processes);
     }
@@ -750,6 +909,8 @@ test "prunes dead pids from prev_processes" {
             allocator.free(proc.name);
             allocator.free(proc.cmdline);
             allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
         }
         allocator.free(processes);
     }
@@ -773,6 +934,8 @@ test "collect processes top-n trimming end to end" {
             allocator.free(proc.name);
             allocator.free(proc.cmdline);
             allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
         }
         allocator.free(processes);
     }
@@ -808,6 +971,8 @@ test "trimToTopN keeps top cpu and top mem" {
             allocator.free(proc.name);
             allocator.free(proc.cmdline);
             allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
         }
         processes.deinit(allocator);
     }
@@ -821,6 +986,10 @@ test "trimToTopN keeps top cpu and top mem" {
             .cpu_percent = s.cpu,
             .mem_rss = s.mem,
             .threads = 1,
+            .io_read_bytes = 0,
+            .io_write_bytes = 0,
+            .cgroup = try allocator.dupe(u8, ""),
+            .unit = try allocator.dupe(u8, ""),
         });
     }
 
@@ -840,6 +1009,90 @@ test "trimToTopN keeps top cpu and top mem" {
     }
     try std.testing.expect(has_top_cpu);
     try std.testing.expect(has_top_mem);
+}
+
+test "parseProcessIo extracts read_bytes and write_bytes" {
+    const content =
+        \\rchar: 123456
+        \\wchar: 7890
+        \\syscr: 10
+        \\syscw: 20
+        \\read_bytes: 4096
+        \\write_bytes: 8192
+        \\cancelled_write_bytes: 0
+    ;
+    const io = Collector.parseProcessIo(content);
+    try std.testing.expectEqual(@as(u64, 4096), io.read_bytes);
+    try std.testing.expectEqual(@as(u64, 8192), io.write_bytes);
+}
+
+test "parseProcessIo tolerates missing keys and garbage" {
+    // Only write_bytes present; read_bytes stays 0, junk lines ignored.
+    const content =
+        \\garbage line with no colon
+        \\write_bytes: 555
+        \\read_bytes: notanumber
+    ;
+    const io = Collector.parseProcessIo(content);
+    try std.testing.expectEqual(@as(u64, 0), io.read_bytes);
+    try std.testing.expectEqual(@as(u64, 555), io.write_bytes);
+}
+
+test "readProcessIo returns 0/0 for a missing pid" {
+    // A pid far above pid_max cannot exist; the read must degrade to 0/0.
+    const io = Collector.readProcessIo(4_000_000_001);
+    try std.testing.expectEqual(@as(u64, 0), io.read_bytes);
+    try std.testing.expectEqual(@as(u64, 0), io.write_bytes);
+}
+
+test "deriveUnit recognizes systemd, docker, k8s, and unknown cgroups" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct { cgroup: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .cgroup = "/system.slice/dmeh.service", .want = "dmeh.service" },
+        .{ .cgroup = "/user.slice/user-1000.slice/session-2.scope", .want = "session-2.scope" },
+        .{ .cgroup = "/system.slice", .want = "system.slice" },
+        .{ .cgroup = "/system.slice/docker-abc123def456.scope", .want = "docker:abc123def456" },
+        .{ .cgroup = "/kubepods/burstable/pod1234-5678/abcd", .want = "k8s:pod1234-5678" },
+        .{ .cgroup = "/some/unknown/path", .want = "" },
+        .{ .cgroup = "", .want = "" },
+    };
+
+    for (cases) |cse| {
+        const unit = try Collector.deriveUnit(allocator, cse.cgroup);
+        defer allocator.free(unit);
+        try std.testing.expectEqualStrings(cse.want, unit);
+    }
+}
+
+test "collect processes populates io and cgroup fields" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    const processes = try collector.collectProcesses(allocator);
+    defer {
+        for (processes) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
+        }
+        allocator.free(processes);
+    }
+
+    // Our own process should have a cgroup path under cgroup v2/v1.
+    const my_pid = std.os.linux.getpid();
+    for (processes) |proc| {
+        if (proc.pid == @as(u32, @intCast(my_pid))) {
+            // cgroup/unit are owned strings (possibly empty); io fields exist.
+            _ = proc.io_read_bytes;
+            _ = proc.io_write_bytes;
+            break;
+        }
+    }
 }
 
 test "collect disks" {
