@@ -597,6 +597,8 @@ pub const Collector = struct {
 
             break :blk try allocator.dupe(u8, path);
         };
+        // deriveUnit can OOM before cgroup is handed to proc; free it if so.
+        errdefer allocator.free(cgroup);
 
         const unit = try deriveUnit(allocator, cgroup);
 
