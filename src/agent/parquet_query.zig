@@ -528,18 +528,10 @@ fn readLogRow(a: Allocator, result: *c.duckdb_result, i: usize) !logs.LogEntry {
     };
 }
 
-fn freeProcess(a: Allocator, p: *collector.ProcessInfo) void {
-    a.free(p.name);
-    a.free(p.cmdline);
-    a.free(p.username);
-    a.free(p.cgroup);
-    a.free(p.unit);
-}
-
-fn freeDisk(a: Allocator, d: *collector.DiskInfo) void {
-    a.free(d.mount_point);
-    a.free(d.filesystem);
-}
+// Reuse staging's owned-string free helpers (same struct types) to avoid a
+// second copy that could drift from collector.ProcessInfo/DiskInfo's fields.
+const freeProcess = staging.freeProcess;
+const freeDisk = staging.freeDisk;
 
 // ============================================================================
 // Tests

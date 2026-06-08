@@ -579,7 +579,7 @@ pub const Snapshot = struct {
     }
 };
 
-fn freeProcess(a: Allocator, p: *ProcessInfo) void {
+pub fn freeProcess(a: Allocator, p: *ProcessInfo) void {
     a.free(p.name);
     a.free(p.cmdline);
     a.free(p.username);
@@ -587,7 +587,7 @@ fn freeProcess(a: Allocator, p: *ProcessInfo) void {
     a.free(p.unit);
 }
 
-fn freeDisk(a: Allocator, d: *DiskInfo) void {
+pub fn freeDisk(a: Allocator, d: *DiskInfo) void {
     a.free(d.mount_point);
     a.free(d.filesystem);
 }
