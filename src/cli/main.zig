@@ -1,7 +1,7 @@
 const std = @import("std");
 const commands = @import("commands.zig");
 const output = @import("output.zig");
-const storage_mod = @import("storage");
+const parquet_query = @import("parquet_query");
 
 const Allocator = std.mem.Allocator;
 
@@ -119,13 +119,22 @@ pub fn main() !void {
     const final_db_path = db_path orelse try expandPath(allocator, default_db_path);
     defer if (db_path == null) allocator.free(final_db_path);
 
-    // Initialize storage (read-only, retry if agent briefly holds the lock)
-    var storage = storage_mod.Storage.initReadOnly(allocator, final_db_path) catch blk: {
+    // Parquet hot tier root (plan 25 cutover). The hot tier lives in the
+    // directory that used to hold metrics.db, so we derive the root from the
+    // configured db path's DIRECTORY exactly as the daemon does (see
+    // src/agent/main.zig) - this keeps the CLI reading the same tree the daemon
+    // writes. A path with no dir component falls back to the current directory.
+    const root = std.fs.path.dirname(final_db_path) orelse ".";
+
+    // Open an on-demand query handle over the parquet tree. It brings DuckDB up
+    // transiently and freezes a parquet file-list + staging snapshot under a
+    // shared roll lock. Retry briefly if the daemon holds the lock mid-roll.
+    var storage = parquet_query.initParquetQuery(allocator, root) catch blk: {
         for (0..3) |_| {
             std.Thread.sleep(100 * std.time.ns_per_ms);
-            break :blk storage_mod.Storage.initReadOnly(allocator, final_db_path) catch continue;
+            break :blk parquet_query.initParquetQuery(allocator, root) catch continue;
         }
-        std.debug.print("Error: could not open database (agent may be writing). Try again.\n", .{});
+        std.debug.print("Error: could not open data directory (agent may be writing). Try again.\n", .{});
         return;
     };
     defer storage.deinit();
