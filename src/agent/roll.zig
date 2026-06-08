@@ -58,14 +58,34 @@ pub const RollResult = struct {
 /// reads the segment file from disk independently, which is safe: the append fd
 /// is O_APPEND so a concurrent decode sees a consistent prefix.
 pub fn rollTable(allocator: Allocator, root: []const u8, stg: *staging.Staging, table: Table) !?RollResult {
-    // Read the segment once: hash the raw bytes for the idempotent sequence id
-    // AND decode them into the snapshot, rather than reading the file twice.
+    // Take the EXCLUSIVE roll lock at the VERY START - BEFORE reading the
+    // segment - and hold it across the WHOLE critical section: read+decode ->
+    // writeParquet(COPY) -> fsync -> stg.reset (truncate staging). An append (a
+    // collect cycle) takes the same EX lock (staging.beginCycle/endCycle), so an
+    // append landing between our read and our reset is impossible: it either
+    // completes entirely before we read or entirely after we reset, never
+    // truncated and lost. A query holds this lock SHARED around its
+    // enumerate-parquet + snapshot-staging (see parquet_query.initParquetQuery);
+    // holding EX here keeps that query from observing the published-but-not-yet-
+    // reset window (which would double-count the rolled rows across both branches
+    // of the UNION ALL). See the CONCURRENCY MODEL comment in staging.zig.
+    var lock_file = try staging.openRollLock(root, allocator);
+    defer lock_file.close();
+    try std.posix.flock(lock_file.handle, std.posix.LOCK.EX);
+    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
+
+    // Read the segment once (UNDER the lock): hash the raw bytes for the
+    // idempotent sequence id AND decode them into the snapshot, rather than
+    // reading the file twice. The read is capped at staging.max_segment_size so a
+    // crafted/huge on-disk file cannot force an unbounded allocation.
     const seg_path = try staging.segmentPath(allocator, root, table);
     defer allocator.free(seg_path);
     const data = blk: {
         const f = try fs.openFileAbsolute(seg_path, .{});
         defer f.close();
-        break :blk try f.readToEndAlloc(allocator, std.math.maxInt(usize));
+        const size = (try f.stat()).size;
+        if (size > staging.max_segment_size) return staging.StagingError.CorruptSegment;
+        break :blk try f.readToEndAlloc(allocator, staging.max_segment_size);
     };
     defer allocator.free(data);
 
@@ -82,18 +102,6 @@ pub fn rollTable(allocator: Allocator, root: []const u8, stg: *staging.Staging, 
     const partition_ts = firstTimestamp(snap) orelse std.time.timestamp();
     const parquet_path = try buildHivePath(allocator, root, table, partition_ts, seq);
     errdefer allocator.free(parquet_path);
-
-    // Take the exclusive roll lock for the WHOLE publish+reset critical section:
-    // COPY (publish the parquet) -> fsync -> stg.reset (truncate staging). A
-    // query holds this lock SHARED around its enumerate-parquet + snapshot-staging
-    // (see parquet_query.initParquetQuery). Without it a query that listed the
-    // glob AFTER our COPY but BEFORE our reset would see the rolled rows in BOTH
-    // the parquet branch and the still-full staging branch of the UNION ALL and
-    // double-count. The lock makes publish+reset atomic w.r.t. any query.
-    var lock_file = try staging.openRollLock(root, allocator);
-    defer lock_file.close();
-    try std.posix.flock(lock_file.handle, std.posix.LOCK.EX);
-    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
 
     const rows_written = try writeParquet(allocator, table, &snap, parquet_path);
 
@@ -209,6 +217,9 @@ fn appendSnapshot(conn: c.duckdb_connection, table: Table, snap: *Snapshot) !usi
 
     const n = try appendSnapshotTo(@ptrCast(appender), snap);
 
+    // The per-column duckdb_append_* calls inside appendSnapshotTo do not check
+    // their return codes individually; the end_row and this flush are the
+    // catch-all - any append failure surfaces here as an AppendError.
     if (c.duckdb_appender_flush(appender) == c.DuckDBError) {
         std.log.err("roll appender flush error: {s}", .{c.duckdb_appender_error(appender)});
         return RollError.AppendError;
@@ -393,10 +404,13 @@ fn firstTimestamp(snap: Snapshot) ?i64 {
 /// <root>/<table>/date=YYYY-MM-DD/hour=HH/<seq>.parquet, creating the
 /// directories. Caller owns the returned path.
 pub fn buildHivePath(allocator: Allocator, root: []const u8, table: Table, timestamp: i64, seq: []const u8) ![]u8 {
-    // `timestamp` is decoded from CRC-only-validated bytes; a negative value would
-    // panic on @intCast to the u64 EpochSeconds.secs. Clamp to the epoch (0) so a
-    // garbage timestamp lands in a fallback partition instead of crashing.
-    const safe_ts: u64 = if (timestamp < 0) 0 else @intCast(timestamp);
+    // `timestamp` is decoded from CRC-only-validated bytes, so it can be garbage.
+    // A negative value would panic on @intCast to the u64 EpochSeconds.secs, and a
+    // huge POSITIVE value would overflow std.time.epoch's year/day math and panic.
+    // Clamp to [0, 253402300799] (1970-01-01 .. 9999-12-31 in unix seconds) so a
+    // garbage timestamp lands in a sane fallback partition instead of crashing.
+    const max_unix_secs: i64 = 253402300799;
+    const safe_ts: u64 = @intCast(std.math.clamp(timestamp, 0, max_unix_secs));
     const ep = std.time.epoch.EpochSeconds{ .secs = safe_ts };
     const day = ep.getEpochDay();
     const year_day = day.calculateYearDay();
@@ -478,7 +492,11 @@ fn fsyncFileAndDir(path: []const u8) !void {
     _ = std.os.linux.fsync(dir.fd);
 }
 
-fn escapeSqlLiteral(allocator: Allocator, s: []const u8) ![]u8 {
+/// Double every single quote so `s` is safe to interpolate inside a single-
+/// quoted SQL string literal. Shared by the roll's COPY and the query path's
+/// read_parquet file-list so a path containing a quote can neither break the
+/// SQL nor inject. Caller owns the result.
+pub fn escapeSqlLiteral(allocator: Allocator, s: []const u8) ![]u8 {
     var out = std.ArrayList(u8){};
     errdefer out.deinit(allocator);
     for (s) |ch| {
@@ -688,28 +706,47 @@ test "roll: re-roll of identical (un-reset) segment is idempotent, no double-cou
 }
 
 test "roll: out-of-range / negative timestamp rolls without panicking" {
-    // A garbage decoded timestamp (negative, and one that would overflow on
-    // * 1_000_000) must not panic in buildHivePath's @intCast or tsMicros'
-    // multiply; it should land in a fallback partition and still produce a
-    // readable parquet.
+    // A garbage decoded timestamp (negative, and a huge positive that would
+    // overflow tsMicros' * 1_000_000 AND buildHivePath's epoch/day math) must not
+    // panic; it should land in a fallback partition and still produce a readable
+    // parquet. firstTimestamp uses row 0 to pick the partition, so we exercise
+    // BOTH a huge-positive and a negative value AS THE FIRST ROW (one segment
+    // each) to prove buildHivePath's clamp handles either extreme.
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try testRoot(a, &tmp);
     defer a.free(root);
 
-    var stg = try staging.Staging.open(a, root);
-    defer stg.deinit();
-
     const m = sampleMetrics();
-    try stg.appendMetrics(-5, m); // negative
-    try stg.appendMetrics(std.math.maxInt(i64), m); // would overflow * 1e6
-    try stg.sync();
 
-    const res = (try rollTable(a, root, &stg, .metrics)) orelse return error.TestUnexpectedResult;
-    defer a.free(res.parquet_path);
-    try testing.expectEqual(@as(usize, 2), res.row_count);
-    try testing.expectEqual(@as(i64, 2), try parquetCount(a, res.parquet_path));
+    // Segment 1: huge-positive FIRST row (the partition timestamp).
+    {
+        var stg = try staging.Staging.open(a, root);
+        defer stg.deinit();
+        try stg.appendMetrics(std.math.maxInt(i64), m); // would overflow * 1e6 + epoch math
+        try stg.appendMetrics(-5, m); // negative, second
+        try stg.sync();
+
+        const res = (try rollTable(a, root, &stg, .metrics)) orelse return error.TestUnexpectedResult;
+        defer a.free(res.parquet_path);
+        try testing.expectEqual(@as(usize, 2), res.row_count);
+        try testing.expectEqual(@as(i64, 2), try parquetCount(a, res.parquet_path));
+    }
+
+    // Segment 2: negative FIRST row (the partition timestamp).
+    {
+        var stg = try staging.Staging.open(a, root);
+        defer stg.deinit();
+        try stg.appendMetrics(-5, m); // negative first
+        try stg.appendMetrics(std.math.maxInt(i64), m);
+        try stg.sync();
+
+        const res = (try rollTable(a, root, &stg, .metrics)) orelse return error.TestUnexpectedResult;
+        defer a.free(res.parquet_path);
+        try testing.expectEqual(@as(usize, 2), res.row_count);
+        try testing.expectEqual(@as(i64, 2), try parquetCount(a, res.parquet_path));
+    }
 }
 
 test "roll: processes and logs segments to parquet" {
