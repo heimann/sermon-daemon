@@ -58,14 +58,25 @@ pub const RollResult = struct {
 /// reads the segment file from disk independently, which is safe: the append fd
 /// is O_APPEND so a concurrent decode sees a consistent prefix.
 pub fn rollTable(allocator: Allocator, root: []const u8, stg: *staging.Staging, table: Table) !?RollResult {
-    var snap = try staging.StagingReader.read(allocator, root, table);
+    // Read the segment once: hash the raw bytes for the idempotent sequence id
+    // AND decode them into the snapshot, rather than reading the file twice.
+    const seg_path = try staging.segmentPath(allocator, root, table);
+    defer allocator.free(seg_path);
+    const data = blk: {
+        const f = try fs.openFileAbsolute(seg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, std.math.maxInt(usize));
+    };
+    defer allocator.free(data);
+
+    var snap = try staging.StagingReader.decodeSegment(allocator, table, data);
     defer snap.deinit();
 
     if (snap.rowCount() == 0) return null;
 
     // Derive the idempotent sequence id from the raw segment bytes so a
     // re-roll after a crash overwrites the same file.
-    const seq = try segmentHashHex(allocator, root, table);
+    const seq = try seqFromBytes(allocator, data);
     defer allocator.free(seq);
 
     const partition_ts = firstTimestamp(snap) orelse std.time.timestamp();
@@ -339,15 +350,7 @@ fn copyToParquet(allocator: Allocator, conn: c.duckdb_connection, table: Table, 
 // ============================================================================
 
 /// Hex of a stable hash over the segment's raw bytes. Same segment -> same id.
-fn segmentHashHex(allocator: Allocator, root: []const u8, table: Table) ![]u8 {
-    const path = try staging.segmentPath(allocator, root, table);
-    defer allocator.free(path);
-
-    const f = try fs.openFileAbsolute(path, .{});
-    defer f.close();
-    const data = try f.readToEndAlloc(allocator, std.math.maxInt(usize));
-    defer allocator.free(data);
-
+fn seqFromBytes(allocator: Allocator, data: []const u8) ![]u8 {
     const h = std.hash.Wyhash.hash(0, data);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h});
 }
@@ -383,13 +386,13 @@ pub fn buildHivePath(allocator: Allocator, root: []const u8, table: Table, times
     });
     defer allocator.free(dir);
 
-    try makePathAbsolute(allocator, dir);
+    try makePathAbsolute(dir);
 
     return std.fmt.allocPrint(allocator, "{s}/{s}.parquet", .{ dir, seq });
 }
 
 /// Recursively create an absolute directory path (mkdir -p).
-fn makePathAbsolute(allocator: Allocator, path: []const u8) !void {
+fn makePathAbsolute(path: []const u8) !void {
     // std.fs.makeDirAbsolute is single-level; walk the components.
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, path, i + 1, '/')) |idx| {
@@ -408,7 +411,6 @@ fn makePathAbsolute(allocator: Allocator, path: []const u8) !void {
         error.PathAlreadyExists => {},
         else => return err,
     };
-    _ = allocator;
 }
 
 /// fsync a written file and its parent directory so the file and its directory
