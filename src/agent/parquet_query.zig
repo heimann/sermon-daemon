@@ -13,18 +13,26 @@
 //! where `<table>_staging` is a TEMP table loaded from a Zig-decoded staging
 //! snapshot (the rows not yet rolled to parquet).
 //!
-//! CRITICAL ORDERING (no double-count, no miss):
-//!   We enumerate/snapshot the parquet file-set FIRST, then snapshot staging
-//!   SECOND. A roll that runs concurrently moves rows from staging to a new
-//!   parquet file and then truncates staging. By reading parquet before
-//!   staging, the worst case is:
-//!     - a brand-new parquet file appears AFTER we listed the glob -> we miss
-//!       it, but its rows are still present in our (older) staging snapshot, so
-//!       they are counted exactly once via staging.
-//!   We can NEVER double-count, because a row can only be in our parquet list
-//!   OR our staging snapshot, never both: it is in parquet only if the file
-//!   existed before our staging read, in which case the roll had already
-//!   truncated it out of staging.
+//! NO DOUBLE-COUNT, NO MISS (ENFORCED BY AN ADVISORY LOCK):
+//!   A roll publishes a new parquet file via COPY and then truncates staging.
+//!   Ordering ALONE does not prevent a double-count: a query that enumerates the
+//!   parquet glob in the window AFTER the COPY but BEFORE the reset, then
+//!   snapshots a still-full staging, would count the rolled rows in BOTH the
+//!   parquet branch and the staging branch of the UNION ALL.
+//!
+//!   So the guarantee is enforced by a cross-process advisory lock on
+//!   `<root>/_staging/.roll.lock` (std.posix.flock):
+//!     - the roll holds LOCK_EX across COPY + fsync + staging reset, making
+//!       publish+reset atomic (see roll.rollTable);
+//!     - a query holds LOCK_SH across BOTH its parquet-glob enumeration AND its
+//!       staging snapshot (see initParquetQuery), so it can never observe the
+//!       published-but-not-yet-reset state.
+//!   A row is therefore in exactly one branch: either staging (not yet rolled)
+//!   or parquet (rolled AND already cleared from staging), never both.
+//!
+//!   We also keep the enumerate-parquet-before-snapshot-staging ordering as
+//!   defense in depth: even were the lock absent, missing a brand-new parquet
+//!   file leaves its rows in the older staging snapshot, counted exactly once.
 //!
 //! The query path is read-only and opens no control channel to the daemon - the
 //! daemon stays write-only.
@@ -76,6 +84,12 @@ pub const QueryResult = struct {
 /// then deinit - it owns a transient in-memory DuckDB plus the loaded staging
 /// snapshots. Same accessor surface as the resident Storage query path so the
 /// CLI is unchanged.
+///
+/// FRESHNESS CONTRACT: a handle snapshots staging ONCE at init (the un-rolled
+/// rows are copied into TEMP tables then) and resolves the parquet glob once.
+/// It is single-query / open-and-exit: reusing a handle across calls serves
+/// stale staging data and misses any parquet rolled after init. Open a fresh
+/// handle per logical query.
 pub const ParquetQuery = struct {
     allocator: Allocator,
     db: c.duckdb_database,
@@ -182,7 +196,7 @@ pub const ParquetQuery = struct {
             var stmt: c.duckdb_prepared_statement = undefined;
             if (c.duckdb_prepare(self.conn, sql.ptr, &stmt) == c.DuckDBError) return QueryError.QueryError;
             defer c.duckdb_destroy_prepare(&stmt);
-            _ = c.duckdb_bind_timestamp(stmt, 1, .{ .micros = ts * 1_000_000 });
+            _ = c.duckdb_bind_timestamp(stmt, 1, .{ .micros = tsMicrosSaturating(ts) });
             break :blk c.duckdb_execute_prepared(stmt, &result);
         } else c.duckdb_query(self.conn, sql.ptr, &result);
         defer c.duckdb_destroy_result(&result);
@@ -217,7 +231,7 @@ pub const ParquetQuery = struct {
             var stmt: c.duckdb_prepared_statement = undefined;
             if (c.duckdb_prepare(self.conn, sql.ptr, &stmt) == c.DuckDBError) return QueryError.QueryError;
             defer c.duckdb_destroy_prepare(&stmt);
-            _ = c.duckdb_bind_timestamp(stmt, 1, .{ .micros = ts * 1_000_000 });
+            _ = c.duckdb_bind_timestamp(stmt, 1, .{ .micros = tsMicrosSaturating(ts) });
             break :blk c.duckdb_execute_prepared(stmt, &result);
         } else c.duckdb_query(self.conn, sql.ptr, &result);
         defer c.duckdb_destroy_result(&result);
@@ -284,6 +298,9 @@ pub const ParquetQuery = struct {
 
 /// Open a transient in-memory DuckDB and build the compatibility views over the
 /// parquet glob UNION ALL the decoded staging snapshot, for every table.
+///
+/// FRESHNESS CONTRACT: this snapshots staging once, here. See ParquetQuery's
+/// doc-comment - the returned handle is single-query / open-and-exit.
 pub fn initParquetQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuery {
     var db: c.duckdb_database = undefined;
     if (c.duckdb_open(":memory:", &db) == c.DuckDBError) return QueryError.DatabaseError;
@@ -294,6 +311,17 @@ pub fn initParquetQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuer
     errdefer c.duckdb_disconnect(&conn);
 
     var pq = ParquetQuery{ .allocator = allocator, .db = db, .conn = conn };
+
+    // Hold the roll lock SHARED across the WHOLE enumerate-parquet + snapshot-
+    // staging loop. The roll takes it EXCLUSIVE around its publish+reset, so
+    // while we hold it shared no roll can move rows from staging to parquet
+    // underneath us - we never observe the published-but-not-yet-reset window
+    // that would double-count. See the module-level comment. The enumerate-
+    // before-snapshot ordering below stays as defense in depth.
+    var lock_file = try staging.openRollLock(root_dir, allocator);
+    defer lock_file.close();
+    try std.posix.flock(lock_file.handle, std.posix.LOCK.SH);
+    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
 
     for (Table.all) |table| {
         // ORDER MATTERS: read the parquet file-set first (existence check on
@@ -453,7 +481,10 @@ fn readProcessRow(a: Allocator, result: *c.duckdb_result, i: usize) !collector.P
     errdefer a.free(name);
     const cmdline = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 3, i)));
     errdefer a.free(cmdline);
-    const state_char = std.mem.span(c.duckdb_value_varchar(result, 4, i))[0];
+    // A tampered/empty parquet could yield a zero-length state string; indexing
+    // [0] would be out of bounds. Default to '?' when empty.
+    const state_span = std.mem.span(c.duckdb_value_varchar(result, 4, i));
+    const state_char: u8 = if (state_span.len == 0) '?' else state_span[0];
     const cpu_percent = c.duckdb_value_float(result, 5, i);
     const mem_rss = c.duckdb_value_uint64(result, 6, i);
     const threads = c.duckdb_value_uint32(result, 7, i);
@@ -512,7 +543,9 @@ fn readLogRow(a: Allocator, result: *c.duckdb_result, i: usize) !logs.LogEntry {
     errdefer if (identifier) |id| a.free(id);
     const systemd_unit = if (c.duckdb_value_is_null(result, 4, i)) null else try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 4, i)));
     errdefer if (systemd_unit) |su| a.free(su);
-    const priority: u8 = @intCast(c.duckdb_value_int32(result, 5, i));
+    // priority is stored as INTEGER; a tampered parquet could hold a value
+    // outside 0-255 that would panic/UB on a bare @intCast to u8. Clamp first.
+    const priority: u8 = @intCast(std.math.clamp(c.duckdb_value_int32(result, 5, i), 0, 255));
     const message = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 6, i)));
     errdefer a.free(message);
     const pid = if (c.duckdb_value_is_null(result, 7, i)) null else c.duckdb_value_uint32(result, 7, i);
@@ -532,6 +565,16 @@ fn readLogRow(a: Allocator, result: *c.duckdb_result, i: usize) !logs.LogEntry {
 // second copy that could drift from collector.ProcessInfo/DiskInfo's fields.
 const freeProcess = staging.freeProcess;
 const freeDisk = staging.freeDisk;
+
+/// Seconds -> micros for a TIMESTAMP bind, saturating instead of overflowing
+/// i64. The bound value can originate from an absurd caller/decoded timestamp,
+/// and a bare `* 1_000_000` would panic/wrap; a clamped bound just selects no
+/// rows, which is the correct behavior for an out-of-range filter.
+fn tsMicrosSaturating(ts: i64) i64 {
+    const micros: i64 = std.math.mul(i64, ts, 1_000_000) catch
+        if (ts < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+    return micros;
+}
 
 // ============================================================================
 // Tests

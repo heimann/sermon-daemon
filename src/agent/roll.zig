@@ -83,6 +83,18 @@ pub fn rollTable(allocator: Allocator, root: []const u8, stg: *staging.Staging, 
     const parquet_path = try buildHivePath(allocator, root, table, partition_ts, seq);
     errdefer allocator.free(parquet_path);
 
+    // Take the exclusive roll lock for the WHOLE publish+reset critical section:
+    // COPY (publish the parquet) -> fsync -> stg.reset (truncate staging). A
+    // query holds this lock SHARED around its enumerate-parquet + snapshot-staging
+    // (see parquet_query.initParquetQuery). Without it a query that listed the
+    // glob AFTER our COPY but BEFORE our reset would see the rolled rows in BOTH
+    // the parquet branch and the still-full staging branch of the UNION ALL and
+    // double-count. The lock makes publish+reset atomic w.r.t. any query.
+    var lock_file = try staging.openRollLock(root, allocator);
+    defer lock_file.close();
+    try std.posix.flock(lock_file.handle, std.posix.LOCK.EX);
+    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
+
     const rows_written = try writeParquet(allocator, table, &snap, parquet_path);
 
     try fsyncFileAndDir(parquet_path);
@@ -132,6 +144,11 @@ fn writeParquet(allocator: Allocator, table: Table, snap: *Snapshot, parquet_pat
 /// CREATE TABLE matching today's storage.zig schema for the table (same column
 /// names + types) so the resulting parquet has the columns the query views
 /// expect.
+///
+/// The u64 byte/size columns (mem_total, swap_*, *_bytes, maxmem, uptime) are
+/// declared BIGINT and appended via duckdb_append_uint64, exactly as
+/// storage.zig does. This signedness pairing is intentional for cutover parity
+/// (do NOT switch to UBIGINT); it assumes these values stay below 2^63.
 fn createTable(conn: c.duckdb_connection, table: Table) !void {
     const sql = switch (table) {
         .metrics =>
@@ -244,7 +261,13 @@ fn endRow(appender: c.duckdb_appender) !void {
 }
 
 fn tsMicros(timestamp: i64) c.duckdb_timestamp {
-    return .{ .micros = timestamp * 1_000_000 };
+    // Timestamps reach here from CRC-only-validated segment bytes, so a garbage
+    // decoded value could overflow i64 on `* 1_000_000` and panic/wrap. Saturate
+    // to the i64 bounds instead so the worst case is a clamped (not corrupt or
+    // crashing) timestamp.
+    const micros: i64 = std.math.mul(i64, timestamp, 1_000_000) catch
+        if (timestamp < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+    return .{ .micros = micros };
 }
 
 fn appendMetricsRow(appender: c.duckdb_appender, timestamp: i64, m: collector.SystemMetrics) !void {
@@ -370,7 +393,11 @@ fn firstTimestamp(snap: Snapshot) ?i64 {
 /// <root>/<table>/date=YYYY-MM-DD/hour=HH/<seq>.parquet, creating the
 /// directories. Caller owns the returned path.
 pub fn buildHivePath(allocator: Allocator, root: []const u8, table: Table, timestamp: i64, seq: []const u8) ![]u8 {
-    const ep = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    // `timestamp` is decoded from CRC-only-validated bytes; a negative value would
+    // panic on @intCast to the u64 EpochSeconds.secs. Clamp to the epoch (0) so a
+    // garbage timestamp lands in a fallback partition instead of crashing.
+    const safe_ts: u64 = if (timestamp < 0) 0 else @intCast(timestamp);
+    const ep = std.time.epoch.EpochSeconds{ .secs = safe_ts };
     const day = ep.getEpochDay();
     const year_day = day.calculateYearDay();
     const md = year_day.calculateMonthDay();
@@ -391,7 +418,14 @@ pub fn buildHivePath(allocator: Allocator, root: []const u8, table: Table, times
     return std.fmt.allocPrint(allocator, "{s}/{s}.parquet", .{ dir, seq });
 }
 
-/// Recursively create an absolute directory path (mkdir -p).
+// The <table>/date=/hour= directories are chmod'd to 0700 (not the default
+// 0755) so a local unprivileged user cannot enumerate table names or infer
+// collection timing from directory mtimes - consistent with the 0600 segment +
+// parquet files and storage.zig's 0600 DB.
+const hive_dir_mode: fs.File.Mode = 0o700;
+
+/// Recursively create an absolute directory path (mkdir -p). Newly-created
+/// components are chmod'd to 0700; pre-existing components are left alone.
 fn makePathAbsolute(path: []const u8) !void {
     // std.fs.makeDirAbsolute is single-level; walk the components.
     var i: usize = 0;
@@ -401,16 +435,29 @@ fn makePathAbsolute(path: []const u8) !void {
             i = idx;
             continue;
         }
-        fs.makeDirAbsolute(prefix) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try makeDirAbsolute0700(prefix);
         i = idx;
     }
+    try makeDirAbsolute0700(path);
+}
+
+/// makeDirAbsolute that chmods a freshly-created dir to 0700 best-effort. An
+/// already-existing dir is left untouched (its owner already chose its mode).
+fn makeDirAbsolute0700(path: []const u8) !void {
     fs.makeDirAbsolute(path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
+        error.PathAlreadyExists => return,
         else => return err,
     };
+    // Path-based chmod via the raw syscall (same direct-syscall idiom as the
+    // directory fsync below): an O_RDONLY dir fd cannot be fchmod'd on Linux.
+    var buf: [fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const rc = std.os.linux.chmod(@ptrCast(&buf), hive_dir_mode);
+    if (std.os.linux.E.init(rc) != .SUCCESS) {
+        std.log.warn("hive dir chmod 0700 failed for {s}: errno {}", .{ path, std.os.linux.E.init(rc) });
+    }
 }
 
 /// fsync a written file and its parent directory so the file and its directory
@@ -585,6 +632,84 @@ test "roll: filename is idempotent for identical segment contents" {
     defer a.free(path2);
 
     try testing.expectEqualStrings(path1, path2);
+}
+
+test "roll: re-roll of identical (un-reset) segment is idempotent, no double-count" {
+    // Simulates a crash AFTER COPY but BEFORE reset: the segment still holds the
+    // same rows, so the next roll must re-derive the SAME parquet path (hash of
+    // the raw bytes), overwrite it, and leave the query count correct - never
+    // doubled. The concurrent interleaving of a query observing the
+    // published-but-not-yet-reset window is prevented by the EX/SH roll lock in
+    // rollTable / initParquetQuery; this sequential test covers the union math
+    // that the lock protects.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    const m = sampleMetrics();
+
+    // First roll: produces parquet, then resets the segment.
+    var path1: []u8 = undefined;
+    {
+        var stg = try staging.Staging.open(a, root);
+        defer stg.deinit();
+        try stg.appendMetrics(1_700_000_000, m);
+        try stg.appendMetrics(1_700_000_010, m);
+        try stg.sync();
+        const res = (try rollTable(a, root, &stg, .metrics)).?;
+        defer a.free(res.parquet_path);
+        path1 = try a.dupe(u8, res.parquet_path);
+        try testing.expectEqual(@as(usize, 2), res.row_count);
+    }
+    defer a.free(path1);
+
+    // Rebuild the IDENTICAL segment (as a crash-replay would leave it un-reset)
+    // and roll again. The path must match and the count must be unchanged.
+    var path2: []u8 = undefined;
+    {
+        var stg = try staging.Staging.open(a, root);
+        defer stg.deinit();
+        try stg.appendMetrics(1_700_000_000, m);
+        try stg.appendMetrics(1_700_000_010, m);
+        try stg.sync();
+        const res = (try rollTable(a, root, &stg, .metrics)).?;
+        defer a.free(res.parquet_path);
+        path2 = try a.dupe(u8, res.parquet_path);
+        try testing.expectEqual(@as(usize, 2), res.row_count);
+    }
+    defer a.free(path2);
+
+    try testing.expectEqualStrings(path1, path2);
+
+    // The overwritten parquet holds exactly the 2 rows - not 4 (no duplication).
+    try testing.expectEqual(@as(i64, 2), try parquetCount(a, path1));
+}
+
+test "roll: out-of-range / negative timestamp rolls without panicking" {
+    // A garbage decoded timestamp (negative, and one that would overflow on
+    // * 1_000_000) must not panic in buildHivePath's @intCast or tsMicros'
+    // multiply; it should land in a fallback partition and still produce a
+    // readable parquet.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    const m = sampleMetrics();
+    try stg.appendMetrics(-5, m); // negative
+    try stg.appendMetrics(std.math.maxInt(i64), m); // would overflow * 1e6
+    try stg.sync();
+
+    const res = (try rollTable(a, root, &stg, .metrics)) orelse return error.TestUnexpectedResult;
+    defer a.free(res.parquet_path);
+    try testing.expectEqual(@as(usize, 2), res.row_count);
+    try testing.expectEqual(@as(i64, 2), try parquetCount(a, res.parquet_path));
 }
 
 test "roll: processes and logs segments to parquet" {
