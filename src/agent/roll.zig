@@ -3,15 +3,29 @@
 //! At an N-min / M-MB trigger the daemon "rolls" a staging segment to a parquet
 //! file. The roll decodes the durable segment, opens a SHORT-LIVED in-process
 //! DuckDB (in-memory), CREATE TABLEs the schema, appender-inserts the decoded
-//! rows, then `COPY ... TO '<hive>' (FORMAT parquet, COMPRESSION zstd)`, fsyncs
-//! the parquet file AND its directory, closes every DuckDB handle and calls
-//! malloc_trim(0), and finally truncates the staging segment. DuckDB is never
-//! resident - it lives only for the duration of one roll.
+//! rows, then `COPY ... TO '<hive>.tmp' (FORMAT parquet, COMPRESSION zstd)`,
+//! closes every DuckDB handle and calls malloc_trim(0). DuckDB is never resident
+//! - it lives only for the duration of one roll.
+//!
+//! CRASH-CONSISTENT RESET-BEFORE-PUBLISH: the parquet is written to a TEMP path
+//! `<final>.tmp` and fsynced (file + dir) FIRST. Only once the temp is durable do
+//! we reset (truncate + fsync) the staging segment, and only THEN do we rename
+//! `<final>.tmp` -> `<final>` and fsync the directory. A file matching the
+//! committed `*.parquet` name therefore exists ONLY AFTER staging was cleared, so
+//! there is never an on-disk state with the SAME rows in both a committed parquet
+//! AND staging - the double-count that plain publish-then-reset would leave after
+//! a crash in its window. The worst case is a crash between reset and rename:
+//! staging empty + a durable orphan `.tmp` not yet renamed = a transient,
+//! recoverable MISS (the rows are durable in the .tmp) while the daemon is down,
+//! repaired at startup by recoverOrphanTemps. If the temp's file fsync fails the
+//! roll ABORTS before resetting staging, so staging is never cleared on un-durable
+//! data. This guarantee holds ACROSS CRASHES; live interleavings against a query
+//! are additionally covered by the EX/SH roll lock (see staging.zig).
 //!
 //! Idempotent replay: the parquet filename `<seq>` is derived from a hash of
 //! the segment's raw bytes, NOT wall-clock. Re-rolling the same segment after a
-//! crash (segment not yet reset) writes the SAME file, overwriting it, so a
-//! crash between COPY and reset cannot double-count.
+//! crash (segment not yet reset) writes the SAME temp/final file, overwriting it,
+//! so a crash before reset cannot double-count.
 //!
 //! Hive layout (warm-compatible, plans 15/22):
 //!   <root>/<table>/date=YYYY-MM-DD/hour=HH/<seq>.parquet
@@ -40,6 +54,7 @@ pub const RollError = error{
     SchemaError,
     AppendError,
     CopyError,
+    SyncError,
     OutOfMemory,
 };
 
@@ -60,15 +75,16 @@ pub const RollResult = struct {
 pub fn rollTable(allocator: Allocator, root: []const u8, stg: *staging.Staging, table: Table) !?RollResult {
     // Take the EXCLUSIVE roll lock at the VERY START - BEFORE reading the
     // segment - and hold it across the WHOLE critical section: read+decode ->
-    // writeParquet(COPY) -> fsync -> stg.reset (truncate staging). An append (a
-    // collect cycle) takes the same EX lock (staging.beginCycle/endCycle), so an
-    // append landing between our read and our reset is impossible: it either
-    // completes entirely before we read or entirely after we reset, never
-    // truncated and lost. A query holds this lock SHARED around its
-    // enumerate-parquet + snapshot-staging (see parquet_query.initParquetQuery);
-    // holding EX here keeps that query from observing the published-but-not-yet-
-    // reset window (which would double-count the rolled rows across both branches
-    // of the UNION ALL). See the CONCURRENCY MODEL comment in staging.zig.
+    // writeParquet(COPY to .tmp) -> fsync temp -> stg.reset (truncate staging) ->
+    // rename .tmp -> final -> fsync dir. An append (a collect cycle) takes the
+    // same EX lock (staging.beginCycle/endCycle), so an append landing between our
+    // read and our reset is impossible: it either completes entirely before we
+    // read or entirely after we reset, never truncated and lost. A query holds
+    // this lock SHARED around its enumerate-parquet + snapshot-staging (see
+    // parquet_query.initParquetQuery); holding EX here keeps that query from
+    // observing the published-but-not-yet-reset window (which would double-count
+    // the rolled rows across both branches of the UNION ALL). See the CONCURRENCY
+    // MODEL comment in staging.zig.
     var lock_file = try staging.openRollLock(root, allocator);
     defer lock_file.close();
     try std.posix.flock(lock_file.handle, std.posix.LOCK.EX);
@@ -103,13 +119,30 @@ pub fn rollTable(allocator: Allocator, root: []const u8, stg: *staging.Staging, 
     const parquet_path = try buildHivePath(allocator, root, table, partition_ts, seq);
     errdefer allocator.free(parquet_path);
 
-    const rows_written = try writeParquet(allocator, table, &snap, parquet_path);
+    // Write to a TEMP path first so the committed `*.parquet` name never appears
+    // on disk until staging has been reset (crash-consistency, see the module
+    // comment). A re-roll overwrites the same temp/final names, so this is
+    // idempotent on replay.
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{parquet_path});
+    defer allocator.free(tmp_path);
 
-    try fsyncFileAndDir(parquet_path);
+    const rows_written = try writeParquet(allocator, table, &snap, tmp_path);
 
-    // Only now that the parquet is durable do we clear the segment. A crash
+    // (a) Make the temp fully durable (file + dir). If the FILE fsync fails this
+    // PROPAGATES and ABORTS the roll BEFORE we touch staging, so staging is never
+    // cleared on un-durable data.
+    try fsyncFileAndDir(tmp_path);
+
+    // (b) Only now that the temp is durable do we clear the segment. A crash
     // before this leaves the segment intact and the next roll is idempotent.
     try stg.reset(table);
+
+    // (c) Publish atomically: rename the durable temp onto its final name, then
+    // fsync the directory so the new entry survives a crash. A crash between (b)
+    // and (c) leaves staging empty + an orphan `.tmp`, recovered at startup by
+    // recoverOrphanTemps - a transient miss, never a double count.
+    try fs.renameAbsolute(tmp_path, parquet_path);
+    try fsyncDirOf(parquet_path);
 
     return RollResult{ .parquet_path = parquet_path, .row_count = rows_written };
 }
@@ -124,6 +157,44 @@ pub fn rollAll(allocator: Allocator, root: []const u8, stg: *staging.Staging) !u
         }
     }
     return rolled;
+}
+
+/// Recover orphan `*.parquet.tmp` files left by a crash BETWEEN staging reset and
+/// the rename (step (b)->(c) in rollTable): the rows are already gone from
+/// staging, so the durable temp is the only copy and renaming it to its final
+/// `*.parquet` name republishes them. Scans every table's tree and renames each
+/// leftover temp; idempotent (a no-op when there are no temps) and safe to call
+/// at daemon startup.
+///
+/// NOTE: the daemon startup path wires this in at cutover. It is intentionally
+/// NOT hooked into any live loop in this foundation PR - call it once, before the
+/// first query/roll, after the process restarts.
+pub fn recoverOrphanTemps(allocator: Allocator, root: []const u8) !void {
+    for (Table.all) |table| {
+        const dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+        defer allocator.free(dir_path);
+
+        var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer dir.close();
+
+        var walker = try dir.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next()) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".parquet.tmp")) continue;
+
+            // entry.path is relative to dir_path; build absolute temp + final paths.
+            const tmp_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
+            defer allocator.free(tmp_abs);
+            // Strip the trailing ".tmp" (4 bytes) to get the final `*.parquet`.
+            const final_abs = tmp_abs[0 .. tmp_abs.len - ".tmp".len];
+
+            try fs.renameAbsolute(tmp_abs, final_abs);
+            try fsyncDirOf(final_abs);
+        }
+    }
 }
 
 // ============================================================================
@@ -475,21 +546,41 @@ fn makeDirAbsolute0700(path: []const u8) !void {
 }
 
 /// fsync a written file and its parent directory so the file and its directory
-/// entry both survive a crash.
+/// entry both survive a crash. The FILE fsync is load-bearing for durability and
+/// its failure is propagated (NOT swallowed) - the roll must not proceed to reset
+/// staging on un-durable data. The directory fsync is tolerant of EINVAL (some
+/// filesystems reject directory fsync) but propagates other errnos.
 fn fsyncFileAndDir(path: []const u8) !void {
     {
         const f = try fs.openFileAbsolute(path, .{});
         defer f.close();
         try f.sync();
     }
-    // Open the parent directory read-only (O_RDONLY) and fsync it so the new
-    // file's directory entry is durable. We call the raw syscall and ignore
-    // its return: some filesystems reject directory fsync with EINVAL, and the
-    // file fsync above is the load-bearing durability guarantee regardless.
     const dir_path = std.fs.path.dirname(path) orelse return;
+    try fsyncDir(dir_path);
+}
+
+/// fsync just the parent directory of `path` (so a rename's new directory entry
+/// is durable). Same EINVAL-tolerant policy as fsyncFileAndDir's dir fsync.
+fn fsyncDirOf(path: []const u8) !void {
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    try fsyncDir(dir_path);
+}
+
+/// Open a directory read-only (O_RDONLY) and fsync it so a just-created or just-
+/// renamed entry is durable. EINVAL is tolerated (some filesystems reject
+/// directory fsync); any other errno is propagated rather than ignored.
+fn fsyncDir(dir_path: []const u8) !void {
     var dir = try fs.openDirAbsolute(dir_path, .{ .iterate = true });
     defer dir.close();
-    _ = std.os.linux.fsync(dir.fd);
+    const rc = std.os.linux.fsync(dir.fd);
+    switch (std.os.linux.E.init(rc)) {
+        .SUCCESS, .INVAL => {},
+        else => |e| {
+            std.log.err("directory fsync failed for {s}: errno {}", .{ dir_path, e });
+            return error.SyncError;
+        },
+    }
 }
 
 /// Double every single quote so `s` is safe to interpolate inside a single-
@@ -795,4 +886,69 @@ test "roll: processes and logs segments to parquet" {
     const lres = (try rollTable(a, root, &stg, .logs)).?;
     defer a.free(lres.parquet_path);
     try testing.expectEqual(@as(i64, 1), try parquetCount(a, lres.parquet_path));
+}
+
+test "roll: recoverOrphanTemps renames an orphan temp to its final, queryable" {
+    // Simulates a crash BETWEEN staging reset and the rename: staging is already
+    // cleared and only a durable `<seq>.parquet.tmp` orphan remains. Startup
+    // recovery must rename it to `<seq>.parquet` and the rows must be queryable.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    // Produce a real parquet via a normal roll, then move it back to a `.tmp`
+    // path to stand in for the orphan a mid-roll crash would leave.
+    var orphan_tmp: []u8 = undefined;
+    var final_path: []u8 = undefined;
+    {
+        var stg = try staging.Staging.open(a, root);
+        defer stg.deinit();
+        try stg.appendMetrics(1_700_000_000, sampleMetrics());
+        try stg.appendMetrics(1_700_000_010, sampleMetrics());
+        try stg.sync();
+        const res = (try rollTable(a, root, &stg, .metrics)).?;
+        final_path = res.parquet_path; // owned
+        orphan_tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{final_path});
+        try fs.renameAbsolute(final_path, orphan_tmp);
+    }
+    defer a.free(final_path);
+    defer a.free(orphan_tmp);
+
+    // The final no longer exists; only the orphan temp does.
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(final_path, .{}));
+
+    // Recovery renames the orphan to its final name.
+    try recoverOrphanTemps(a, root);
+
+    // Final now exists and is readable; the orphan temp is gone.
+    try testing.expectEqual(@as(i64, 2), try parquetCount(a, final_path));
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(orphan_tmp, .{}));
+
+    // Idempotent: a second call with no temps left is a clean no-op.
+    try recoverOrphanTemps(a, root);
+    try testing.expectEqual(@as(i64, 2), try parquetCount(a, final_path));
+}
+
+test "roll: recoverOrphanTemps is a no-op when there are no temps" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    // No table dirs exist at all - must not error.
+    try recoverOrphanTemps(a, root);
+
+    // A normal roll leaves only a committed `.parquet`; recovery must not touch it.
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+    try stg.appendMetrics(1_700_000_000, sampleMetrics());
+    try stg.sync();
+    const res = (try rollTable(a, root, &stg, .metrics)).?;
+    defer a.free(res.parquet_path);
+
+    try recoverOrphanTemps(a, root);
+    try testing.expectEqual(@as(i64, 1), try parquetCount(a, res.parquet_path));
 }
