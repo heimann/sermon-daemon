@@ -66,6 +66,22 @@ const segment_mode: fs.File.Mode = 0o600;
 
 const staging_subdir = "_staging";
 
+/// Hard cap on a staging segment's on-disk size when replaying it. A segment is
+/// rolled (and reset) at an N-min / M-MB trigger far below this, so a real
+/// segment never approaches 256 MiB; a file larger than this is a crafted or
+/// corrupt artifact and we refuse to allocate for it (it would otherwise force
+/// `readToEndAlloc` to allocate the whole file before any row-count guard runs).
+pub const max_segment_size: u64 = 256 * 1024 * 1024;
+
+/// Read a segment file's bytes, rejecting an over-cap file before allocating.
+/// `f` must be positioned at the start. Returns CorruptSegment if the file
+/// exceeds `max_segment_size`.
+fn readSegmentCapped(allocator: Allocator, f: fs.File) ![]u8 {
+    const size = (try f.stat()).size;
+    if (size > max_segment_size) return StagingError.CorruptSegment;
+    return f.readToEndAlloc(allocator, max_segment_size);
+}
+
 // ============================================================================
 // Payload encoding
 // ============================================================================
@@ -207,6 +223,29 @@ pub fn TimedSlice(comptime T: type) type {
 // Staging (writer)
 // ============================================================================
 
+// ============================================================================
+// CONCURRENCY MODEL (one advisory lock file `<root>/_staging/.roll.lock`)
+//
+// Queries run in a SEPARATE process from the daemon, so the lock must NOT be
+// held during user-query execution or the daemon's collection would stall. The
+// lock only brackets the brief publish/snapshot critical sections:
+//
+//   APPEND (daemon, per collect cycle): take LOCK.EX around the cycle's appends
+//     + fdatasync, release after. See Staging.beginCycle / endCycle. Brief.
+//   ROLL (daemon, rare): take LOCK.EX BEFORE reading/decoding the segment and
+//     hold it across read -> decode -> writeParquet(COPY) -> fsync -> reset. See
+//     roll.rollTable. Brief-ish.
+//   QUERY (separate process, in parquet_query.initParquetQuery): take LOCK.SH,
+//     and under it BOTH (a) enumerate+FREEZE the parquet file list for every
+//     table AND (b) load the staging snapshot temp tables; then release. The
+//     lock is NOT held during the later user query.
+//
+// Append and roll both take LOCK.EX, so they fully serialize: an append
+// completes either entirely before roll's read or entirely after roll's reset,
+// never truncated in between. Queries hold SH and are excluded from roll's EX
+// section, yielding a consistent point-in-time snapshot with no stalls.
+// ============================================================================
+
 pub const Staging = struct {
     allocator: Allocator,
     root_dir: []u8,
@@ -215,6 +254,11 @@ pub const Staging = struct {
     /// Reusable scratch buffer for building a record payload. Kept across
     /// cycles so the hot path allocates nothing in steady state.
     scratch: std.ArrayList(u8),
+    /// The advisory roll lock fd, held open for the daemon's lifetime. A collect
+    /// cycle takes LOCK.EX on it (beginCycle/endCycle) to serialize the cycle's
+    /// appends + fdatasync against a roll's read+reset (which takes the same EX
+    /// lock). See the CONCURRENCY MODEL comment above.
+    lock_file: fs.File,
 
     /// Open (creating if needed) every table's segment under
     /// `<root_dir>/_staging/`. A fresh segment gets its 1-byte schema_version
@@ -239,18 +283,38 @@ pub const Staging = struct {
             opened += 1;
         }
 
+        const lock_file = try openRollLock(root_dir, allocator);
+
         return Staging{
             .allocator = allocator,
             .root_dir = owned_root,
             .files = files,
             .scratch = .{},
+            .lock_file = lock_file,
         };
     }
 
     pub fn deinit(self: *Staging) void {
         for (&self.files) |*f| f.close();
+        self.lock_file.close();
         self.scratch.deinit(self.allocator);
         self.allocator.free(self.root_dir);
+    }
+
+    /// Begin a collect cycle: take LOCK.EX on the roll lock so the cycle's
+    /// appends + the closing fdatasync are atomic w.r.t. a roll (which holds the
+    /// same EX lock across its read+reset). MUST be paired with endCycle. See the
+    /// CONCURRENCY MODEL comment above.
+    pub fn beginCycle(self: *Staging) !void {
+        try std.posix.flock(self.lock_file.handle, std.posix.LOCK.EX);
+    }
+
+    /// End a collect cycle: fdatasync every touched segment (so committed records
+    /// survive a crash) THEN release the EX lock. The sync happens under the lock
+    /// so a roll cannot interleave between an append and its sync.
+    pub fn endCycle(self: *Staging) !void {
+        defer std.posix.flock(self.lock_file.handle, std.posix.LOCK.UN) catch {};
+        try self.sync();
     }
 
     fn file(self: *Staging, table: Table) *fs.File {
@@ -607,7 +671,7 @@ pub const StagingReader = struct {
         };
         defer f.close();
 
-        const data = try f.readToEndAlloc(allocator, std.math.maxInt(usize));
+        const data = try readSegmentCapped(allocator, f);
         defer allocator.free(data);
 
         return decodeSegment(allocator, table, data);
@@ -840,6 +904,22 @@ fn openSegment(path: []const u8) !fs.File {
     // Try to open an existing segment for append first.
     if (fs.openFileAbsolute(path, .{ .mode = .read_write })) |f| {
         errdefer f.close();
+        // Validate the header byte BEFORE appending. A zero-length file (a crash
+        // between create and the first header write) gets its schema_version byte
+        // written now, so appended records are preceded by a header on replay. A
+        // non-empty file whose first byte is not our schema_version is an old or
+        // foreign segment - appending to it would make replay misread the first
+        // record's bytes as a header, so refuse instead.
+        const size = (try f.stat()).size;
+        if (size == 0) {
+            try f.writeAll(&[_]u8{schema_version});
+        } else {
+            try f.seekTo(0);
+            var byte: [1]u8 = undefined;
+            if ((try f.readAll(&byte)) != 1 or byte[0] != schema_version) {
+                return StagingError.UnsupportedSchemaVersion;
+            }
+        }
         try f.seekFromEnd(0);
         return f;
     } else |err| switch (err) {
@@ -1195,6 +1275,79 @@ test "staging: crafted huge row count with valid CRC is rejected without giant a
     // via OOM or be caught by the leak detector; the guard must return
     // CorruptSegment before any per-row allocation happens.
     try testing.expectError(StagingError.CorruptSegment, StagingReader.decodeSegment(a, .metrics, seg.items));
+}
+
+test "staging: opening a zero-length segment writes the header and stays replayable" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    // Simulate a crash between create and the first header write: a zero-length
+    // segment file with no schema_version byte yet.
+    {
+        const staging_dir = try std.fs.path.join(a, &.{ root, staging_subdir });
+        defer a.free(staging_dir);
+        try makeDirAbsoluteIfAbsent(staging_dir);
+        const path = try segmentPath(a, root, .metrics);
+        defer a.free(path);
+        const f = try fs.createFileAbsolute(path, .{ .mode = segment_mode, .truncate = true });
+        f.close();
+    }
+
+    // Open (which must repair the missing header), append, and replay.
+    var staging = try Staging.open(a, root);
+    defer staging.deinit();
+    try staging.appendMetrics(7777, sampleMetrics());
+    try staging.sync();
+
+    var snap = try StagingReader.read(a, root, .metrics);
+    defer snap.deinit();
+    try testing.expectEqual(@as(usize, 1), snap.cycles.len);
+    try testing.expectEqual(@as(i64, 7777), snap.cycles[0].metrics[0].timestamp);
+}
+
+test "staging: opening a segment with a bad schema byte is refused" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    {
+        const staging_dir = try std.fs.path.join(a, &.{ root, staging_subdir });
+        defer a.free(staging_dir);
+        try makeDirAbsoluteIfAbsent(staging_dir);
+        const path = try segmentPath(a, root, .metrics);
+        defer a.free(path);
+        const f = try fs.createFileAbsolute(path, .{ .mode = segment_mode, .truncate = true });
+        defer f.close();
+        try f.writeAll(&[_]u8{schema_version +% 1}); // wrong/old version
+    }
+
+    try testing.expectError(StagingError.UnsupportedSchemaVersion, Staging.open(a, root));
+}
+
+test "staging: beginCycle/endCycle append + sync round-trip" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var staging = try Staging.open(a, root);
+    defer staging.deinit();
+
+    // The daemon's per-cycle pattern: lock, append touched tables, sync+unlock.
+    try staging.beginCycle();
+    try staging.appendMetrics(1234, sampleMetrics());
+    try staging.endCycle();
+
+    var snap = try StagingReader.read(a, root, .metrics);
+    defer snap.deinit();
+    try testing.expectEqual(@as(usize, 1), snap.cycles.len);
+    try testing.expectEqual(@as(i64, 1234), snap.cycles[0].metrics[0].timestamp);
 }
 
 test "staging: byteLen grows and reset truncates to header" {

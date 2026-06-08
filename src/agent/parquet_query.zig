@@ -7,11 +7,15 @@
 //!
 //! Each view is:
 //!
-//!     read_parquet('<root>/<table>/**/*.parquet', hive_partitioning=true)
+//!     read_parquet(['<f1>','<f2>',...], hive_partitioning=true, union_by_name=true)
 //!       UNION ALL <table>_staging
 //!
-//! where `<table>_staging` is a TEMP table loaded from a Zig-decoded staging
-//! snapshot (the rows not yet rolled to parquet).
+//! where the file list is an EXPLICIT, SQL-escaped set of parquet paths FROZEN
+//! at init under the lock (NOT a lazy glob - DuckDB would re-evaluate a glob at
+//! query time, after the lock is released, and a roll in that window could make
+//! the glob double-count against the still-frozen staging temp). `<table>_staging`
+//! is a TEMP table loaded from a Zig-decoded staging snapshot (the rows not yet
+//! rolled to parquet).
 //!
 //! NO DOUBLE-COUNT, NO MISS (ENFORCED BY AN ADVISORY LOCK):
 //!   A roll publishes a new parquet file via COPY and then truncates staging.
@@ -133,8 +137,8 @@ pub const ParquetQuery = struct {
                 if (c.duckdb_value_is_null(&result, col_idx, row_idx)) {
                     rows[row_idx][col_idx] = null;
                 } else {
-                    const v = c.duckdb_value_varchar(&result, col_idx, row_idx);
-                    rows[row_idx][col_idx] = try self.allocator.dupe(u8, std.mem.span(v));
+                    // duckdb_value_varchar mallocs; dupeVarchar frees the original.
+                    rows[row_idx][col_idx] = try dupeVarchar(self.allocator, c.duckdb_value_varchar(&result, col_idx, row_idx));
                 }
             }
         }
@@ -166,8 +170,10 @@ pub const ParquetQuery = struct {
         var stmt: c.duckdb_prepared_statement = undefined;
         if (c.duckdb_prepare(self.conn, sql, &stmt) == c.DuckDBError) return QueryError.QueryError;
         defer c.duckdb_destroy_prepare(&stmt);
-        _ = c.duckdb_bind_int64(stmt, 1, since);
-        _ = c.duckdb_bind_int64(stmt, 2, until);
+        // Check each bind: a failure here (wrong index/type) would otherwise
+        // silently leave a parameter unset and skew the result.
+        if (c.duckdb_bind_int64(stmt, 1, since) == c.DuckDBError) return QueryError.QueryError;
+        if (c.duckdb_bind_int64(stmt, 2, until) == c.DuckDBError) return QueryError.QueryError;
 
         var result: c.duckdb_result = undefined;
         if (c.duckdb_execute_prepared(stmt, &result) == c.DuckDBError) {
@@ -196,7 +202,7 @@ pub const ParquetQuery = struct {
             var stmt: c.duckdb_prepared_statement = undefined;
             if (c.duckdb_prepare(self.conn, sql.ptr, &stmt) == c.DuckDBError) return QueryError.QueryError;
             defer c.duckdb_destroy_prepare(&stmt);
-            _ = c.duckdb_bind_timestamp(stmt, 1, .{ .micros = tsMicrosSaturating(ts) });
+            if (c.duckdb_bind_timestamp(stmt, 1, .{ .micros = tsMicrosSaturating(ts) }) == c.DuckDBError) return QueryError.QueryError;
             break :blk c.duckdb_execute_prepared(stmt, &result);
         } else c.duckdb_query(self.conn, sql.ptr, &result);
         defer c.duckdb_destroy_result(&result);
@@ -231,7 +237,7 @@ pub const ParquetQuery = struct {
             var stmt: c.duckdb_prepared_statement = undefined;
             if (c.duckdb_prepare(self.conn, sql.ptr, &stmt) == c.DuckDBError) return QueryError.QueryError;
             defer c.duckdb_destroy_prepare(&stmt);
-            _ = c.duckdb_bind_timestamp(stmt, 1, .{ .micros = tsMicrosSaturating(ts) });
+            if (c.duckdb_bind_timestamp(stmt, 1, .{ .micros = tsMicrosSaturating(ts) }) == c.DuckDBError) return QueryError.QueryError;
             break :blk c.duckdb_execute_prepared(stmt, &result);
         } else c.duckdb_query(self.conn, sql.ptr, &result);
         defer c.duckdb_destroy_result(&result);
@@ -259,15 +265,12 @@ pub const ParquetQuery = struct {
         if (c.duckdb_prepare(self.conn, sql, &stmt) == c.DuckDBError) return QueryError.QueryError;
         defer c.duckdb_destroy_prepare(&stmt);
 
-        if (since) |s| {
-            _ = c.duckdb_bind_int64(stmt, 1, s);
-        } else _ = c.duckdb_bind_null(stmt, 1);
-        if (unit) |u| {
-            _ = c.duckdb_bind_varchar_length(stmt, 2, u.ptr, u.len);
-        } else _ = c.duckdb_bind_null(stmt, 2);
-        if (priority) |p| {
-            _ = c.duckdb_bind_uint8(stmt, 3, p);
-        } else _ = c.duckdb_bind_null(stmt, 3);
+        const b1 = if (since) |s| c.duckdb_bind_int64(stmt, 1, s) else c.duckdb_bind_null(stmt, 1);
+        if (b1 == c.DuckDBError) return QueryError.QueryError;
+        const b2 = if (unit) |u| c.duckdb_bind_varchar_length(stmt, 2, u.ptr, u.len) else c.duckdb_bind_null(stmt, 2);
+        if (b2 == c.DuckDBError) return QueryError.QueryError;
+        const b3 = if (priority) |p| c.duckdb_bind_uint8(stmt, 3, p) else c.duckdb_bind_null(stmt, 3);
+        if (b3 == c.DuckDBError) return QueryError.QueryError;
 
         var result: c.duckdb_result = undefined;
         if (c.duckdb_execute_prepared(stmt, &result) == c.DuckDBError) {
@@ -324,26 +327,42 @@ pub fn initParquetQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuer
     defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
 
     for (Table.all) |table| {
-        // ORDER MATTERS: read the parquet file-set first (existence check on
-        // the glob), THEN snapshot staging. See the module-level comment.
-        const has_parquet = try tableHasParquet(allocator, root_dir, table);
+        // ORDER MATTERS: MATERIALIZE the parquet file-set first (a frozen,
+        // explicit list of file paths), THEN snapshot staging - both under the
+        // SH lock. Freezing the list (rather than a lazy glob the view re-
+        // evaluates at query time) is load-bearing: a roll between this init and
+        // the later user query cannot change what this handle sees, so a row
+        // rolled after init stays counted exactly once via the still-frozen
+        // staging temp. See the module-level comment.
+        var files = try collectParquetFiles(allocator, root_dir, table);
+        defer {
+            for (files.items) |p| allocator.free(p);
+            files.deinit(allocator);
+        }
 
         try createStagingTemp(allocator, &pq, root_dir, table);
-        try createView(allocator, &pq, root_dir, table, has_parquet);
+        try createView(allocator, &pq, table, files.items);
     }
 
     return pq;
 }
 
-/// True if at least one parquet file exists for this table. We also ensure the
-/// table's directory exists so the read_parquet glob always resolves (an empty
-/// glob otherwise errors in DuckDB).
-fn tableHasParquet(allocator: Allocator, root_dir: []const u8, table: Table) !bool {
+/// Collect the absolute paths of every `.parquet` file for this table into an
+/// owned list (caller frees each path + the list). An empty list (no directory
+/// or no files) yields a staging-only view. The returned list is FROZEN here
+/// under the SH lock so the view cannot re-glob and see a post-init roll.
+fn collectParquetFiles(allocator: Allocator, root_dir: []const u8, table: Table) !std.ArrayList([]u8) {
+    var files = std.ArrayList([]u8){};
+    errdefer {
+        for (files.items) |p| allocator.free(p);
+        files.deinit(allocator);
+    }
+
     const dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_dir, table.name() });
     defer allocator.free(dir_path);
 
     var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return false,
+        error.FileNotFound => return files,
         else => return err,
     };
     defer dir.close();
@@ -352,10 +371,13 @@ fn tableHasParquet(allocator: Allocator, root_dir: []const u8, table: Table) !bo
     defer walker.deinit();
     while (try walker.next()) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".parquet")) {
-            return true;
+            // entry.path is relative to dir_path; build the absolute path.
+            const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
+            errdefer allocator.free(abs);
+            try files.append(allocator, abs);
         }
     }
-    return false;
+    return files;
 }
 
 /// CREATE TEMP TABLE <table>_staging and load the (pre-roll) staging snapshot
@@ -419,25 +441,35 @@ fn stagingTempDdl(allocator: Allocator, table: Table) ![:0]u8 {
     return std.fmt.allocPrintSentinel(allocator, "CREATE TEMP TABLE {s}_staging ({s})", .{ table.name(), cols }, 0);
 }
 
-/// CREATE VIEW <table> AS read_parquet(glob) UNION ALL <table>_staging.
-/// When no parquet exists yet the view is just the staging temp table, so the
-/// empty case resolves without read_parquet erroring on a zero-file glob.
+/// CREATE VIEW <table> AS read_parquet([<frozen file list>]) UNION ALL
+/// <table>_staging. When `files` is empty the view is just the staging temp
+/// table, so the empty case resolves without read_parquet erroring on a zero-
+/// file list.
+///
+/// The parquet side reads an EXPLICIT, SQL-escaped list of file paths frozen at
+/// init (NOT a lazy glob): DuckDB re-evaluates a glob at query time, after the
+/// SH lock is released, so a roll between init and the user query could make the
+/// glob see a new parquet while the staging temp still holds the same rows -
+/// double-counting. The frozen list pins exactly the files that existed under
+/// the lock. Every path is double-quote-escaped (escapeSqlLiteral) so a path
+/// containing a single quote can neither break the literal nor inject.
 ///
 /// We SELECT the explicit column list (not `*`) from the parquet side because
 /// `hive_partitioning=true` appends synthetic `date`/`hour` partition columns,
 /// which would otherwise make the parquet branch wider than the staging branch
 /// and break the UNION ALL's column-count check. The explicit list also keeps
 /// column ordering identical across both branches and the row readers.
-fn createView(allocator: Allocator, pq: *ParquetQuery, root_dir: []const u8, table: Table, has_parquet: bool) !void {
+fn createView(allocator: Allocator, pq: *ParquetQuery, table: Table, files: []const []const u8) !void {
     const temp_name = table.name();
     const cols = columnList(table);
-    const sql = if (has_parquet) blk: {
-        const glob = try std.fmt.allocPrint(allocator, "{s}/{s}/**/*.parquet", .{ root_dir, table.name() });
-        defer allocator.free(glob);
+
+    const sql = if (files.len > 0) blk: {
+        const file_list = try buildFileListLiteral(allocator, files);
+        defer allocator.free(file_list);
         break :blk try std.fmt.allocPrintSentinel(
             allocator,
-            "CREATE VIEW {s} AS SELECT {s} FROM read_parquet('{s}', hive_partitioning=true, union_by_name=true) UNION ALL SELECT {s} FROM {s}_staging",
-            .{ table.name(), cols, glob, cols, temp_name },
+            "CREATE VIEW {s} AS SELECT {s} FROM read_parquet([{s}], hive_partitioning=true, union_by_name=true) UNION ALL SELECT {s} FROM {s}_staging",
+            .{ table.name(), cols, file_list, cols, temp_name },
             0,
         );
     } else try std.fmt.allocPrintSentinel(
@@ -457,9 +489,35 @@ fn createView(allocator: Allocator, pq: *ParquetQuery, root_dir: []const u8, tab
     c.duckdb_destroy_result(&result);
 }
 
+/// Build a comma-separated list of single-quoted, SQL-escaped file paths for the
+/// read_parquet([...]) literal: `'<f1>','<f2>',...`. Each path is run through
+/// roll.escapeSqlLiteral so an embedded single quote is doubled. Caller frees.
+fn buildFileListLiteral(allocator: Allocator, files: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+    for (files, 0..) |path, idx| {
+        if (idx != 0) try out.append(allocator, ',');
+        const escaped = try roll.escapeSqlLiteral(allocator, path);
+        defer allocator.free(escaped);
+        try out.append(allocator, '\'');
+        try out.appendSlice(allocator, escaped);
+        try out.append(allocator, '\'');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 // ============================================================================
 // Row readers (mirror storage.zig column ordering)
 // ============================================================================
+
+/// duckdb_value_varchar mallocs the returned C string; dupe it into our
+/// allocator and duckdb_free the original so it does not leak. A null result
+/// (NULL cell or OOM inside DuckDB) dupes the empty string.
+fn dupeVarchar(a: Allocator, ptr: [*c]u8) ![]u8 {
+    if (ptr == null) return a.dupe(u8, "");
+    defer c.duckdb_free(ptr);
+    return a.dupe(u8, std.mem.span(ptr));
+}
 
 fn readMetricsRow(result: *c.duckdb_result, i: usize) collector.SystemMetrics {
     return .{
@@ -477,30 +535,31 @@ fn readMetricsRow(result: *c.duckdb_result, i: usize) collector.SystemMetrics {
 
 fn readProcessRow(a: Allocator, result: *c.duckdb_result, i: usize) !collector.ProcessInfo {
     const pid = c.duckdb_value_uint32(result, 1, i);
-    const name = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 2, i)));
+    const name = try dupeVarchar(a, c.duckdb_value_varchar(result, 2, i));
     errdefer a.free(name);
-    const cmdline = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 3, i)));
+    const cmdline = try dupeVarchar(a, c.duckdb_value_varchar(result, 3, i));
     errdefer a.free(cmdline);
     // A tampered/empty parquet could yield a zero-length state string; indexing
     // [0] would be out of bounds. Default to '?' when empty.
-    const state_span = std.mem.span(c.duckdb_value_varchar(result, 4, i));
-    const state_char: u8 = if (state_span.len == 0) '?' else state_span[0];
+    const state_str = try dupeVarchar(a, c.duckdb_value_varchar(result, 4, i));
+    defer a.free(state_str);
+    const state_char: u8 = if (state_str.len == 0) '?' else state_str[0];
     const cpu_percent = c.duckdb_value_float(result, 5, i);
     const mem_rss = c.duckdb_value_uint64(result, 6, i);
     const threads = c.duckdb_value_uint32(result, 7, i);
-    const username = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 8, i)));
+    const username = try dupeVarchar(a, c.duckdb_value_varchar(result, 8, i));
     errdefer a.free(username);
     const io_read_bytes = if (c.duckdb_value_is_null(result, 9, i)) 0 else c.duckdb_value_uint64(result, 9, i);
     const io_write_bytes = if (c.duckdb_value_is_null(result, 10, i)) 0 else c.duckdb_value_uint64(result, 10, i);
     const cgroup = if (c.duckdb_value_is_null(result, 11, i))
         try a.dupe(u8, "")
     else
-        try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 11, i)));
+        try dupeVarchar(a, c.duckdb_value_varchar(result, 11, i));
     errdefer a.free(cgroup);
     const unit = if (c.duckdb_value_is_null(result, 12, i))
         try a.dupe(u8, "")
     else
-        try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 12, i)));
+        try dupeVarchar(a, c.duckdb_value_varchar(result, 12, i));
     errdefer a.free(unit);
     return .{
         .pid = pid,
@@ -519,9 +578,9 @@ fn readProcessRow(a: Allocator, result: *c.duckdb_result, i: usize) !collector.P
 }
 
 fn readDiskRow(a: Allocator, result: *c.duckdb_result, i: usize) !collector.DiskInfo {
-    const mount_point = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 1, i)));
+    const mount_point = try dupeVarchar(a, c.duckdb_value_varchar(result, 1, i));
     errdefer a.free(mount_point);
-    const filesystem = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 2, i)));
+    const filesystem = try dupeVarchar(a, c.duckdb_value_varchar(result, 2, i));
     errdefer a.free(filesystem);
     return .{
         .mount_point = mount_point,
@@ -535,18 +594,18 @@ fn readDiskRow(a: Allocator, result: *c.duckdb_result, i: usize) !collector.Disk
 fn readLogRow(a: Allocator, result: *c.duckdb_result, i: usize) !logs.LogEntry {
     const ts_struct = c.duckdb_value_timestamp(result, 0, i);
     const timestamp = @divTrunc(ts_struct.micros, 1_000_000);
-    const source = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 1, i)));
+    const source = try dupeVarchar(a, c.duckdb_value_varchar(result, 1, i));
     errdefer a.free(source);
-    const unit = if (c.duckdb_value_is_null(result, 2, i)) null else try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 2, i)));
+    const unit = if (c.duckdb_value_is_null(result, 2, i)) null else try dupeVarchar(a, c.duckdb_value_varchar(result, 2, i));
     errdefer if (unit) |u| a.free(u);
-    const identifier = if (c.duckdb_value_is_null(result, 3, i)) null else try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 3, i)));
+    const identifier = if (c.duckdb_value_is_null(result, 3, i)) null else try dupeVarchar(a, c.duckdb_value_varchar(result, 3, i));
     errdefer if (identifier) |id| a.free(id);
-    const systemd_unit = if (c.duckdb_value_is_null(result, 4, i)) null else try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 4, i)));
+    const systemd_unit = if (c.duckdb_value_is_null(result, 4, i)) null else try dupeVarchar(a, c.duckdb_value_varchar(result, 4, i));
     errdefer if (systemd_unit) |su| a.free(su);
     // priority is stored as INTEGER; a tampered parquet could hold a value
     // outside 0-255 that would panic/UB on a bare @intCast to u8. Clamp first.
     const priority: u8 = @intCast(std.math.clamp(c.duckdb_value_int32(result, 5, i), 0, 255));
-    const message = try a.dupe(u8, std.mem.span(c.duckdb_value_varchar(result, 6, i)));
+    const message = try dupeVarchar(a, c.duckdb_value_varchar(result, 6, i));
     errdefer a.free(message);
     const pid = if (c.duckdb_value_is_null(result, 7, i)) null else c.duckdb_value_uint32(result, 7, i);
     return .{
@@ -679,6 +738,83 @@ test "parquet_query: union of rolled parquet + un-rolled staging, no dup/miss" {
     const range = try pq.getMetricsRange(1_700_000_000, 1_700_002_000);
     defer a.free(range);
     try testing.expectEqual(@as(usize, 7), range.len);
+}
+
+test "parquet_query: frozen file list - a roll after init does not change a handle's view (no double-count)" {
+    // Fix 1: the parquet file set is materialized (frozen) at init under the SH
+    // lock, NOT a lazy glob. After init we move the staging rows to parquet via a
+    // roll; an already-open handle must NOT see the new parquet file (its list is
+    // frozen) and must NOT double-count. A glob-based view would re-evaluate at
+    // query time and count the rolled rows in BOTH branches.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    // 3 rows in staging, no parquet yet.
+    var i: i64 = 0;
+    while (i < 3) : (i += 1) try stg.appendMetrics(1_700_000_000 + i * 10, sampleMetrics(@floatFromInt(i)));
+    try stg.sync();
+
+    // Open the handle: it freezes an EMPTY parquet list and snapshots 3 staging rows.
+    var pq = try initParquetQuery(a, root);
+    defer pq.deinit();
+
+    // Now roll: staging -> parquet (and staging reset). This happens AFTER init.
+    const res = (try roll.rollTable(a, root, &stg, .metrics)).?;
+    a.free(res.parquet_path);
+
+    // The already-open handle still sees exactly 3 (its frozen staging snapshot),
+    // NOT 6: the post-init parquet is invisible to the frozen file list, so no
+    // double-count. A fresh handle would see the 3 rolled rows from parquet.
+    var res2 = try pq.rawQuery("SELECT COUNT(*) AS n FROM metrics");
+    defer res2.deinit();
+    try testing.expectEqualStrings("3", res2.rows[0][0].?);
+
+    var pq2 = try initParquetQuery(a, root);
+    defer pq2.deinit();
+    var res3 = try pq2.rawQuery("SELECT COUNT(*) AS n FROM metrics");
+    defer res3.deinit();
+    try testing.expectEqualStrings("3", res3.rows[0][0].?);
+}
+
+test "parquet_query: a parquet path containing a single quote is escaped, not broken" {
+    // Fix 3: createView SQL-escapes every interpolated parquet path. Place a real
+    // parquet file under a directory whose name contains a single quote and prove
+    // the view both builds (no SQL break/injection) and reads the rows.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    // Produce a real parquet via a normal roll, then relocate it under a
+    // single-quote directory inside the table's tree so collectParquetFiles
+    // finds it and createView must escape the path.
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+    try stg.appendMetrics(1_700_000_000, sampleMetrics(42.0));
+    try stg.sync();
+    const res = (try roll.rollTable(a, root, &stg, .metrics)).?;
+    defer a.free(res.parquet_path);
+
+    // metrics dir exists now; create a quoted subdir and move the parquet in.
+    const quoted_dir = try std.fmt.allocPrint(a, "{s}/metrics/o'clock", .{root});
+    defer a.free(quoted_dir);
+    try fs.makeDirAbsolute(quoted_dir);
+    const dest = try std.fmt.allocPrint(a, "{s}/seg.parquet", .{quoted_dir});
+    defer a.free(dest);
+    try fs.renameAbsolute(res.parquet_path, dest);
+
+    var pq = try initParquetQuery(a, root);
+    defer pq.deinit();
+    var cnt = try pq.rawQuery("SELECT COUNT(*) AS n FROM metrics");
+    defer cnt.deinit();
+    try testing.expectEqualStrings("1", cnt.rows[0][0].?);
 }
 
 test "parquet_query: typed getters over union (processes + logs)" {
