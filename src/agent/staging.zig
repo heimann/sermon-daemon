@@ -657,12 +657,46 @@ pub const StagingReader = struct {
     }
 };
 
+/// Smallest possible encoded size of one row for a table - all fixed fields plus
+/// the length prefixes of every string at zero length (see the `encode*` fns).
+/// Used to reject a crafted/corrupt `n` before it drives a giant allocation: a
+/// CRC is forgeable (not a MAC), so a torn or malicious record could declare
+/// n = 0xFFFFFFFF and force a multi-hundred-GB `alloc`. Bounding n by
+/// remaining_bytes / min_row_size caps the alloc at the payload's real size.
+fn minRowSize(table: Table) usize {
+    return switch (table) {
+        // 4 f32 + mem_total/mem_used u64 + mem_percent f32 + swap u64 x2
+        .metrics => 4 * 4 + 8 + 8 + 4 + 8 + 8,
+        // pid u32, name/cmdline len, state u8, cpu f32, mem_rss u64, threads u32,
+        // username len, io u64 x2, cgroup/unit len
+        .processes => 4 + 4 + 4 + 1 + 4 + 8 + 4 + 4 + 8 + 8 + 4 + 4,
+        // mount/fs len, total/used u64, percent f32
+        .disks => 4 + 4 + 8 + 8 + 4,
+        // vmid u32, name/node/type/status len, maxmem u64, maxcpu f64, uptime u64
+        .containers => 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8,
+        // ts i64, source len, unit/identifier/systemd_unit opt flag x3, priority u8,
+        // message len, pid opt flag
+        .logs => 8 + 4 + 1 + 1 + 1 + 1 + 4 + 1,
+    };
+}
+
+/// Reject a per-cycle row count that cannot fit in the bytes left in the payload
+/// (a crafted/corrupt segment forcing an unbounded alloc). `cur` is positioned
+/// just past the count field, so its remaining bytes bound how many rows of the
+/// table's minimum encoded size could possibly follow.
+fn checkRowCount(cur: *const Cursor, table: Table, n: u32) !void {
+    const remaining = cur.buf.len - cur.pos;
+    const max_rows = remaining / minRowSize(table);
+    if (n > max_rows) return StagingError.CorruptSegment;
+}
+
 fn decodeCycle(allocator: Allocator, table: Table, payload: []const u8) !DecodedCycle {
     var cur = Cursor{ .buf = payload };
     switch (table) {
         .metrics => {
             const ts = try cur.i64_();
             const n = try cur.u32_();
+            try checkRowCount(&cur, table, n);
             const rows = try allocator.alloc(MetricsRow, n);
             errdefer allocator.free(rows);
             for (rows) |*row| row.* = .{ .timestamp = ts, .metrics = try decodeMetrics(&cur) };
@@ -671,6 +705,7 @@ fn decodeCycle(allocator: Allocator, table: Table, payload: []const u8) !Decoded
         .processes => {
             const ts = try cur.i64_();
             const n = try cur.u32_();
+            try checkRowCount(&cur, table, n);
             const rows = try allocator.alloc(ProcessInfo, n);
             errdefer allocator.free(rows);
             var filled: usize = 0;
@@ -684,6 +719,7 @@ fn decodeCycle(allocator: Allocator, table: Table, payload: []const u8) !Decoded
         .disks => {
             const ts = try cur.i64_();
             const n = try cur.u32_();
+            try checkRowCount(&cur, table, n);
             const rows = try allocator.alloc(DiskInfo, n);
             errdefer allocator.free(rows);
             var filled: usize = 0;
@@ -697,6 +733,7 @@ fn decodeCycle(allocator: Allocator, table: Table, payload: []const u8) !Decoded
         .containers => {
             const ts = try cur.i64_();
             const n = try cur.u32_();
+            try checkRowCount(&cur, table, n);
             const rows = try allocator.alloc(ContainerEntry, n);
             errdefer allocator.free(rows);
             var filled: usize = 0;
@@ -709,6 +746,7 @@ fn decodeCycle(allocator: Allocator, table: Table, payload: []const u8) !Decoded
         },
         .logs => {
             const n = try cur.u32_();
+            try checkRowCount(&cur, table, n);
             const rows = try allocator.alloc(LogEntry, n);
             errdefer allocator.free(rows);
             var filled: usize = 0;
@@ -731,11 +769,69 @@ pub fn segmentPath(allocator: Allocator, root_dir: []const u8, table: Table) ![]
     return std.fmt.allocPrint(allocator, "{s}/{s}/{s}.log", .{ root_dir, staging_subdir, table.name() });
 }
 
+/// `<root>/_staging/.roll.lock` - the cross-process advisory lock that
+/// serializes a roll's publish+reset against a query's enumerate+snapshot. The
+/// roll takes LOCK_EX, the query LOCK_SH, around their respective critical
+/// sections so a query never observes the published-but-not-yet-reset window.
+/// Caller owns the returned path.
+pub fn rollLockPath(allocator: Allocator, root_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}/.roll.lock", .{ root_dir, staging_subdir });
+}
+
+/// Open (creating if missing, 0600) the roll lockfile. Caller closes the fd. The
+/// file content is never read; only its flock state matters. The `_staging` dir
+/// is created (0700) if absent so a query can take the lock before any segment
+/// has been written.
+pub fn openRollLock(root_dir: []const u8, allocator: Allocator) !fs.File {
+    const path = try rollLockPath(allocator, root_dir);
+    defer allocator.free(path);
+    if (fs.openFileAbsolute(path, .{ .mode = .read_write })) |f| {
+        return f;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    const staging_dir = try std.fs.path.join(allocator, &.{ root_dir, staging_subdir });
+    defer allocator.free(staging_dir);
+    try makeDirAbsoluteIfAbsent(staging_dir);
+    return fs.createFileAbsolute(path, .{ .mode = segment_mode, .read = true, .truncate = false });
+}
+
+// Directories holding segments must be 0700 (not the default 0755): their names
+// and mtimes would otherwise leak table names + collection activity timing to a
+// local unprivileged user, defeating the 0600 file mode. Mirrors the 0600 chmod
+// storage.zig applies to the DuckDB file.
+const dir_mode: fs.File.Mode = 0o700;
+
 fn makeDirAbsoluteIfAbsent(path: []const u8) !void {
     fs.makeDirAbsolute(path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
+        error.PathAlreadyExists => return,
         else => return err,
     };
+    chmodDir(path);
+}
+
+/// chmod a directory to 0700 best-effort (mirrors storage.zig's chmod-or-warn).
+/// Uses the path-based chmod syscall: an O_RDONLY directory fd cannot be
+/// fchmod'd on Linux (EBADF), so File.chmod is not usable here.
+fn chmodDir(path: []const u8) void {
+    chmodPath0700(path);
+}
+
+/// Best-effort `chmod(path, 0700)` via the raw syscall (same direct-syscall
+/// idiom roll.zig uses for directory fsync). Logs and continues on failure.
+fn chmodPath0700(path: []const u8) void {
+    var buf: [fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) {
+        std.log.warn("dir chmod skipped (path too long): {s}", .{path});
+        return;
+    }
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const rc = std.os.linux.chmod(@ptrCast(&buf), dir_mode);
+    if (std.os.linux.E.init(rc) != .SUCCESS) {
+        std.log.warn("dir chmod 0700 failed for {s}: errno {}", .{ path, std.os.linux.E.init(rc) });
+    }
 }
 
 /// Open (creating if needed) a segment in append mode, mode 0600. A brand-new
@@ -1072,6 +1168,33 @@ test "staging: truncated tail (short read) is skipped" {
 
     try testing.expectEqual(@as(usize, 1), snap.cycles.len);
     try testing.expectEqual(@as(i64, 1000), snap.cycles[0].metrics[0].timestamp);
+}
+
+test "staging: crafted huge row count with valid CRC is rejected without giant alloc" {
+    const a = testing.allocator;
+
+    // Build a metrics segment by hand: schema_version byte, then one record
+    // whose payload declares n = 0xFFFFFFFF rows but carries no row bytes. The
+    // CRC is computed over the (forged) payload so the frame passes the CRC
+    // check and reaches decodeCycle, exercising the unbounded-alloc guard.
+    var payload = std.ArrayList(u8){};
+    defer payload.deinit(a);
+    try putI64(&payload, a, 1000); // cycle timestamp
+    try putU32(&payload, a, 0xFFFF_FFFF); // crafted row count
+
+    var seg = std.ArrayList(u8){};
+    defer seg.deinit(a);
+    try seg.append(a, schema_version);
+    var header: [8]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], @intCast(payload.items.len), .little);
+    std.mem.writeInt(u32, header[4..8], std.hash.Crc32.hash(payload.items), .little);
+    try seg.appendSlice(a, &header);
+    try seg.appendSlice(a, payload.items);
+
+    // Using testing.allocator means a multi-GB alloc would either fail the test
+    // via OOM or be caught by the leak detector; the guard must return
+    // CorruptSegment before any per-row allocation happens.
+    try testing.expectError(StagingError.CorruptSegment, StagingReader.decodeSegment(a, .metrics, seg.items));
 }
 
 test "staging: byteLen grows and reset truncates to header" {
