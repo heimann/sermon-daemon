@@ -198,6 +198,372 @@ pub fn recoverOrphanTemps(allocator: Allocator, root: []const u8) !void {
 }
 
 // ============================================================================
+// Retention
+// ============================================================================
+
+/// Delete whole `date=YYYY-MM-DD` partition directories older than the retention
+/// window across every table. Replaces storage.runRetention's per-row DELETE:
+/// the hot tier is partitioned by day, so dropping an entire stale day's
+/// directory tree reclaims its space in one unlink-tree without rewriting any
+/// parquet. Best-effort per partition - a failure to remove one dir is logged
+/// and the rest still proceed (the cloud holds the long-term history).
+///
+/// A partition is stale when its day's END (date + 1 day) is before the cutoff
+/// (now - retention_seconds), so a partition is only dropped once its entire day
+/// is past the window. `retention_seconds <= 0` disables retention (keep all).
+pub fn runRetention(allocator: Allocator, root: []const u8, retention_seconds: i64) !void {
+    if (retention_seconds <= 0) return;
+    const cutoff = std.time.timestamp() - retention_seconds;
+
+    for (Table.all) |table| {
+        const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+        defer allocator.free(table_dir);
+
+        var dir = fs.openDirAbsolute(table_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer dir.close();
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            if (!std.mem.startsWith(u8, entry.name, "date=")) continue;
+
+            const day_start = dayStartUnix(entry.name["date=".len..]) orelse continue;
+            // Keep the day until its whole span (start + 86400) is past the cutoff.
+            if (day_start + std.time.s_per_day > cutoff) continue;
+
+            const part_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ table_dir, entry.name });
+            defer allocator.free(part_path);
+            fs.deleteTreeAbsolute(part_path) catch |err| {
+                std.log.warn("retention: failed to remove stale partition {s}: {}", .{ part_path, err });
+                continue;
+            };
+        }
+    }
+}
+
+/// Parse a `YYYY-MM-DD` partition name into the unix-seconds start of that day
+/// (UTC midnight). Returns null on a malformed name so retention skips it rather
+/// than miscomputing an age. Mirrors buildHivePath's date formatting.
+fn dayStartUnix(date_str: []const u8) ?i64 {
+    if (date_str.len != 10 or date_str[4] != '-' or date_str[7] != '-') return null;
+    const year = std.fmt.parseInt(u16, date_str[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, date_str[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, date_str[8..10], 10) catch return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+
+    // Days since the unix epoch for this calendar date (UTC), via the same
+    // std.time.epoch math buildHivePath uses in reverse.
+    var days: u64 = 0;
+    var y: u16 = 1970;
+    while (y < year) : (y += 1) {
+        days += if (std.time.epoch.isLeapYear(y)) @as(u64, 366) else 365;
+    }
+    var m: u8 = 1;
+    while (m < month) : (m += 1) {
+        days += std.time.epoch.getDaysInMonth(year, @as(std.time.epoch.Month, @enumFromInt(m)));
+    }
+    days += day - 1;
+    return @as(i64, @intCast(days)) * std.time.s_per_day;
+}
+
+// ============================================================================
+// Compaction
+// ============================================================================
+
+/// Compact small parquet files within each `date=*/hour=*` leaf partition of a
+/// table down to a single file, so the query path's frozen file list stays
+/// small. A soak showed low-volume tables accrue many tiny files (one per roll)
+/// that the query must enumerate; merging them keeps enumeration cheap.
+///
+/// For any leaf partition holding MORE than `max_files_per_partition` `.parquet`
+/// files, the files are read via read_parquet, COPYed to a `<merged>.tmp` in the
+/// same partition, fsynced, the originals unlinked, then the temp atomically
+/// renamed to its final name and the dir fsynced - the same crash-safe
+/// temp+rename discipline as the roll, under the SAME EX roll lock (so a query
+/// or roll never observes a half-merged set). Returns the count of partitions
+/// compacted. Best-effort overall; a per-partition failure is logged and skipped.
+pub fn compact(allocator: Allocator, root: []const u8, table: Table, max_files_per_partition: usize) !usize {
+    // Take the EX roll lock for the whole scan+merge: a query holds it SH around
+    // its enumerate+snapshot, and the roll holds it EX; compaction mutates the
+    // same committed file set, so it must serialize against both. See the
+    // CONCURRENCY MODEL comment in staging.zig.
+    var lock_file = try staging.openRollLock(root, allocator);
+    defer lock_file.close();
+    try std.posix.flock(lock_file.handle, std.posix.LOCK.EX);
+    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
+
+    const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+    defer allocator.free(table_dir);
+
+    // Walk the table tree collecting the leaf directories that directly contain
+    // `.parquet` files. We do a single walk, grouping files by their parent dir.
+    var dir = fs.openDirAbsolute(table_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close();
+
+    // Map parent-dir (absolute) -> list of absolute file paths in it.
+    var groups = std.StringHashMap(std.ArrayList([]u8)).init(allocator);
+    defer {
+        var kit = groups.iterator();
+        while (kit.next()) |kv| {
+            for (kv.value_ptr.items) |p| allocator.free(p);
+            kv.value_ptr.deinit(allocator);
+            allocator.free(kv.key_ptr.*);
+        }
+        groups.deinit();
+    }
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".parquet")) continue;
+        const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ table_dir, entry.path });
+        errdefer allocator.free(abs);
+        const parent = std.fs.path.dirname(abs) orelse {
+            allocator.free(abs);
+            continue;
+        };
+        const gop = try groups.getOrPut(parent);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try allocator.dupe(u8, parent);
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(allocator, abs);
+    }
+
+    var compacted: usize = 0;
+    var git = groups.iterator();
+    while (git.next()) |kv| {
+        const files = kv.value_ptr.items;
+        if (files.len <= max_files_per_partition) continue;
+        compactPartition(allocator, kv.key_ptr.*, files) catch |err| {
+            std.log.warn("compaction: failed for partition {s}: {}", .{ kv.key_ptr.*, err });
+            continue;
+        };
+        compacted += 1;
+    }
+    return compacted;
+}
+
+/// Merge `files` (all in `partition_dir`) into one new parquet file via a
+/// crash-safe temp+rename. The merged file's name is derived from a hash of the
+/// sorted input basenames so a crash-replay re-derives the same name. Originals
+/// are unlinked only AFTER the merged temp is fsynced-durable; the rename
+/// publishes atomically.
+fn compactPartition(allocator: Allocator, partition_dir: []const u8, files: []const []u8) !void {
+    // Stable merged-file name: hash the concatenated sorted basenames so the
+    // output is deterministic for a given input set (idempotent on replay).
+    var hasher = std.hash.Wyhash.init(0);
+    // Sort a copy of the basenames for a stable hash regardless of walk order.
+    const basenames = try allocator.alloc([]const u8, files.len);
+    defer allocator.free(basenames);
+    for (files, 0..) |f, i| basenames[i] = std.fs.path.basename(f);
+    std.mem.sort([]const u8, basenames, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    for (basenames) |b| hasher.update(b);
+    const merged_name = try std.fmt.allocPrint(allocator, "c{x:0>16}.parquet", .{hasher.final()});
+    defer allocator.free(merged_name);
+
+    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ partition_dir, merged_name });
+    defer allocator.free(final_path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{final_path});
+    defer allocator.free(tmp_path);
+
+    // COPY the union of all input files (frozen, explicit list) to the temp.
+    try copyMergeToParquet(allocator, files, tmp_path);
+
+    // Make the merged temp durable BEFORE removing any original (so a crash here
+    // leaves all originals intact and the query set unchanged).
+    try fsyncFileAndDir(tmp_path);
+
+    // Remove the originals (skip the temp itself and any pre-existing merged file
+    // sharing the final name - it will be overwritten by the rename anyway).
+    for (files) |f| {
+        if (std.mem.eql(u8, f, final_path)) continue;
+        fs.deleteFileAbsolute(f) catch |err| {
+            std.log.warn("compaction: failed to unlink merged-away file {s}: {}", .{ f, err });
+        };
+    }
+
+    // Publish atomically and fsync the directory entry.
+    try fs.renameAbsolute(tmp_path, final_path);
+    try fsyncDirOf(final_path);
+}
+
+/// COPY (SELECT * FROM read_parquet([<files>])) TO '<dest>' via a transient
+/// in-memory DuckDB. The file list is explicit + SQL-escaped (never a glob) so
+/// the merge reads exactly the inputs compaction enumerated under the lock.
+fn copyMergeToParquet(allocator: Allocator, files: []const []u8, dest: []const u8) !void {
+    var db: c.duckdb_database = undefined;
+    if (c.duckdb_open(":memory:", &db) == c.DuckDBError) return RollError.DatabaseError;
+    defer c.duckdb_close(&db);
+    var conn: c.duckdb_connection = undefined;
+    if (c.duckdb_connect(db, &conn) == c.DuckDBError) return RollError.ConnectionError;
+    defer c.duckdb_disconnect(&conn);
+
+    // Build the '<f1>','<f2>',... literal with each path SQL-escaped.
+    var list = std.ArrayList(u8){};
+    defer list.deinit(allocator);
+    for (files, 0..) |path, idx| {
+        if (idx != 0) try list.append(allocator, ',');
+        const escaped = try escapeSqlLiteral(allocator, path);
+        defer allocator.free(escaped);
+        try list.append(allocator, '\'');
+        try list.appendSlice(allocator, escaped);
+        try list.append(allocator, '\'');
+    }
+
+    const escaped_dest = try escapeSqlLiteral(allocator, dest);
+    defer allocator.free(escaped_dest);
+
+    const sql = try std.fmt.allocPrintSentinel(
+        allocator,
+        "COPY (SELECT * FROM read_parquet([{s}])) TO '{s}' (FORMAT parquet, COMPRESSION zstd)",
+        .{ list.items, escaped_dest },
+        0,
+    );
+    defer allocator.free(sql);
+
+    var result: c.duckdb_result = undefined;
+    const state = c.duckdb_query(conn, sql.ptr, &result);
+    defer c.duckdb_destroy_result(&result);
+    if (state == c.DuckDBError) {
+        std.log.err("compaction COPY error: {s}", .{c.duckdb_result_error(&result)});
+        _ = malloc_trim(0);
+        return RollError.CopyError;
+    }
+    _ = malloc_trim(0);
+}
+
+// ============================================================================
+// One-shot legacy metrics.db migration
+// ============================================================================
+
+/// One-shot migration of a pre-cutover resident `metrics.db` into the parquet
+/// tree. If `db_path` exists, opens it READ-ONLY, COPYs each of the six tables'
+/// rows into the hive layout via a per-table
+/// `COPY (SELECT *, ... ) TO '<table>' (FORMAT parquet, PARTITION_BY ...)`, then
+/// renames `metrics.db` -> `metrics.db.migrated` (kept for rollback, NOT
+/// deleted). Best-effort: ANY failure logs a warning and returns without
+/// renaming, so a partial migration can be retried (or ignored - the cloud has
+/// the history). Returns true when a migration ran (db existed), false when
+/// there was nothing to migrate.
+pub fn migrateLegacyDb(allocator: Allocator, root: []const u8, db_path: []const u8) !bool {
+    fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+
+    var db: c.duckdb_database = undefined;
+    // Open the legacy DB read-only so we never mutate it (rollback stays clean).
+    var config: c.duckdb_config = undefined;
+    if (c.duckdb_create_config(&config) == c.DuckDBError) return RollError.DatabaseError;
+    defer c.duckdb_destroy_config(&config);
+    _ = c.duckdb_set_config(config, "access_mode", "READ_ONLY");
+
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+    var open_err: [*c]u8 = null;
+    if (c.duckdb_open_ext(db_path_z.ptr, &db, config, &open_err) == c.DuckDBError) {
+        if (open_err != null) {
+            std.log.warn("migrate: cannot open legacy db {s}: {s}", .{ db_path, open_err });
+            c.duckdb_free(open_err);
+        }
+        return RollError.DatabaseError;
+    }
+    defer c.duckdb_close(&db);
+
+    var conn: c.duckdb_connection = undefined;
+    if (c.duckdb_connect(db, &conn) == c.DuckDBError) return RollError.ConnectionError;
+    defer c.duckdb_disconnect(&conn);
+
+    // COPY each table partitioned by date/hour into the hive tree. DuckDB's
+    // PARTITION_BY writes the same date=YYYY-MM-DD/hour=HH layout the roll uses.
+    // A table missing from a legacy DB is tolerated (logged, skipped).
+    for (Table.all) |table| {
+        migrateTable(allocator, conn, root, table) catch |err| {
+            std.log.warn("migrate: table {s} failed: {} - continuing", .{ table.name(), err });
+            _ = malloc_trim(0);
+            return false; // best-effort: leave metrics.db in place for retry/rollback
+        };
+    }
+    _ = malloc_trim(0);
+
+    // Rename metrics.db -> metrics.db.migrated (kept for rollback; do NOT delete).
+    const migrated_path = try std.fmt.allocPrint(allocator, "{s}.migrated", .{db_path});
+    defer allocator.free(migrated_path);
+    try fs.renameAbsolute(db_path, migrated_path);
+    return true;
+}
+
+fn migrateTable(allocator: Allocator, conn: c.duckdb_connection, root: []const u8, table: Table) !void {
+    // A legacy DB predating a table simply lacks it; that is NOT a migration
+    // failure - skip it silently. Probe the catalog first so a missing table
+    // does not abort the whole migration.
+    if (!try tableExists(allocator, conn, table)) {
+        std.log.info("migrate: table {s} absent in legacy db, skipping", .{table.name()});
+        return;
+    }
+
+    // PARTITION_BY needs date/hour columns derived from timestamp. We SELECT the
+    // table's explicit columns plus computed partition columns. union_by_name on
+    // the read side later strips them, matching the roll's hive layout.
+    const out_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+    defer allocator.free(out_dir);
+    try makePathAbsolute(out_dir);
+
+    const escaped_dir = try escapeSqlLiteral(allocator, out_dir);
+    defer allocator.free(escaped_dir);
+
+    // strftime gives the partition strings exactly matching buildHivePath's
+    // zero-padded date=YYYY-MM-DD / hour=HH. OVERWRITE_OR_IGNORE keeps the
+    // migration idempotent if re-run before the rename.
+    const sql = try std.fmt.allocPrintSentinel(
+        allocator,
+        "COPY (SELECT *, strftime(timestamp, '%Y-%m-%d') AS date, strftime(timestamp, '%H') AS hour FROM {s}) " ++
+            "TO '{s}' (FORMAT parquet, COMPRESSION zstd, PARTITION_BY (date, hour), OVERWRITE_OR_IGNORE)",
+        .{ table.name(), escaped_dir },
+        0,
+    );
+    defer allocator.free(sql);
+
+    var result: c.duckdb_result = undefined;
+    const state = c.duckdb_query(conn, sql.ptr, &result);
+    defer c.duckdb_destroy_result(&result);
+    if (state == c.DuckDBError) {
+        std.log.warn("migrate COPY {s} error: {s}", .{ table.name(), c.duckdb_result_error(&result) });
+        return RollError.CopyError;
+    }
+}
+
+/// True when `table` exists in the connected DB's catalog. Used so the migration
+/// can skip tables a legacy DB never created without treating them as failures.
+fn tableExists(allocator: Allocator, conn: c.duckdb_connection, table: Table) !bool {
+    const sql = try std.fmt.allocPrintSentinel(
+        allocator,
+        "SELECT 1 FROM information_schema.tables WHERE table_name = '{s}'",
+        .{table.name()},
+        0,
+    );
+    defer allocator.free(sql);
+    var result: c.duckdb_result = undefined;
+    if (c.duckdb_query(conn, sql.ptr, &result) == c.DuckDBError) {
+        c.duckdb_destroy_result(&result);
+        return RollError.DatabaseError;
+    }
+    defer c.duckdb_destroy_result(&result);
+    return c.duckdb_row_count(&result) > 0;
+}
+
+// ============================================================================
 // DuckDB-backed parquet write
 // ============================================================================
 
@@ -266,6 +632,12 @@ fn createTable(conn: c.duckdb_connection, table: Table) !void {
         \\  message TEXT, pid INTEGER
         \\)
         ,
+        .container_metrics =>
+        \\CREATE TABLE container_metrics (
+        \\  timestamp TIMESTAMP NOT NULL, vmid INTEGER NOT NULL,
+        \\  cpu_pct DOUBLE, mem_current BIGINT, mem_max BIGINT
+        \\)
+        ,
     };
 
     var result: c.duckdb_result = undefined;
@@ -328,6 +700,10 @@ pub fn appendSnapshotTo(opaque_appender: ?*anyopaque, snap: *Snapshot) !usize {
             },
             .logs => |rows| for (rows) |entry| {
                 try appendLogRow(appender, entry);
+                n += 1;
+            },
+            .container_metrics => |ts| for (ts.rows) |sample| {
+                try appendContainerMetricRow(appender, ts.timestamp, sample);
                 n += 1;
             },
         }
@@ -427,6 +803,26 @@ fn appendLogRow(appender: c.duckdb_appender, e: logs.LogEntry) !void {
     try endRow(appender);
 }
 
+/// Mirrors storage.insertContainerMetrics exactly: a NaN cpu_pct (the
+/// "first cycle, no delta yet" sentinel) and a null mem_max are persisted as
+/// SQL NULL so the dashboard doesn't render a misleading 0% spike / 0 limit.
+fn appendContainerMetricRow(appender: c.duckdb_appender, timestamp: i64, m: proxmox.ContainerMetrics) !void {
+    _ = c.duckdb_append_timestamp(appender, tsMicros(timestamp));
+    _ = c.duckdb_append_uint32(appender, m.vmid);
+    if (std.math.isNan(m.cpu_pct)) {
+        _ = c.duckdb_append_null(appender);
+    } else {
+        _ = c.duckdb_append_double(appender, m.cpu_pct);
+    }
+    _ = c.duckdb_append_uint64(appender, m.mem_current);
+    if (m.mem_max) |mm| {
+        _ = c.duckdb_append_uint64(appender, mm);
+    } else {
+        _ = c.duckdb_append_null(appender);
+    }
+    try endRow(appender);
+}
+
 fn copyToParquet(allocator: Allocator, conn: c.duckdb_connection, table: Table, parquet_path: []const u8) !void {
     // Single-quotes in a filesystem path would break the SQL literal; our hive
     // paths never contain them, but escape defensively all the same.
@@ -469,6 +865,7 @@ fn firstTimestamp(snap: Snapshot) ?i64 {
         .disks => |ts| ts.timestamp,
         .containers => |ts| ts.timestamp,
         .logs => |rows| if (rows.len > 0) rows[0].timestamp else null,
+        .container_metrics => |ts| ts.timestamp,
     };
 }
 
@@ -888,6 +1285,49 @@ test "roll: processes and logs segments to parquet" {
     try testing.expectEqual(@as(i64, 1), try parquetCount(a, lres.parquet_path));
 }
 
+test "roll: container_metrics segment to parquet, NaN/null persist as SQL NULL" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    const samples = [_]proxmox.ContainerMetrics{
+        .{ .vmid = 101, .cpu_pct = 33.0, .mem_current = 1_000_000, .mem_max = 4_000_000 },
+        .{ .vmid = 102, .cpu_pct = std.math.nan(f64), .mem_current = 2_000_000, .mem_max = null },
+    };
+    try stg.appendContainerMetrics(1_700_000_000, &samples);
+    try stg.sync();
+
+    const res = (try rollTable(a, root, &stg, .container_metrics)).?;
+    defer a.free(res.parquet_path);
+    try testing.expectEqual(@as(usize, 2), res.row_count);
+    try testing.expectEqual(@as(i64, 2), try parquetCount(a, res.parquet_path));
+
+    // The NaN cpu_pct + null mem_max row must read back as SQL NULL (exactly one
+    // NULL each), proving the storage.insertContainerMetrics parity.
+    var db: c.duckdb_database = undefined;
+    try testing.expect(c.duckdb_open(":memory:", &db) != c.DuckDBError);
+    defer c.duckdb_close(&db);
+    var conn: c.duckdb_connection = undefined;
+    try testing.expect(c.duckdb_connect(db, &conn) != c.DuckDBError);
+    defer c.duckdb_disconnect(&conn);
+    const sql = try std.fmt.allocPrintSentinel(
+        a,
+        "SELECT COUNT(*) FROM read_parquet('{s}') WHERE cpu_pct IS NULL OR mem_max IS NULL",
+        .{res.parquet_path},
+        0,
+    );
+    defer a.free(sql);
+    var result: c.duckdb_result = undefined;
+    try testing.expect(c.duckdb_query(conn, sql.ptr, &result) != c.DuckDBError);
+    defer c.duckdb_destroy_result(&result);
+    try testing.expectEqual(@as(i64, 1), c.duckdb_value_int64(&result, 0, 0));
+}
+
 test "roll: recoverOrphanTemps renames an orphan temp to its final, queryable" {
     // Simulates a crash BETWEEN staging reset and the rename: staging is already
     // cleared and only a durable `<seq>.parquet.tmp` orphan remains. Startup
@@ -929,6 +1369,192 @@ test "roll: recoverOrphanTemps renames an orphan temp to its final, queryable" {
     // Idempotent: a second call with no temps left is a clean no-op.
     try recoverOrphanTemps(a, root);
     try testing.expectEqual(@as(i64, 2), try parquetCount(a, final_path));
+}
+
+test "roll: runRetention drops a stale date= partition, keeps a fresh one" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    // One segment far in the past (stale) and one at "now" (fresh). The roll
+    // partitions by the row's own timestamp, so each lands in its own date= dir.
+    const now = std.time.timestamp();
+    const stale_ts = now - (30 * std.time.s_per_day); // 30 days ago
+    try stg.appendMetrics(stale_ts, sampleMetrics());
+    try stg.sync();
+    const r1 = (try rollTable(a, root, &stg, .metrics)).?;
+    a.free(r1.parquet_path);
+
+    try stg.appendMetrics(now, sampleMetrics());
+    try stg.sync();
+    const r2 = (try rollTable(a, root, &stg, .metrics)).?;
+    defer a.free(r2.parquet_path);
+
+    // Two date= partitions exist before retention.
+    try testing.expectEqual(@as(usize, 2), try countDatePartitions(a, root, .metrics));
+
+    // 7-day window: the 30-day-old partition is stale; the fresh one stays.
+    try runRetention(a, root, 7 * std.time.s_per_day);
+
+    try testing.expectEqual(@as(usize, 1), try countDatePartitions(a, root, .metrics));
+    // The fresh parquet is still readable.
+    try testing.expectEqual(@as(i64, 1), try parquetCount(a, r2.parquet_path));
+}
+
+fn countDatePartitions(allocator: Allocator, root: []const u8, table: Table) !usize {
+    const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+    defer allocator.free(table_dir);
+    var dir = fs.openDirAbsolute(table_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next()) |e| {
+        if (e.kind == .directory and std.mem.startsWith(u8, e.name, "date=")) n += 1;
+    }
+    return n;
+}
+
+test "roll: compact merges many small files in a partition into one, same row count" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    // Roll several distinct segments at the SAME timestamp -> several files in
+    // the same date=/hour= partition. (Distinct contents => distinct seq names.)
+    const ts: i64 = 1_700_000_000;
+    const n_files = 5;
+    var total_rows: i64 = 0;
+    var k: i64 = 0;
+    while (k < n_files) : (k += 1) {
+        // Vary row count per segment so contents differ (distinct hashes).
+        var j: i64 = 0;
+        while (j <= k) : (j += 1) {
+            try stg.appendMetrics(ts, sampleMetrics());
+            total_rows += 1;
+        }
+        try stg.sync();
+        const r = (try rollTable(a, root, &stg, .metrics)).?;
+        a.free(r.parquet_path);
+    }
+
+    // Find the leaf partition dir and confirm it has n_files files pre-compaction.
+    try testing.expectEqual(@as(usize, n_files), try countParquetFilesInTree(a, root, .metrics));
+
+    // Compact with a threshold below the file count so it triggers.
+    const compacted = try compact(a, root, .metrics, 2);
+    try testing.expectEqual(@as(usize, 1), compacted);
+
+    // Exactly one file remains, holding the SAME total row count.
+    try testing.expectEqual(@as(usize, 1), try countParquetFilesInTree(a, root, .metrics));
+
+    var pq_db: c.duckdb_database = undefined;
+    try testing.expect(c.duckdb_open(":memory:", &pq_db) != c.DuckDBError);
+    defer c.duckdb_close(&pq_db);
+    var conn: c.duckdb_connection = undefined;
+    try testing.expect(c.duckdb_connect(pq_db, &conn) != c.DuckDBError);
+    defer c.duckdb_disconnect(&conn);
+    const glob = try std.fmt.allocPrintSentinel(a, "SELECT COUNT(*) FROM read_parquet('{s}/metrics/**/*.parquet')", .{root}, 0);
+    defer a.free(glob);
+    var result: c.duckdb_result = undefined;
+    try testing.expect(c.duckdb_query(conn, glob.ptr, &result) != c.DuckDBError);
+    defer c.duckdb_destroy_result(&result);
+    try testing.expectEqual(total_rows, c.duckdb_value_int64(&result, 0, 0));
+
+    // Idempotent: a second compaction with the now-single file is a no-op.
+    try testing.expectEqual(@as(usize, 0), try compact(a, root, .metrics, 2));
+}
+
+fn countParquetFilesInTree(allocator: Allocator, root: []const u8, table: Table) !usize {
+    const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+    defer allocator.free(table_dir);
+    var dir = fs.openDirAbsolute(table_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close();
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    var n: usize = 0;
+    while (try walker.next()) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.basename, ".parquet")) n += 1;
+    }
+    return n;
+}
+
+test "roll: migrateLegacyDb copies a seeded duckdb into the parquet tree" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    const db_path = try std.fmt.allocPrint(a, "{s}/metrics.db", .{root});
+    defer a.free(db_path);
+
+    // Seed a small legacy DB with a metrics table (the schema the roll's
+    // createTable produces) and two rows.
+    {
+        var db: c.duckdb_database = undefined;
+        const db_path_z = try a.dupeZ(u8, db_path);
+        defer a.free(db_path_z);
+        try testing.expect(c.duckdb_open(db_path_z.ptr, &db) != c.DuckDBError);
+        defer c.duckdb_close(&db);
+        var conn: c.duckdb_connection = undefined;
+        try testing.expect(c.duckdb_connect(db, &conn) != c.DuckDBError);
+        defer c.duckdb_disconnect(&conn);
+
+        const ddl =
+            \\CREATE TABLE metrics (timestamp TIMESTAMP NOT NULL, cpu_percent REAL, cpu_user REAL,
+            \\  cpu_system REAL, cpu_iowait REAL, mem_total BIGINT, mem_used BIGINT, mem_percent REAL,
+            \\  swap_total BIGINT, swap_used BIGINT);
+            \\INSERT INTO metrics VALUES (to_timestamp(1700000000), 1,1,1,1, 100,50,50, 0,0);
+            \\INSERT INTO metrics VALUES (to_timestamp(1700000010), 2,2,2,2, 100,60,60, 0,0);
+        ;
+        var r: c.duckdb_result = undefined;
+        try testing.expect(c.duckdb_query(conn, ddl, &r) != c.DuckDBError);
+        c.duckdb_destroy_result(&r);
+    }
+
+    // Migrate.
+    const ran = try migrateLegacyDb(a, root, db_path);
+    try testing.expect(ran);
+
+    // The two rows are now readable from the parquet tree (file count is not
+    // asserted - PARTITION_BY groups same-hour rows into one file).
+    var db: c.duckdb_database = undefined;
+    try testing.expect(c.duckdb_open(":memory:", &db) != c.DuckDBError);
+    defer c.duckdb_close(&db);
+    var conn: c.duckdb_connection = undefined;
+    try testing.expect(c.duckdb_connect(db, &conn) != c.DuckDBError);
+    defer c.duckdb_disconnect(&conn);
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT COUNT(*) FROM read_parquet('{s}/metrics/**/*.parquet')", .{root}, 0);
+    defer a.free(sql);
+    var result: c.duckdb_result = undefined;
+    try testing.expect(c.duckdb_query(conn, sql.ptr, &result) != c.DuckDBError);
+    defer c.duckdb_destroy_result(&result);
+    try testing.expectEqual(@as(i64, 2), c.duckdb_value_int64(&result, 0, 0));
+
+    // metrics.db was renamed to metrics.db.migrated (kept for rollback).
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(db_path, .{}));
+    const migrated = try std.fmt.allocPrint(a, "{s}.migrated", .{db_path});
+    defer a.free(migrated);
+    try fs.accessAbsolute(migrated, .{});
+
+    // No legacy db => no-op, returns false.
+    try testing.expect(!(try migrateLegacyDb(a, root, db_path)));
 }
 
 test "roll: recoverOrphanTemps is a no-op when there are no temps" {

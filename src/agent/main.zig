@@ -6,17 +6,29 @@ const proc_self_mod = @import("proc_self");
 const proxmox_mod = @import("proxmox");
 const push_mod = @import("push");
 const storage_mod = @import("storage");
+// Parquet hot tier (plan 25 cutover). The daemon WRITE path is now a durable
+// append-log (staging) periodically rolled to parquet (roll); the resident
+// DuckDB write path (storage_mod) is retired here. storage_mod is still imported
+// only for its back-compat constants (default_memory_limit_mb) - see below.
+const staging_mod = @import("staging");
+const roll_mod = @import("roll");
 
 const default_db_path = "~/.local/share/sermon/metrics.db";
 const default_config_path = "~/.config/sermon/config.json";
 const default_interval: u64 = 10;
 const default_retention: i64 = 7 * 24 * 60 * 60; // 7 days
 const default_rules_filename = "log_rules.json";
-// Periodic DuckDB handle refresh. Long soaks showed DuckDB can retain anonymous
-// RSS after process-table writes/checkpoints; refreshing the embedded DB every
-// few hours returns that memory without restarting the daemon process.
-const default_storage_refresh_interval: u64 = 4 * 60 * 60;
-const storage_refresh_min_interval: i64 = 15 * 60;
+// Roll trigger thresholds for the parquet hot tier. A table's staging segment
+// rolls to parquet when it exceeds default_roll_max_bytes OR when
+// default_roll_interval_s have elapsed since the last roll (so low-volume tables
+// - disks, containers - still roll and don't sit un-rolled forever). Both are
+// config-overridable (roll_max_bytes / roll_interval_s).
+const default_roll_max_bytes: u64 = 8 * 1024 * 1024; // 8 MiB
+const default_roll_interval_s: u64 = 300; // 5 minutes
+// Compaction: a leaf partition with more than this many parquet files is merged
+// to one (keeps the query path's enumerated file list small). Runs on the same
+// hourly cadence as retention.
+const default_compact_max_files: usize = 16;
 // Processes stored per cycle when config.max_processes is unset. Snapshotting
 // every process is the dominant source of DB growth (millions of rows/week);
 // keeping the top-N by CPU and memory cuts that ~5-15x. Set max_processes to 0
@@ -32,17 +44,28 @@ const Config = struct {
     retention: ?i64 = null,
     server_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
-    // DuckDB buffer-pool cap (MB). See Storage.default_memory_limit_mb.
+    // DuckDB buffer-pool cap (MB). RETAINED FOR BACK-COMPAT: the resident-DuckDB
+    // write path is retired (plan 25), so this no longer caps a resident DB. The
+    // roll uses a transient in-memory DuckDB whose lifetime is one roll; roll.zig
+    // does not currently expose a buffer-pool knob, so this value is parsed (so
+    // existing config.json files don't break) and logged but otherwise unused.
     memory_limit_mb: ?u32 = null,
     // Max processes stored per cycle (top-N by CPU and memory). 0 keeps every
     // process (old behavior). See default_max_processes / keep_all_processes.
     max_processes: ?u32 = null,
-    // Periodic DuckDB refresh interval in seconds. 0 disables time-based
-    // refresh. See default_storage_refresh_interval.
+    // RETAINED FOR BACK-COMPAT ONLY: periodic DuckDB refresh interval. There is
+    // no resident DuckDB to refresh after the cutover; parsed-but-unused.
     storage_refresh_interval: ?u64 = null,
-    // RSS threshold in MB that can trigger a DuckDB refresh. 0 disables the RSS
-    // trigger. Defaults to memory_limit_mb.
+    // RETAINED FOR BACK-COMPAT ONLY: RSS-triggered DuckDB refresh threshold.
+    // No resident DuckDB to refresh; parsed-but-unused.
     storage_refresh_rss_mb: ?u32 = null,
+    // Roll trigger: a table's staging segment rolls to parquet once it exceeds
+    // this many bytes. See default_roll_max_bytes.
+    roll_max_bytes: ?u64 = null,
+    // Roll trigger: a table also rolls once this many seconds have elapsed since
+    // its last roll, so low-volume tables don't sit un-rolled. See
+    // default_roll_interval_s.
+    roll_interval_s: ?u64 = null,
 };
 
 fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(Config) {
@@ -154,6 +177,8 @@ pub fn main() !void {
     var interval: u64 = if (config) |c| c.value.interval orelse default_interval else default_interval;
     var server_url: ?[]const u8 = if (config) |c| c.value.server_url else null;
     var api_key: ?[]const u8 = if (config) |c| c.value.api_key else null;
+    // RETAINED FOR BACK-COMPAT: still parsed so old config.json files load, but
+    // the resident-DuckDB write path it capped is retired. Logged at startup.
     const memory_limit_mb: u32 = if (config) |c|
         c.value.memory_limit_mb orelse storage_mod.Storage.default_memory_limit_mb
     else
@@ -162,14 +187,15 @@ pub fn main() !void {
         c.value.max_processes orelse default_max_processes
     else
         default_max_processes;
-    const storage_refresh_interval: u64 = if (config) |c|
-        c.value.storage_refresh_interval orelse default_storage_refresh_interval
+    // Roll trigger thresholds (parquet hot tier). Config-overridable.
+    const roll_max_bytes: u64 = if (config) |c|
+        c.value.roll_max_bytes orelse default_roll_max_bytes
     else
-        default_storage_refresh_interval;
-    const storage_refresh_rss_mb: u32 = if (config) |c|
-        c.value.storage_refresh_rss_mb orelse memory_limit_mb
+        default_roll_max_bytes;
+    const roll_interval_s: u64 = if (config) |c|
+        c.value.roll_interval_s orelse default_roll_interval_s
     else
-        memory_limit_mb;
+        default_roll_interval_s;
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -253,15 +279,64 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
-    // Open storage once for the daemon's lifetime. Reopening per-cycle
-    // mmaps the entire DB on every collection tick and pegs CPU on
-    // populated databases (~400 MB and up). See scripts/bench/.
-    var storage = try storage_mod.Storage.initWithMemoryLimit(allocator, final_db_path, memory_limit_mb);
-    defer storage.deinit();
+    // ── Parquet hot tier root (plan 25 cutover) ──
+    // The hot tier lives in the directory that USED to hold metrics.db (so
+    // existing --db/db_path config keeps pointing at the same place). The
+    // staging append-log lands in <root>/_staging/ and rolled parquet in
+    // <root>/<table>/date=.../hour=.../*.parquet. We derive the root from the
+    // configured db path's directory; if the path has no dir component we fall
+    // back to the current directory.
+    const root = try allocator.dupe(u8, std.fs.path.dirname(final_db_path) orelse ".");
+    defer allocator.free(root);
 
-    std.debug.print("sermon-agent started (db={s}, interval={d}s, memory_limit={d}MB, max_processes={d}, storage_refresh_interval={d}s, storage_refresh_rss={d}MB)\n", .{ final_db_path, interval, memory_limit_mb, max_processes, storage_refresh_interval, storage_refresh_rss_mb });
+    // STARTUP LIFECYCLE (must run BEFORE any append/roll/query):
+    //   1. recoverOrphanTemps: a crash BETWEEN a roll's staging-reset and its
+    //      rename leaves a durable `<seq>.parquet.tmp` whose rows are already
+    //      gone from staging. Rename such orphans to their final name so those
+    //      rows are not stranded. Idempotent; safe when there are none.
+    roll_mod.recoverOrphanTemps(allocator, root) catch |err| {
+        std.debug.print("Warning: orphan-temp recovery failed: {}\n", .{err});
+    };
+
+    // One-shot MIGRATION: if a legacy resident metrics.db still exists at the
+    // old path, COPY its rows into the parquet tree (best-effort) and rename it
+    // to metrics.db.migrated (kept for rollback). A failure is logged and the
+    // daemon continues - the cloud holds the long-term history.
+    if (roll_mod.migrateLegacyDb(allocator, root, final_db_path)) |migrated| {
+        if (migrated) std.debug.print("migrated legacy {s} into parquet hot tier\n", .{final_db_path});
+    } else |err| {
+        std.debug.print("Warning: legacy db migration failed: {}\n", .{err});
+    }
+
+    // Open the durable staging append-log for the daemon's lifetime. This
+    // replaces the resident DuckDB write path entirely.
+    var stg = try staging_mod.Staging.open(allocator, root);
+    defer stg.deinit();
+
+    // REPLAY: re-roll any staging segments left over from a prior run so a crash
+    // mid-run does not strand un-rolled rows in staging (and so the segment
+    // doesn't keep growing past its size trigger across restarts). rollAll is a
+    // no-op for empty segments.
+    {
+        const replayed = roll_mod.rollAll(allocator, root, &stg) catch |err| blk: {
+            std.debug.print("Warning: startup replay roll failed: {}\n", .{err});
+            break :blk 0;
+        };
+        if (replayed > 0) std.debug.print("startup replay: rolled {d} leftover staging segment(s)\n", .{replayed});
+    }
+
+    std.debug.print("sermon-agent started (root={s}, interval={d}s, max_processes={d}, roll_max_bytes={d}, roll_interval_s={d}s) [memory_limit_mb={d} retained for back-compat, unused]\n", .{ root, interval, max_processes, roll_max_bytes, roll_interval_s, memory_limit_mb });
     if (log_rules.len > 0) {
         std.debug.print("loaded {d} log rule(s)\n", .{log_rules.len});
+    }
+
+    // Per-table wall-clock of the last roll, so the time-based roll trigger fires
+    // even for low-volume tables that never reach the byte threshold. Seeded to
+    // "now" so a fresh start waits a full interval before the first time-roll.
+    var last_roll: [staging_mod.Table.all.len]i64 = undefined;
+    {
+        const start_ts = std.time.timestamp();
+        for (&last_roll) |*t| t.* = start_ts;
     }
 
     // Initialize collector. max_processes caps how many processes each cycle
@@ -316,21 +391,16 @@ pub fn main() !void {
     }
     std.Thread.sleep(1 * std.time.ns_per_s);
 
-    // Run retention once on startup to trim a pre-wedged DB before the main
-    // loop begins. Non-fatal: the main loop's failsafe handles persistent
-    // storage failures; log once and continue.
+    // Run retention once on startup to trim stale partitions before the loop
+    // begins. Non-fatal: best-effort, log once and continue.
     {
         const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
-        storage.runRetention(retention) catch |err| {
+        roll_mod.runRetention(allocator, root, retention) catch |err| {
             std.debug.print("Warning: startup retention failed: {}\n", .{err});
         };
     }
 
     var retention_counter: u64 = 0;
-    var last_storage_refresh: i64 = std.time.timestamp();
-    // Tracks whether a reconnect has been attempted since the last successful
-    // write. Used for two-stage recovery: reconnect once, then quarantine.
-    var reconnect_attempted: bool = false;
     var self_state = proc_self_mod.State.init();
     var ct_metrics_state = proxmox_mod.ContainerMetricsState.init(allocator);
     defer ct_metrics_state.deinit();
@@ -407,57 +477,79 @@ pub fn main() !void {
             push_logs.deinit(allocator);
         }
 
-        // Write everything (storage held open across cycles)
+        // ── WRITE PATH: append this cycle to the durable staging log ──
+        // The resident DuckDB write path is retired (plan 25). One collect cycle
+        // = one bracketed begin/end (takes the EX roll lock, appends each
+        // non-empty table's record, fdatasyncs once, releases). The append guards
+        // mirror today's storage.insert* guards (only write non-empty tables).
         {
-            // Firehose guard: after the first insert failure in a cycle, skip
-            // all remaining DB writes for that cycle. This caps failure logging
-            // at one line per cycle rather than up to 1000 (one per log entry).
-            // Logs are still drained from the tailer for the push path.
-            var storage_failed = false;
+            // Firehose guard, preserved in spirit: on the FIRST append failure in
+            // a cycle, skip the remaining appends so we log at most one warning
+            // per cycle (not one per log entry). Logs are still drained from the
+            // tailer for the push path regardless of staging health.
+            var staging_failed = false;
 
-            if (!storage_failed) {
-                storage.insertMetrics(now, metrics) catch |err| {
-                    std.debug.print("Warning: metrics insert failed: {}\n", .{err});
-                    storage_failed = true;
+            // beginCycle takes the EX roll lock; if even that fails we can't
+            // safely append this cycle - warn once and drain logs for push only.
+            // `cycle_open` tracks whether the lock is held: endCycle (which
+            // RELEASES the lock) MUST run whenever begin succeeded, even if an
+            // append later failed, or we would leak the EX lock and wedge every
+            // future cycle + any query/roll. So endCycle is gated on cycle_open,
+            // NOT on staging_failed.
+            var cycle_open = false;
+            stg.beginCycle() catch |err| {
+                std.debug.print("Warning: staging beginCycle failed: {}\n", .{err});
+                staging_failed = true;
+            };
+            if (!staging_failed) cycle_open = true;
+
+            if (!staging_failed) {
+                stg.appendMetrics(now, metrics) catch |err| {
+                    std.debug.print("Warning: metrics append failed: {}\n", .{err});
+                    staging_failed = true;
                 };
             }
-            if (!storage_failed and procs.len > 0) {
-                storage.insertProcesses(now, procs) catch |err| {
-                    std.debug.print("Warning: process insert failed: {}\n", .{err});
-                    storage_failed = true;
+            if (!staging_failed and procs.len > 0) {
+                stg.appendProcesses(now, procs) catch |err| {
+                    std.debug.print("Warning: process append failed: {}\n", .{err});
+                    staging_failed = true;
                 };
             }
-            if (!storage_failed and disks.len > 0) {
-                storage.insertDisks(now, disks) catch |err| {
-                    std.debug.print("Warning: disk insert failed: {}\n", .{err});
-                    storage_failed = true;
+            if (!staging_failed and disks.len > 0) {
+                stg.appendDisks(now, disks) catch |err| {
+                    std.debug.print("Warning: disk append failed: {}\n", .{err});
+                    staging_failed = true;
                 };
             }
-            if (!storage_failed and containers.len > 0) {
-                storage.insertContainers(now, containers) catch |err| {
-                    std.debug.print("Warning: container insert failed: {}\n", .{err});
-                    storage_failed = true;
+            if (!staging_failed and containers.len > 0) {
+                stg.appendContainers(now, containers) catch |err| {
+                    std.debug.print("Warning: container append failed: {}\n", .{err});
+                    staging_failed = true;
                 };
             }
-            if (!storage_failed and ct_metrics.len > 0) {
-                storage.insertContainerMetrics(now, ct_metrics) catch |err| {
-                    std.debug.print("Warning: container_metrics insert failed: {}\n", .{err});
-                    storage_failed = true;
+            if (!staging_failed and ct_metrics.len > 0) {
+                stg.appendContainerMetrics(now, ct_metrics) catch |err| {
+                    std.debug.print("Warning: container_metrics append failed: {}\n", .{err});
+                    staging_failed = true;
                 };
             }
 
-            // Drain available log entries. Push path is independent of storage
-            // health; only skip DB inserts when storage failed this cycle.
+            // Drain available log entries. The push path is independent of
+            // staging health; only skip the staging append when staging failed
+            // this cycle. Each entry is appended individually here (one record
+            // per log entry mirrors the old per-entry insertLog), but they all
+            // sit inside this one begin/end bracket and share one fdatasync.
             if (log_tailer) |*lt| {
                 var log_count: u32 = 0;
                 while (log_count < 1000) : (log_count += 1) {
                     const maybe_entry = lt.next() catch break;
                     if (maybe_entry == null) break;
                     const entry = maybe_entry.?;
-                    if (!storage_failed) {
-                        storage.insertLog(entry) catch |err| {
-                            std.debug.print("Warning: log insert failed: {}\n", .{err});
-                            storage_failed = true;
+                    if (!staging_failed) {
+                        // appendLogs takes a slice; pass this single entry.
+                        stg.appendLogs(&[_]logs_mod.LogEntry{entry}) catch |err| {
+                            std.debug.print("Warning: log append failed: {}\n", .{err});
+                            staging_failed = true;
                         };
                     }
                     push_logs.append(allocator, entry) catch |err| {
@@ -468,68 +560,56 @@ pub fn main() !void {
                 }
             }
 
-            // Run retention cleanup every hour
-            retention_counter += interval;
-            if (retention_counter >= 3600) {
-                const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
-                storage.runRetention(retention) catch |err| {
-                    std.debug.print("Warning: retention cleanup failed: {}\n", .{err});
+            // Close the cycle: fdatasync every touched segment THEN release the
+            // EX lock (endCycle does both, the unlock via defer even if the sync
+            // errors). Gated on cycle_open so the lock is ALWAYS released once
+            // begin took it - a mid-cycle append failure must not strand it.
+            if (cycle_open) {
+                stg.endCycle() catch |err| {
+                    std.debug.print("Warning: staging endCycle failed: {}\n", .{err});
                 };
-                retention_counter = 0;
             }
+        }
 
-            // Two-stage recovery when inserts consistently fail:
-            //   Stage 1 - reconnect: clears the connection. Handles transient
-            //             wedges and resets the counter on success. Sets
-            //             reconnect_attempted so we don't reconnect in a loop.
-            //   Stage 2 - quarantine: if reconnect already succeeded but inserts
-            //             still fail (DB too large for memory_limit), rename the
-            //             DB/WAL aside and open a fresh one. Also used immediately
-            //             when reconnect itself fails (handles already null).
-            // Reset reconnect_attempted whenever storage is healthy.
-            if (storage.consecutive_insert_failures == 0) {
-                reconnect_attempted = false;
-            } else if (storage.consecutive_insert_failures >= storage_mod.Storage.reconnect_failure_threshold) {
-                if (!reconnect_attempted) {
-                    std.log.warn(
-                        "DuckDB inserts failed {d} cycles in a row, reconnecting",
-                        .{storage.consecutive_insert_failures},
-                    );
-                    if (storage.refresh()) |_| {
-                        storage.consecutive_insert_failures = 0;
-                        reconnect_attempted = true;
-                        last_storage_refresh = now;
-                    } else |err| {
-                        // Reconnect failed (DB likely permanently wedged).
-                        // Go straight to quarantine rather than looping on
-                        // null handles.
-                        std.log.warn("DuckDB reconnect failed: {}, quarantining wedged DB", .{err});
-                        if (storage.quarantineAndReopen()) |_| {
-                            storage.consecutive_insert_failures = 0;
-                            reconnect_attempted = false;
-                            last_storage_refresh = now;
-                        } else |qerr| {
-                            std.log.err("DuckDB quarantine failed: {}, exiting for restart", .{qerr});
-                            running = false;
-                        }
-                    }
-                } else {
-                    // Reconnect succeeded but inserts are still failing:
-                    // the same DB is too large/wedged. Quarantine it.
-                    std.log.warn(
-                        "DuckDB still unwritable after reconnect ({d} failures), quarantining",
-                        .{storage.consecutive_insert_failures},
-                    );
-                    if (storage.quarantineAndReopen()) |_| {
-                        storage.consecutive_insert_failures = 0;
-                        reconnect_attempted = false;
-                        last_storage_refresh = now;
-                    } else |err| {
-                        std.log.err("DuckDB quarantine failed: {}, exiting for restart", .{err});
-                        running = false;
-                    }
-                }
+        // ── ROLL TRIGGER ──
+        // After committing the cycle, roll each table whose segment has grown
+        // past roll_max_bytes OR whose last roll was more than roll_interval_s
+        // ago (so low-volume tables - disks, containers - still roll and don't
+        // sit un-rolled indefinitely). rollTable resets the segment on success
+        // and is a no-op for an empty segment. Failures are per-table, logged,
+        // and non-fatal (the rows stay durably in staging for the next attempt).
+        for (staging_mod.Table.all) |table| {
+            const idx = @intFromEnum(table);
+            const size = stg.byteLen(table) catch 0;
+            const size_trigger = size > roll_max_bytes;
+            const time_trigger = (now - last_roll[idx]) >= @as(i64, @intCast(roll_interval_s));
+            if (!size_trigger and !time_trigger) continue;
+            if (roll_mod.rollTable(allocator, root, &stg, table)) |maybe_res| {
+                if (maybe_res) |res| allocator.free(res.parquet_path);
+                // Reset the time trigger even when there was nothing to roll, so
+                // an idle table doesn't re-evaluate the (cheap) trigger every cycle.
+                last_roll[idx] = now;
+            } else |err| {
+                std.debug.print("Warning: roll of {s} failed: {}\n", .{ table.name(), err });
             }
+        }
+
+        // ── RETENTION + COMPACTION (hourly) ──
+        // Retention drops whole stale date= partitions; compaction merges a
+        // partition's many small files into one so queries enumerate fewer
+        // files. Both are best-effort and non-fatal.
+        retention_counter += interval;
+        if (retention_counter >= 3600) {
+            const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
+            roll_mod.runRetention(allocator, root, retention) catch |err| {
+                std.debug.print("Warning: retention cleanup failed: {}\n", .{err});
+            };
+            for (staging_mod.Table.all) |table| {
+                _ = roll_mod.compact(allocator, root, table, default_compact_max_files) catch |err| {
+                    std.debug.print("Warning: compaction of {s} failed: {}\n", .{ table.name(), err });
+                };
+            }
+            retention_counter = 0;
         }
 
         const self_sample = proc_self_mod.sample(&self_state) catch |err| sblk: {
@@ -545,35 +625,6 @@ pub fn main() !void {
             };
         };
 
-        if (storage.consecutive_insert_failures == 0 and shouldRefreshStorage(
-            now,
-            last_storage_refresh,
-            storage_refresh_interval,
-            self_sample.rss_kb,
-            storage_refresh_rss_mb,
-        )) {
-            const elapsed = now - last_storage_refresh;
-            std.log.warn(
-                "DuckDB storage refresh triggered (elapsed={d}s, rss={d}KB)",
-                .{ elapsed, self_sample.rss_kb },
-            );
-            if (storage.refresh()) |_| {
-                storage.consecutive_insert_failures = 0;
-                reconnect_attempted = false;
-                last_storage_refresh = now;
-            } else |err| {
-                std.log.warn("DuckDB storage refresh failed: {}, quarantining wedged DB", .{err});
-                if (storage.quarantineAndReopen()) |_| {
-                    storage.consecutive_insert_failures = 0;
-                    reconnect_attempted = false;
-                    last_storage_refresh = now;
-                } else |qerr| {
-                    std.log.err("DuckDB quarantine after refresh failed: {}, exiting for restart", .{qerr});
-                    running = false;
-                }
-            }
-        }
-
         if (server_url) |url| {
             if (api_key) |key| {
                 const maybe_payload = push_mod.buildPayload(
@@ -586,8 +637,13 @@ pub fn main() !void {
                     push_logs.items,
                     rule_set,
                     self_sample,
-                    storage.consecutive_insert_failures,
-                    storage.dbSizeBytes(),
+                    // No resident DuckDB after the cutover: there are no
+                    // consecutive insert failures to report, and "db size" is now
+                    // the on-disk hot tier rather than a single DB file. Report 0
+                    // for both (push.zig signature is unchanged by request); a
+                    // hot-tier size metric is a follow-up slice.
+                    0,
+                    0,
                     runtime,
                     containers,
                     ct_metrics,
@@ -614,21 +670,6 @@ pub fn main() !void {
     }
 
     std.debug.print("sermon-agent shutting down\n", .{});
-}
-
-fn shouldRefreshStorage(now: i64, last_refresh: i64, interval_seconds: u64, rss_kb: u64, rss_threshold_mb: u32) bool {
-    const elapsed = now - last_refresh;
-    if (elapsed < storage_refresh_min_interval) return false;
-
-    if (interval_seconds > 0 and elapsed >= @as(i64, @intCast(interval_seconds))) {
-        return true;
-    }
-
-    if (rss_threshold_mb > 0 and rss_kb >= @as(u64, rss_threshold_mb) * 1024) {
-        return true;
-    }
-
-    return false;
 }
 
 fn readHostname(allocator: std.mem.Allocator) ![]const u8 {
