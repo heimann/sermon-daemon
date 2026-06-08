@@ -17,20 +17,30 @@
 //! is a TEMP table loaded from a Zig-decoded staging snapshot (the rows not yet
 //! rolled to parquet).
 //!
-//! NO DOUBLE-COUNT, NO MISS (ENFORCED BY AN ADVISORY LOCK):
-//!   A roll publishes a new parquet file via COPY and then truncates staging.
-//!   Ordering ALONE does not prevent a double-count: a query that enumerates the
-//!   parquet glob in the window AFTER the COPY but BEFORE the reset, then
-//!   snapshots a still-full staging, would count the rolled rows in BOTH the
-//!   parquet branch and the staging branch of the UNION ALL.
+//! NO DOUBLE-COUNT, NO MISS (ACROSS CRASHES AND LIVE INTERLEAVINGS):
+//!   The guarantee holds in two layers:
 //!
-//!   So the guarantee is enforced by a cross-process advisory lock on
-//!   `<root>/_staging/.roll.lock` (std.posix.flock):
-//!     - the roll holds LOCK_EX across COPY + fsync + staging reset, making
-//!       publish+reset atomic (see roll.rollTable);
-//!     - a query holds LOCK_SH across BOTH its parquet-glob enumeration AND its
-//!       staging snapshot (see initParquetQuery), so it can never observe the
-//!       published-but-not-yet-reset state.
+//!   1. ACROSS CRASHES (on-disk ordering): the roll writes the parquet to a TEMP
+//!      `<final>.tmp`, fsyncs it, THEN resets (truncates + fsyncs) staging, and
+//!      ONLY THEN renames the temp into its final `*.parquet` name. So a committed
+//!      parquet implies staging was ALREADY cleared - there is never a persisted
+//!      state with the same rows in both a committed parquet and staging. A crash
+//!      between reset and rename leaves staging empty + a durable orphan `.tmp`
+//!      (a transient, recoverable miss); roll.recoverOrphanTemps renames such
+//!      orphans on daemon startup. collectParquetFiles matches only `.parquet`,
+//!      never the in-flight `.parquet.tmp`.
+//!
+//!   2. LIVE INTERLEAVINGS (advisory lock): ordering alone does not stop a query
+//!      that, mid-roll, enumerates a just-renamed parquet AND snapshots a staging
+//!      not yet observed-as-reset from counting rows twice. A cross-process
+//!      advisory lock on `<root>/_staging/.roll.lock` (std.posix.flock) closes
+//!      that window:
+//!        - the roll holds LOCK_EX across its whole temp-write + fsync + reset +
+//!          rename critical section (see roll.rollTable);
+//!        - a query holds LOCK_SH across BOTH its parquet enumeration AND its
+//!          staging snapshot (see initParquetQuery), so it can never observe the
+//!          published-but-not-yet-reset state.
+//!
 //!   A row is therefore in exactly one branch: either staging (not yet rolled)
 //!   or parquet (rolled AND already cleared from staging), never both.
 //!
@@ -316,11 +326,12 @@ pub fn initParquetQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuer
     var pq = ParquetQuery{ .allocator = allocator, .db = db, .conn = conn };
 
     // Hold the roll lock SHARED across the WHOLE enumerate-parquet + snapshot-
-    // staging loop. The roll takes it EXCLUSIVE around its publish+reset, so
-    // while we hold it shared no roll can move rows from staging to parquet
-    // underneath us - we never observe the published-but-not-yet-reset window
-    // that would double-count. See the module-level comment. The enumerate-
-    // before-snapshot ordering below stays as defense in depth.
+    // staging loop. The roll takes it EXCLUSIVE around its whole temp-write +
+    // fsync + reset + rename critical section, so while we hold it shared no roll
+    // can move rows from staging to parquet underneath us - we never observe the
+    // published-but-not-yet-reset window that would double-count. See the module-
+    // level comment. The enumerate-before-snapshot ordering below stays as defense
+    // in depth.
     var lock_file = try staging.openRollLock(root_dir, allocator);
     defer lock_file.close();
     try std.posix.flock(lock_file.handle, std.posix.LOCK.SH);
@@ -370,6 +381,10 @@ fn collectParquetFiles(allocator: Allocator, root_dir: []const u8, table: Table)
     var walker = try dir.walk(allocator);
     defer walker.deinit();
     while (try walker.next()) |entry| {
+        // Match ONLY committed files ending in exactly `.parquet`; a roll's in-
+        // flight `<seq>.parquet.tmp` does NOT end in `.parquet`, so it is excluded
+        // here (it must never join the frozen file set - its rows are still in
+        // staging until the rename publishes it).
         if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".parquet")) {
             // entry.path is relative to dir_path; build the absolute path.
             const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
@@ -810,6 +825,47 @@ test "parquet_query: a parquet path containing a single quote is escaped, not br
     defer a.free(dest);
     try fs.renameAbsolute(res.parquet_path, dest);
 
+    var pq = try initParquetQuery(a, root);
+    defer pq.deinit();
+    var cnt = try pq.rawQuery("SELECT COUNT(*) AS n FROM metrics");
+    defer cnt.deinit();
+    try testing.expectEqualStrings("1", cnt.rows[0][0].?);
+}
+
+test "parquet_query: collectParquetFiles ignores a *.parquet.tmp in the tree" {
+    // Crash-consistency fix: an in-flight roll's `<seq>.parquet.tmp` must never
+    // join the frozen file set (its rows are still in staging until the rename
+    // publishes it). Place one real `.parquet` plus a sibling `.parquet.tmp`
+    // (a copy of the same file) and assert the view counts the committed file
+    // exactly once - never twice.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+    try stg.appendMetrics(1_700_000_000, sampleMetrics(7.0));
+    try stg.sync();
+    const res = (try roll.rollTable(a, root, &stg, .metrics)).?;
+    defer a.free(res.parquet_path);
+
+    // Drop a `.parquet.tmp` alongside the committed file (byte-for-byte copy).
+    const tmp_sibling = try std.fmt.allocPrint(a, "{s}.tmp", .{res.parquet_path});
+    defer a.free(tmp_sibling);
+    try fs.copyFileAbsolute(res.parquet_path, tmp_sibling, .{});
+
+    // collectParquetFiles must skip the .tmp: exactly one committed file is seen.
+    var files = try collectParquetFiles(a, root, .metrics);
+    defer {
+        for (files.items) |p| a.free(p);
+        files.deinit(a);
+    }
+    try testing.expectEqual(@as(usize, 1), files.items.len);
+    try testing.expect(std.mem.endsWith(u8, files.items[0], ".parquet"));
+
+    // And the view counts the single committed row, not the .tmp's copy too.
     var pq = try initParquetQuery(a, root);
     defer pq.deinit();
     var cnt = try pq.rawQuery("SELECT COUNT(*) AS n FROM metrics");
