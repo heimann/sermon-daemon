@@ -197,6 +197,56 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // ── Parquet hot tier (plan 25): staging + roll + query ──
+    // Self-contained modules that share the typed structs and link libduckdb
+    // like storage. Not yet wired into the daemon loop (deliberate follow-up).
+    const staging_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/staging.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    staging_mod.addImport("collector", collector_mod);
+    staging_mod.addImport("logs", logs_mod);
+    staging_mod.addImport("proxmox", proxmox_mod);
+
+    const roll_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/roll.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    roll_mod.addImport("collector", collector_mod);
+    roll_mod.addImport("logs", logs_mod);
+    roll_mod.addImport("proxmox", proxmox_mod);
+    roll_mod.addImport("staging", staging_mod);
+    roll_mod.addIncludePath(b.path("lib"));
+    roll_mod.addLibraryPath(b.path("lib"));
+    roll_mod.linkSystemLibrary("duckdb", .{});
+
+    const parquet_query_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/parquet_query.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    parquet_query_mod.addImport("collector", collector_mod);
+    parquet_query_mod.addImport("logs", logs_mod);
+    parquet_query_mod.addImport("proxmox", proxmox_mod);
+    parquet_query_mod.addImport("staging", staging_mod);
+    parquet_query_mod.addImport("roll", roll_mod);
+    parquet_query_mod.addIncludePath(b.path("lib"));
+    parquet_query_mod.addLibraryPath(b.path("lib"));
+    parquet_query_mod.linkSystemLibrary("duckdb", .{});
+
+    const staging_tests = b.addTest(.{ .root_module = staging_mod });
+
+    const roll_tests = b.addTest(.{ .root_module = roll_mod });
+    roll_tests.addRPath(b.path("lib"));
+
+    const parquet_query_tests = b.addTest(.{ .root_module = parquet_query_mod });
+    parquet_query_tests.addRPath(b.path("lib"));
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);
     test_step.dependOn(&b.addRunArtifact(collector_tests).step);
@@ -205,6 +255,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(push_tests).step);
     test_step.dependOn(&b.addRunArtifact(proc_self_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxmox_tests).step);
+    test_step.dependOn(&b.addRunArtifact(staging_tests).step);
+    test_step.dependOn(&b.addRunArtifact(roll_tests).step);
+    test_step.dependOn(&b.addRunArtifact(parquet_query_tests).step);
 
     // ── Bench (resource usage check) ──
     const bench = b.addSystemCommand(&.{ "bash", "bench.sh" });
