@@ -135,7 +135,7 @@ pub fn main() !void {
             break :blk parquet_query.initParquetQuery(allocator, root) catch continue;
         }
         std.debug.print("Error: could not open data directory (agent may be writing). Try again.\n", .{});
-        return;
+        return error.QueryInitFailed;
     };
     defer storage.deinit();
 

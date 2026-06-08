@@ -325,6 +325,15 @@ pub fn main() !void {
         if (replayed > 0) std.debug.print("startup replay: rolled {d} leftover staging segment(s)\n", .{replayed});
     }
 
+    // Obsolete-config visibility: the resident-DuckDB refresh knobs are parsed for
+    // back-compat but do nothing post-cutover. If an operator still has either set,
+    // warn once so they aren't misled into thinking it's taking effect.
+    if (config) |c| {
+        if (c.value.storage_refresh_interval != null or c.value.storage_refresh_rss_mb != null) {
+            std.log.warn("config: storage_refresh_interval / storage_refresh_rss_mb are obsolete post-cutover (no resident DuckDB to refresh) - ignored", .{});
+        }
+    }
+
     std.debug.print("sermon-agent started (root={s}, interval={d}s, max_processes={d}, roll_max_bytes={d}, roll_interval_s={d}s) [memory_limit_mb={d} retained for back-compat, unused]\n", .{ root, interval, max_processes, roll_max_bytes, roll_interval_s, memory_limit_mb });
     if (log_rules.len > 0) {
         std.debug.print("loaded {d} log rule(s)\n", .{log_rules.len});
@@ -667,6 +676,20 @@ pub fn main() !void {
             std.Thread.sleep(1 * std.time.ns_per_s);
             remaining -= 1;
         }
+    }
+
+    // Clean-shutdown flush: roll any staging segments still holding rows so they
+    // don't sit un-rolled across a restart. Durability does NOT depend on this -
+    // a crash is handled by the startup replay roll above - so it's best-effort
+    // (catch + log, non-fatal). It just bounds segment size and makes the
+    // shutdown intent (drain staging to parquet) explicit. Runs BEFORE deinit so
+    // the roll reuses the still-open staging fd.
+    {
+        const flushed = roll_mod.rollAll(allocator, root, &stg) catch |err| blk: {
+            std.debug.print("Warning: shutdown flush roll failed: {}\n", .{err});
+            break :blk 0;
+        };
+        if (flushed > 0) std.debug.print("shutdown flush: rolled {d} staging segment(s)\n", .{flushed});
     }
 
     std.debug.print("sermon-agent shutting down\n", .{});

@@ -159,12 +159,25 @@ pub fn rollAll(allocator: Allocator, root: []const u8, stg: *staging.Staging) !u
     return rolled;
 }
 
-/// Recover orphan `*.parquet.tmp` files left by a crash BETWEEN staging reset and
-/// the rename (step (b)->(c) in rollTable): the rows are already gone from
-/// staging, so the durable temp is the only copy and renaming it to its final
-/// `*.parquet` name republishes them. Scans every table's tree and renames each
-/// leftover temp; idempotent (a no-op when there are no temps) and safe to call
-/// at daemon startup.
+/// Recover the temp/marker files a crash can leave behind, per partition leaf,
+/// across every table's tree. Idempotent (a no-op when there are none) and safe
+/// to call at daemon startup. Three distinct suffixes are handled:
+///
+///   - `*.parquet.tmp` (ROLL temp): a crash BETWEEN a roll's staging reset and
+///     its rename leaves a durable temp whose rows are already gone from staging,
+///     so the temp is the only copy. REPUBLISH it: rename -> `*.parquet`.
+///
+///   - `*.parquet.building` (COMPACTION, PRE-commit): the merge had not reached
+///     its commit point, so the original inputs are intact and authoritative.
+///     DELETE the partial merge and keep the originals.
+///
+///   - `*.parquet.committed` (COMPACTION, POST-commit): the merge is
+///     authoritative. Every OTHER `*.parquet` file in that partition was a merge
+///     input (compaction merges the WHOLE leaf partition), and is fully captured
+///     in the merge - DELETE each, then rename `.committed` -> `.parquet`.
+///
+/// We collect the work into lists first (a single walk per table), then mutate,
+/// so we never rename/delete entries out from under the live walker.
 ///
 /// NOTE: the daemon startup path wires this in at cutover. It is intentionally
 /// NOT hooked into any live loop in this foundation PR - call it once, before the
@@ -180,20 +193,74 @@ pub fn recoverOrphanTemps(allocator: Allocator, root: []const u8) !void {
         };
         defer dir.close();
 
+        // Collect absolute paths into per-class lists in a single walk, so we
+        // never mutate the tree while the walker iterates it.
+        var roll_tmps = std.ArrayList([]u8){};
+        var buildings = std.ArrayList([]u8){};
+        var committeds = std.ArrayList([]u8){};
+        defer {
+            for (roll_tmps.items) |p| allocator.free(p);
+            for (buildings.items) |p| allocator.free(p);
+            for (committeds.items) |p| allocator.free(p);
+            roll_tmps.deinit(allocator);
+            buildings.deinit(allocator);
+            committeds.deinit(allocator);
+        }
+
         var walker = try dir.walk(allocator);
         defer walker.deinit();
         while (try walker.next()) |entry| {
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".parquet.tmp")) continue;
+            if (entry.kind != .file) continue;
+            // entry.path is relative to dir_path; build the absolute path.
+            const class: ?*std.ArrayList([]u8) =
+                if (std.mem.endsWith(u8, entry.basename, ".parquet.tmp")) &roll_tmps else if (std.mem.endsWith(u8, entry.basename, ".parquet.building")) &buildings else if (std.mem.endsWith(u8, entry.basename, ".parquet.committed")) &committeds else null;
+            const list = class orelse continue;
+            const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
+            errdefer allocator.free(abs);
+            try list.append(allocator, abs);
+        }
 
-            // entry.path is relative to dir_path; build absolute temp + final paths.
-            const tmp_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
-            defer allocator.free(tmp_abs);
-            // Strip the trailing ".tmp" (4 bytes) to get the final `*.parquet`.
+        // ROLL temps: republish (rename -> `.parquet`, stripping ".tmp").
+        for (roll_tmps.items) |tmp_abs| {
             const final_abs = tmp_abs[0 .. tmp_abs.len - ".tmp".len];
-
             try fs.renameAbsolute(tmp_abs, final_abs);
             try fsyncDirOf(final_abs);
         }
+
+        // PRE-commit compaction temps: drop the partial merge; originals stand.
+        for (buildings.items) |building_abs| {
+            try fs.deleteFileAbsolute(building_abs);
+            try fsyncDirOf(building_abs);
+        }
+
+        // POST-commit compaction markers: the merge wins. Delete every OTHER
+        // `*.parquet` in the same partition (the merge inputs), then publish.
+        for (committeds.items) |committed_abs| {
+            // Strip ".committed" to get the final `*.parquet` name this publishes.
+            const final_abs = committed_abs[0 .. committed_abs.len - ".committed".len];
+            const part_dir = std.fs.path.dirname(committed_abs) orelse continue;
+            try deleteOtherParquets(allocator, part_dir, final_abs);
+            try fs.renameAbsolute(committed_abs, final_abs);
+            try fsyncDirOf(final_abs);
+        }
+    }
+}
+
+/// Delete every committed `*.parquet` file directly in `part_dir` except
+/// `keep_final`. Used by recoverOrphanTemps to drop the merge inputs that a
+/// POST-commit compaction crash left behind alongside the `.committed` marker.
+/// Only matches the bare `.parquet` suffix, so any other in-flight `.tmp` /
+/// `.building` / `.committed` markers in the partition are left untouched.
+fn deleteOtherParquets(allocator: Allocator, part_dir: []const u8, keep_final: []const u8) !void {
+    var dir = try fs.openDirAbsolute(part_dir, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".parquet")) continue;
+        const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ part_dir, entry.name });
+        defer allocator.free(abs);
+        if (std.mem.eql(u8, abs, keep_final)) continue;
+        try fs.deleteFileAbsolute(abs);
     }
 }
 
@@ -279,12 +346,14 @@ fn dayStartUnix(date_str: []const u8) ?i64 {
 /// that the query must enumerate; merging them keeps enumeration cheap.
 ///
 /// For any leaf partition holding MORE than `max_files_per_partition` `.parquet`
-/// files, the files are read via read_parquet, COPYed to a `<merged>.tmp` in the
-/// same partition, fsynced, the originals unlinked, then the temp atomically
-/// renamed to its final name and the dir fsynced - the same crash-safe
-/// temp+rename discipline as the roll, under the SAME EX roll lock (so a query
-/// or roll never observes a half-merged set). Returns the count of partitions
-/// compacted. Best-effort overall; a per-partition failure is logged and skipped.
+/// files, the files are read via read_parquet and merged into one new file via a
+/// TWO-MARKER commit protocol (see compactPartition) under the SAME EX roll lock
+/// (so a query or roll never observes a half-merged set). The two markers make
+/// the on-disk state unambiguous after ANY crash, so startup recoverOrphanTemps
+/// can always decide whether the merge or the originals are authoritative -
+/// avoiding the double-count a plain temp+unlink-loop+rename would leave if a
+/// crash split the original-deletion. Returns the count of partitions compacted.
+/// Best-effort overall; a per-partition failure is logged and skipped.
 pub fn compact(allocator: Allocator, root: []const u8, table: Table, max_files_per_partition: usize) !usize {
     // Take the EX roll lock for the whole scan+merge: a query holds it SH around
     // its enumerate+snapshot, and the roll holds it EX; compaction mutates the
@@ -350,11 +419,26 @@ pub fn compact(allocator: Allocator, root: []const u8, table: Table, max_files_p
     return compacted;
 }
 
-/// Merge `files` (all in `partition_dir`) into one new parquet file via a
-/// crash-safe temp+rename. The merged file's name is derived from a hash of the
-/// sorted input basenames so a crash-replay re-derives the same name. Originals
-/// are unlinked only AFTER the merged temp is fsynced-durable; the rename
-/// publishes atomically.
+/// Merge `files` (ALL `.parquet` in `partition_dir` - compaction merges a whole
+/// leaf partition) into one new parquet file via a TWO-MARKER commit protocol.
+/// The merged file's name is derived from a hash of the sorted input basenames so
+/// a crash-replay re-derives the same name.
+///
+/// The plain "write tmp, fsync, unlink-loop originals, rename tmp->final" is
+/// NOT crash-safe with recoverOrphanTemps: a crash after the tmp fsync but mid
+/// (or before) the original-unlink would, at startup, see a durable tmp AND
+/// intact originals - and republishing the tmp while the originals survive is a
+/// persistent double-count. The two markers make the on-disk state unambiguous:
+///   1. Write the merged parquet to `<seq>.parquet.building`, fsync file + dir.
+///      `.building` is NOT matched by the committed `*.parquet` glob and is a
+///      DISTINCT suffix from the roll's `.parquet.tmp`.
+///   2. COMMIT POINT: atomically rename `.building` -> `.parquet.committed`,
+///      fsync dir. After this single rename the merge is authoritative.
+///   3. Delete the original input files.
+///   4. Rename `.committed` -> `.parquet`, fsync dir.
+/// recoverOrphanTemps reads these markers after a crash: a `.building` (PRE
+/// commit) is dropped and the originals kept; a `.committed` (POST commit) wins
+/// and the originals are deleted. See recoverOrphanTemps.
 fn compactPartition(allocator: Allocator, partition_dir: []const u8, files: []const []u8) !void {
     // Stable merged-file name: hash the concatenated sorted basenames so the
     // output is deterministic for a given input set (idempotent on replay).
@@ -374,18 +458,25 @@ fn compactPartition(allocator: Allocator, partition_dir: []const u8, files: []co
 
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ partition_dir, merged_name });
     defer allocator.free(final_path);
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{final_path});
-    defer allocator.free(tmp_path);
+    const building_path = try std.fmt.allocPrint(allocator, "{s}.building", .{final_path});
+    defer allocator.free(building_path);
+    const committed_path = try std.fmt.allocPrint(allocator, "{s}.committed", .{final_path});
+    defer allocator.free(committed_path);
 
-    // COPY the union of all input files (frozen, explicit list) to the temp.
-    try copyMergeToParquet(allocator, files, tmp_path);
+    // (1) COPY the union of all input files (frozen, explicit list) to the
+    // `.building` temp and make it durable (file + dir) BEFORE any commit, so a
+    // crash here leaves all originals intact and the query set unchanged.
+    try copyMergeToParquet(allocator, files, building_path);
+    try fsyncFileAndDir(building_path);
 
-    // Make the merged temp durable BEFORE removing any original (so a crash here
-    // leaves all originals intact and the query set unchanged).
-    try fsyncFileAndDir(tmp_path);
+    // (2) COMMIT POINT: atomically rename `.building` -> `.committed` and fsync
+    // the dir. After this the merge is authoritative; a crash now is recovered by
+    // deleting the originals and publishing the `.committed`.
+    try fs.renameAbsolute(building_path, committed_path);
+    try fsyncDirOf(committed_path);
 
-    // Remove the originals (skip the temp itself and any pre-existing merged file
-    // sharing the final name - it will be overwritten by the rename anyway).
+    // (3) Delete the originals (skip the committed file itself, e.g. if a prior
+    // merge already shares the final name). They are fully captured in the merge.
     for (files) |f| {
         if (std.mem.eql(u8, f, final_path)) continue;
         fs.deleteFileAbsolute(f) catch |err| {
@@ -393,8 +484,8 @@ fn compactPartition(allocator: Allocator, partition_dir: []const u8, files: []co
         };
     }
 
-    // Publish atomically and fsync the directory entry.
-    try fs.renameAbsolute(tmp_path, final_path);
+    // (4) Publish: rename `.committed` -> `.parquet` and fsync the directory.
+    try fs.renameAbsolute(committed_path, final_path);
     try fsyncDirOf(final_path);
 }
 
@@ -1475,6 +1566,167 @@ test "roll: compact merges many small files in a partition into one, same row co
 
     // Idempotent: a second compaction with the now-single file is a no-op.
     try testing.expectEqual(@as(usize, 0), try compact(a, root, .metrics, 2));
+}
+
+/// Roll `n` distinct one-row metrics segments at `ts`, returning the leaf
+/// partition dir (caller owns) that holds them. Distinct row counts make each
+/// segment's bytes (and thus its seq name) differ.
+fn rollNDistinctFiles(a: Allocator, root: []const u8, stg: *staging.Staging, ts: i64, n: usize) ![]u8 {
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        var j: usize = 0;
+        while (j <= k) : (j += 1) try stg.appendMetrics(ts, sampleMetrics());
+        try stg.sync();
+        const r = (try rollTable(a, root, stg, .metrics)).?;
+        defer a.free(r.parquet_path);
+    }
+    // Derive the leaf partition dir from any produced parquet path's dirname.
+    return leafPartitionDir(a, root);
+}
+
+/// The single date=/hour= leaf dir under <root>/metrics that holds parquet files
+/// (the tests above all roll at one timestamp, so there is exactly one).
+fn leafPartitionDir(a: Allocator, root: []const u8) ![]u8 {
+    const table_dir = try std.fmt.allocPrint(a, "{s}/metrics", .{root});
+    defer a.free(table_dir);
+    var dir = try fs.openDirAbsolute(table_dir, .{ .iterate = true });
+    defer dir.close();
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next()) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.basename, ".parquet")) {
+            const abs = try std.fmt.allocPrint(a, "{s}/{s}", .{ table_dir, e.path });
+            defer a.free(abs);
+            return a.dupe(u8, std.fs.path.dirname(abs).?);
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "roll: recoverOrphanTemps drops a PRE-commit .building, keeps originals" {
+    // Simulates a crash AFTER the merged `.building` fsync but BEFORE the commit
+    // rename: the originals are intact + authoritative, so recovery must DELETE
+    // the partial `.building` and leave the originals (row count unchanged).
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    const part_dir = try rollNDistinctFiles(a, root, &stg, 1_700_000_000, 3);
+    defer a.free(part_dir);
+
+    const glob = try partGlob(a, root);
+    defer a.free(glob);
+
+    const files_before = try countParquetFilesInTree(a, root, .metrics);
+    const rows_before = try parquetCount(a, glob);
+
+    // Plant a partial `.building` (a copy of an original under a .building name).
+    const building = try std.fmt.allocPrint(a, "{s}/c0000000000000000.parquet.building", .{part_dir});
+    defer a.free(building);
+    try plantParquetCopy(a, root, building);
+
+    try recoverOrphanTemps(a, root);
+
+    // The `.building` is gone; the originals (and their row count) are untouched.
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(building, .{}));
+    try testing.expectEqual(files_before, try countParquetFilesInTree(a, root, .metrics));
+    try testing.expectEqual(rows_before, try parquetCount(a, glob));
+}
+
+test "roll: recoverOrphanTemps publishes a POST-commit .committed, deletes originals, no double-count" {
+    // Simulates a crash AFTER the commit rename but BEFORE the originals were
+    // deleted: a `.committed` (holding the full merge) sits alongside the
+    // originals. Recovery must DELETE the originals, rename `.committed` ->
+    // `.parquet`, and the partition must read each row EXACTLY once.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    const part_dir = try rollNDistinctFiles(a, root, &stg, 1_700_000_000, 3);
+    defer a.free(part_dir);
+
+    const glob = try partGlob(a, root);
+    defer a.free(glob);
+
+    // Total rows across the originals (this is what the merge captures).
+    const total_rows = try parquetCount(a, glob);
+
+    // Build a real `.committed` by merging the originals into it via the same
+    // COPY path compaction uses (so it genuinely holds every original row).
+    const originals = try collectPartParquets(a, part_dir);
+    defer {
+        for (originals) |p| a.free(p);
+        a.free(originals);
+    }
+    const committed = try std.fmt.allocPrint(a, "{s}/c0000000000000000.parquet.committed", .{part_dir});
+    defer a.free(committed);
+    try copyMergeToParquet(a, originals, committed);
+
+    try recoverOrphanTemps(a, root);
+
+    // The `.committed` became the sole `.parquet`; the originals are gone.
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(committed, .{}));
+    try testing.expectEqual(@as(usize, 1), try countParquetFilesInTree(a, root, .metrics));
+    // The partition reads back the SAME total - each original row exactly once,
+    // neither doubled (originals + merge) nor lost.
+    try testing.expectEqual(total_rows, try parquetCount(a, glob));
+}
+
+/// '<root>/metrics/**/*.parquet' glob for read_parquet over the whole table.
+/// Caller owns the returned buffer.
+fn partGlob(a: Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}/metrics/**/*.parquet", .{root});
+}
+
+/// Copy the first original `.parquet` in the tree to `dest` (used to fabricate a
+/// stray `.building`). Reads bytes directly - we only need a file that EXISTS.
+fn plantParquetCopy(a: Allocator, root: []const u8, dest: []const u8) !void {
+    const part_dir = try leafPartitionDir(a, root);
+    defer a.free(part_dir);
+    const originals = try collectPartParquets(a, part_dir);
+    defer {
+        for (originals) |p| a.free(p);
+        a.free(originals);
+    }
+    try testing.expect(originals.len > 0);
+    const src = try fs.openFileAbsolute(originals[0], .{});
+    defer src.close();
+    const dst = try fs.createFileAbsolute(dest, .{});
+    defer dst.close();
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const nread = try src.read(&buf);
+        if (nread == 0) break;
+        try dst.writeAll(buf[0..nread]);
+    }
+}
+
+/// Absolute paths of every `*.parquet` (bare suffix) directly in `part_dir`.
+fn collectPartParquets(a: Allocator, part_dir: []const u8) ![][]u8 {
+    var dir = try fs.openDirAbsolute(part_dir, .{ .iterate = true });
+    defer dir.close();
+    var out = std.ArrayList([]u8){};
+    errdefer {
+        for (out.items) |p| a.free(p);
+        out.deinit(a);
+    }
+    var it = dir.iterate();
+    while (try it.next()) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.name, ".parquet")) {
+            try out.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ part_dir, e.name }));
+        }
+    }
+    return out.toOwnedSlice(a);
 }
 
 fn countParquetFilesInTree(allocator: Allocator, root: []const u8, table: Table) !usize {
