@@ -34,6 +34,7 @@ pub const ProcessInfo = collector.ProcessInfo;
 pub const DiskInfo = collector.DiskInfo;
 pub const LogEntry = logs.LogEntry;
 pub const ContainerEntry = proxmox.ContainerEntry;
+pub const ContainerMetrics = proxmox.ContainerMetrics;
 
 pub const StagingError = error{
     CorruptSegment,
@@ -44,7 +45,7 @@ pub const StagingError = error{
 /// as the first byte of a fresh segment and verified on open/replay.
 pub const schema_version: u8 = 1;
 
-/// The five tables the hot tier carries. The names match today's DuckDB table
+/// The six tables the hot tier carries. The names match today's DuckDB table
 /// names exactly so the query path can present compatibility views.
 pub const Table = enum {
     metrics,
@@ -52,12 +53,13 @@ pub const Table = enum {
     disks,
     containers,
     logs,
+    container_metrics,
 
     pub fn name(self: Table) []const u8 {
         return @tagName(self);
     }
 
-    pub const all = [_]Table{ .metrics, .processes, .disks, .containers, .logs };
+    pub const all = [_]Table{ .metrics, .processes, .disks, .containers, .logs, .container_metrics };
 };
 
 // File mode matches the DuckDB on-disk DB (0600): an unprivileged user on the
@@ -135,6 +137,15 @@ fn putOptU32(buf: *std.ArrayList(u8), allocator: Allocator, v: ?u32) !void {
     }
 }
 
+fn putOptU64(buf: *std.ArrayList(u8), allocator: Allocator, v: ?u64) !void {
+    if (v) |val| {
+        try buf.append(allocator, 1);
+        try putU64(buf, allocator, val);
+    } else {
+        try buf.append(allocator, 0);
+    }
+}
+
 /// Cursor over a payload buffer that decodes the same encoding `put*` writes.
 /// Every read is bounds-checked; a truncated payload yields CorruptSegment so
 /// the caller can treat it as a torn record.
@@ -187,6 +198,12 @@ const Cursor = struct {
         if (present == 0) return null;
         return try self.u32_();
     }
+
+    fn optU64(self: *Cursor) !?u64 {
+        const present = (try self.need(1))[0];
+        if (present == 0) return null;
+        return try self.u64_();
+    }
 };
 
 // ============================================================================
@@ -208,6 +225,7 @@ pub const DecodedCycle = union(Table) {
     disks: TimedSlice(DiskInfo),
     containers: TimedSlice(ContainerEntry),
     logs: []LogEntry,
+    container_metrics: TimedSlice(ContainerMetrics),
 };
 
 /// A per-cycle slice of rows sharing a single cycle timestamp (mirrors how
@@ -387,6 +405,18 @@ pub const Staging = struct {
         try self.writeRecord(.logs, buf.items);
     }
 
+    /// Per-container CPU/memory samples for one cycle. Mirrors
+    /// storage.insertContainerMetrics: all samples share the cycle timestamp.
+    pub fn appendContainerMetrics(self: *Staging, timestamp: i64, samples: []const ContainerMetrics) !void {
+        self.scratch.clearRetainingCapacity();
+        const a = self.allocator;
+        const buf = &self.scratch;
+        try putI64(buf, a, timestamp);
+        try putU32(buf, a, @intCast(samples.len));
+        for (samples) |sample| try encodeContainerMetric(buf, a, sample);
+        try self.writeRecord(.container_metrics, buf.items);
+    }
+
     /// One `fdatasync` per table segment - call once after a cycle's appends.
     /// Crash before this returns may lose the just-appended (uncommitted)
     /// records; everything synced previously survives.
@@ -461,6 +491,16 @@ fn encodeContainer(buf: *std.ArrayList(u8), a: Allocator, e: ContainerEntry) !vo
     try putU64(buf, a, e.maxmem);
     try putF64(buf, a, e.maxcpu);
     try putU64(buf, a, e.uptime);
+}
+
+/// cpu_pct is encoded by its raw IEEE-754 bits (NaN sentinel included): the bit
+/// pattern round-trips losslessly, so the roll can re-test isNan and persist
+/// NULL just like storage.insertContainerMetrics. mem_max is optional.
+fn encodeContainerMetric(buf: *std.ArrayList(u8), a: Allocator, m: ContainerMetrics) !void {
+    try putU32(buf, a, m.vmid);
+    try putF64(buf, a, m.cpu_pct);
+    try putU64(buf, a, m.mem_current);
+    try putOptU64(buf, a, m.mem_max);
 }
 
 fn encodeLog(buf: *std.ArrayList(u8), a: Allocator, e: LogEntry) !void {
@@ -562,6 +602,15 @@ fn decodeContainer(cur: *Cursor, a: Allocator) !ContainerEntry {
     };
 }
 
+fn decodeContainerMetric(cur: *Cursor) !ContainerMetrics {
+    return ContainerMetrics{
+        .vmid = try cur.u32_(),
+        .cpu_pct = try cur.f64_(),
+        .mem_current = try cur.u64_(),
+        .mem_max = try cur.optU64(),
+    };
+}
+
 fn decodeLog(cur: *Cursor, a: Allocator) !LogEntry {
     const timestamp = try cur.i64_();
     const source = try cur.str(a);
@@ -621,6 +670,9 @@ pub const Snapshot = struct {
                     for (rows) |*e| e.deinit(a);
                     a.free(rows);
                 },
+                // ContainerMetrics is all scalars/optionals - no owned heap, so
+                // only the row slice itself is freed.
+                .container_metrics => |ts| a.free(ts.rows),
             }
         }
         a.free(self.cycles);
@@ -637,6 +689,7 @@ pub const Snapshot = struct {
                 .disks => |ts| ts.rows.len,
                 .containers => |ts| ts.rows.len,
                 .logs => |rows| rows.len,
+                .container_metrics => |ts| ts.rows.len,
             };
         }
         return total;
@@ -741,6 +794,8 @@ fn minRowSize(table: Table) usize {
         // ts i64, source len, unit/identifier/systemd_unit opt flag x3, priority u8,
         // message len, pid opt flag
         .logs => 8 + 4 + 1 + 1 + 1 + 1 + 4 + 1,
+        // vmid u32, cpu_pct f64, mem_current u64, mem_max opt flag
+        .container_metrics => 4 + 8 + 8 + 1,
     };
 }
 
@@ -820,6 +875,17 @@ fn decodeCycle(allocator: Allocator, table: Table, payload: []const u8) !Decoded
                 filled += 1;
             }
             return .{ .logs = rows };
+        },
+        .container_metrics => {
+            const ts = try cur.i64_();
+            const n = try cur.u32_();
+            try checkRowCount(&cur, table, n);
+            const rows = try allocator.alloc(ContainerMetrics, n);
+            errdefer allocator.free(rows);
+            // ContainerMetrics owns no heap, so a partial-decode error just frees
+            // the slice (errdefer above); no per-row cleanup needed.
+            for (rows) |*row| row.* = try decodeContainerMetric(&cur);
+            return .{ .container_metrics = .{ .timestamp = ts, .rows = rows } };
         },
     }
 }
@@ -1174,6 +1240,39 @@ test "staging: logs round-trip with optional fields" {
     try testing.expect(rows[1].unit == null);
     try testing.expect(rows[1].pid == null);
     try testing.expectEqualStrings("error: disk full", rows[1].message);
+}
+
+test "staging: container_metrics round-trip with NaN cpu and null mem_max" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var staging = try Staging.open(a, root);
+    defer staging.deinit();
+
+    const samples = [_]ContainerMetrics{
+        .{ .vmid = 101, .cpu_pct = 12.5, .mem_current = 500_000_000, .mem_max = 2_000_000_000 },
+        // NaN cpu (first cycle for this CT) + null mem_max (unprivileged CT).
+        .{ .vmid = 102, .cpu_pct = std.math.nan(f64), .mem_current = 100_000_000, .mem_max = null },
+    };
+    try staging.appendContainerMetrics(6000, &samples);
+    try staging.sync();
+
+    var snap = try StagingReader.read(a, root, .container_metrics);
+    defer snap.deinit();
+
+    try testing.expectEqual(@as(usize, 1), snap.cycles.len);
+    const ts = snap.cycles[0].container_metrics;
+    try testing.expectEqual(@as(i64, 6000), ts.timestamp);
+    try testing.expectEqual(@as(usize, 2), ts.rows.len);
+    try testing.expectEqual(@as(u32, 101), ts.rows[0].vmid);
+    try testing.expectApproxEqAbs(@as(f64, 12.5), ts.rows[0].cpu_pct, 0.001);
+    try testing.expectEqual(@as(u64, 2_000_000_000), ts.rows[0].mem_max.?);
+    // NaN bit pattern round-trips so the roll can still detect the sentinel.
+    try testing.expect(std.math.isNan(ts.rows[1].cpu_pct));
+    try testing.expect(ts.rows[1].mem_max == null);
 }
 
 test "staging: torn/corrupted tail record is skipped, survivors returned" {

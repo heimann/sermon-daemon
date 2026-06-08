@@ -440,6 +440,7 @@ fn columnList(table: Table) []const u8 {
         .disks => "timestamp, mount_point, filesystem, total_bytes, used_bytes, percent",
         .containers => "timestamp, vmid, name, node, type, status, maxmem, maxcpu, uptime",
         .logs => "timestamp, source, unit, identifier, systemd_unit, priority, message, pid",
+        .container_metrics => "timestamp, vmid, cpu_pct, mem_current, mem_max",
     };
 }
 
@@ -452,6 +453,7 @@ fn stagingTempDdl(allocator: Allocator, table: Table) ![:0]u8 {
         .disks => "timestamp TIMESTAMP, mount_point VARCHAR, filesystem VARCHAR, total_bytes BIGINT, used_bytes BIGINT, percent REAL",
         .containers => "timestamp TIMESTAMP, vmid INTEGER, name VARCHAR, node VARCHAR, type VARCHAR, status VARCHAR, maxmem BIGINT, maxcpu DOUBLE, uptime BIGINT",
         .logs => "timestamp TIMESTAMP, source VARCHAR, unit VARCHAR, identifier VARCHAR, systemd_unit VARCHAR, priority INTEGER, message TEXT, pid INTEGER",
+        .container_metrics => "timestamp TIMESTAMP, vmid INTEGER, cpu_pct DOUBLE, mem_current BIGINT, mem_max BIGINT",
     };
     return std.fmt.allocPrintSentinel(allocator, "CREATE TEMP TABLE {s}_staging ({s})", .{ table.name(), cols }, 0);
 }
@@ -871,6 +873,47 @@ test "parquet_query: collectParquetFiles ignores a *.parquet.tmp in the tree" {
     var cnt = try pq.rawQuery("SELECT COUNT(*) AS n FROM metrics");
     defer cnt.deinit();
     try testing.expectEqualStrings("1", cnt.rows[0][0].?);
+}
+
+test "parquet_query: container_metrics union of rolled parquet + staging" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+
+    // Roll one batch of CT metrics to parquet.
+    const rolled = [_]proxmox.ContainerMetrics{
+        .{ .vmid = 101, .cpu_pct = 10.0, .mem_current = 1_000_000, .mem_max = 4_000_000 },
+        .{ .vmid = 102, .cpu_pct = 20.0, .mem_current = 2_000_000, .mem_max = null },
+    };
+    try stg.appendContainerMetrics(1_700_000_000, &rolled);
+    try stg.sync();
+    const res = (try roll.rollTable(a, root, &stg, .container_metrics)).?;
+    a.free(res.parquet_path);
+
+    // Leave a second batch (including a NaN sentinel row) only in staging.
+    const staged = [_]proxmox.ContainerMetrics{
+        .{ .vmid = 103, .cpu_pct = std.math.nan(f64), .mem_current = 3_000_000, .mem_max = null },
+    };
+    try stg.appendContainerMetrics(1_700_001_000, &staged);
+    try stg.sync();
+
+    var pq = try initParquetQuery(a, root);
+    defer pq.deinit();
+
+    // 2 (parquet) + 1 (staging) = 3 rows, no dup/miss across the UNION.
+    var cnt = try pq.rawQuery("SELECT COUNT(*) AS n FROM container_metrics");
+    defer cnt.deinit();
+    try testing.expectEqualStrings("3", cnt.rows[0][0].?);
+
+    // The NaN cpu_pct staging row reads back as SQL NULL through the view.
+    var nulls = try pq.rawQuery("SELECT COUNT(*) AS n FROM container_metrics WHERE cpu_pct IS NULL");
+    defer nulls.deinit();
+    try testing.expectEqualStrings("1", nulls.rows[0][0].?);
 }
 
 test "parquet_query: typed getters over union (processes + logs)" {
