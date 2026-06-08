@@ -24,11 +24,11 @@ const default_rules_filename = "log_rules.json";
 // - disks, containers - still roll and don't sit un-rolled forever). Both are
 // config-overridable (roll_max_bytes / roll_interval_s).
 const default_roll_max_bytes: u64 = 8 * 1024 * 1024; // 8 MiB
-const default_roll_interval_s: u64 = 300; // 5 minutes
-// Compaction: a leaf partition with more than this many parquet files is merged
-// to one (keeps the query path's enumerated file list small). Runs on the same
-// hourly cadence as retention.
-const default_compact_max_files: usize = 16;
+// 1 hour: low-volume tables roll hourly instead of every 5 min, keeping the
+// steady-state file count modest (~1-1.5k files over the 7-day retention window)
+// now that compaction is a deferred follow-up. The 8 MiB size trigger still
+// rolls busy tables sooner.
+const default_roll_interval_s: u64 = 3600; // 1 hour
 // Processes stored per cycle when config.max_processes is unset. Snapshotting
 // every process is the dominant source of DB growth (millions of rows/week);
 // keeping the top-N by CPU and memory cuts that ~5-15x. Set max_processes to 0
@@ -603,21 +603,16 @@ pub fn main() !void {
             }
         }
 
-        // ── RETENTION + COMPACTION (hourly) ──
-        // Retention drops whole stale date= partitions; compaction merges a
-        // partition's many small files into one so queries enumerate fewer
-        // files. Both are best-effort and non-fatal.
+        // ── RETENTION (hourly) ──
+        // Retention drops whole stale date= partitions (best-effort, non-fatal).
+        // Compaction is a DEFERRED follow-up: queries tolerate the file count at
+        // the current roll cadence, and retention bounds the tree.
         retention_counter += interval;
         if (retention_counter >= 3600) {
             const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
             roll_mod.runRetention(allocator, root, retention) catch |err| {
                 std.debug.print("Warning: retention cleanup failed: {}\n", .{err});
             };
-            for (staging_mod.Table.all) |table| {
-                _ = roll_mod.compact(allocator, root, table, default_compact_max_files) catch |err| {
-                    std.debug.print("Warning: compaction of {s} failed: {}\n", .{ table.name(), err });
-                };
-            }
             retention_counter = 0;
         }
 
