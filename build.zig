@@ -92,6 +92,23 @@ pub fn build(b: *std.Build) void {
     storage_mod.addLibraryPath(b.path("lib"));
     storage_mod.linkSystemLibrary("duckdb", .{});
 
+    // On-demand parquet query module. Declared here (alongside staging/roll)
+    // because the CLI read path now imports it; the test target below reuses it.
+    const parquet_query_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/parquet_query.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    parquet_query_mod.addImport("collector", collector_mod);
+    parquet_query_mod.addImport("logs", logs_mod);
+    parquet_query_mod.addImport("proxmox", proxmox_mod);
+    parquet_query_mod.addImport("staging", staging_mod);
+    parquet_query_mod.addImport("roll", roll_mod);
+    parquet_query_mod.addIncludePath(b.path("lib"));
+    parquet_query_mod.addLibraryPath(b.path("lib"));
+    parquet_query_mod.linkSystemLibrary("duckdb", .{});
+
     // ── sermon-agent (daemon) ──
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/main.zig"),
@@ -126,9 +143,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // The CLI read path goes through the parquet hot tier (plan 25 cutover), so
+    // it imports parquet_query and its transitive deps (staging, roll, proxmox)
+    // and links duckdb, mirroring the agent module. It no longer needs storage.
     cli_mod.addImport("collector", collector_mod);
     cli_mod.addImport("logs", logs_mod);
-    cli_mod.addImport("storage", storage_mod);
+    cli_mod.addImport("proxmox", proxmox_mod);
+    cli_mod.addImport("staging", staging_mod);
+    cli_mod.addImport("roll", roll_mod);
+    cli_mod.addImport("parquet_query", parquet_query_mod);
     cli_mod.addIncludePath(b.path("lib"));
     cli_mod.addLibraryPath(b.path("lib"));
     cli_mod.linkSystemLibrary("duckdb", .{});
@@ -226,24 +249,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // ── Parquet hot tier (plan 25): query module + test targets ──
-    // staging_mod and roll_mod are declared up top (shared with the daemon). The
-    // on-demand query module is query-path-only, so it lives here.
-    const parquet_query_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent/parquet_query.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    parquet_query_mod.addImport("collector", collector_mod);
-    parquet_query_mod.addImport("logs", logs_mod);
-    parquet_query_mod.addImport("proxmox", proxmox_mod);
-    parquet_query_mod.addImport("staging", staging_mod);
-    parquet_query_mod.addImport("roll", roll_mod);
-    parquet_query_mod.addIncludePath(b.path("lib"));
-    parquet_query_mod.addLibraryPath(b.path("lib"));
-    parquet_query_mod.linkSystemLibrary("duckdb", .{});
-
+    // ── Parquet hot tier (plan 25): test targets ──
+    // staging_mod, roll_mod, and parquet_query_mod are declared up top (shared
+    // with the daemon and CLI). Their test targets live here.
     const staging_tests = b.addTest(.{ .root_module = staging_mod });
 
     const roll_tests = b.addTest(.{ .root_module = roll_mod });
