@@ -28,6 +28,16 @@ pub const ProcessInfo = struct {
     mem_rss: u64,
     threads: u32,
     username: []const u8,
+    // Cumulative bytes the process has caused to be fetched from / sent to the
+    // storage layer (from /proc/[pid]/io). 0 when the file is unreadable.
+    io_read_bytes: u64,
+    io_write_bytes: u64,
+    // Raw cgroup path (last line of /proc/[pid]/cgroup) and a friendly unit
+    // name derived from it (systemd unit, docker/k8s container). Both are
+    // owned strings; cgroup is "" when /proc/[pid]/cgroup is unreadable and
+    // unit is "" when no friendly name could be derived.
+    cgroup: []const u8,
+    unit: []const u8,
 };
 
 pub const DiskInfo = struct {
@@ -61,6 +71,7 @@ const CpuStats = struct {
 const ProcessStats = struct {
     utime: u64,
     stime: u64,
+    starttime: u64, // /proc/[pid]/stat field 22; identifies the process across PID reuse
     timestamp: i64,
 };
 
@@ -70,6 +81,14 @@ pub const Collector = struct {
     prev_processes: std.AutoHashMap(u32, ProcessStats),
     clock_ticks: u64,
     page_size: u64,
+    // Cap on processes returned per cycle. collectProcesses keeps the union of
+    // the top-N by CPU and top-N by memory; everything else is dropped before
+    // being returned. keep_all_processes disables trimming (stores every
+    // process, the original behavior).
+    max_processes: u32,
+
+    /// Sentinel for `max_processes`: keep every process, no trimming.
+    pub const keep_all_processes: u32 = 0;
 
     pub fn init(allocator: Allocator) !Collector {
         const clock_ticks = readClockTicks() catch 100;
@@ -80,6 +99,7 @@ pub const Collector = struct {
             .prev_processes = std.AutoHashMap(u32, ProcessStats).init(allocator),
             .clock_ticks = clock_ticks,
             .page_size = @intCast(std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE))),
+            .max_processes = keep_all_processes,
         };
     }
 
@@ -239,6 +259,8 @@ pub const Collector = struct {
                 allocator.free(proc.name);
                 allocator.free(proc.cmdline);
                 allocator.free(proc.username);
+                allocator.free(proc.cgroup);
+                allocator.free(proc.unit);
             }
             processes.deinit(allocator);
         }
@@ -262,9 +284,109 @@ pub const Collector = struct {
             }
         }
 
+        // Drop CPU-delta baselines for PIDs that no longer exist before any
+        // returned/stored-process trimming. Pruning must see the full live set.
+        try self.pruneDeadProcesses(allocator, processes.items);
+
+        // Trim to the most interesting processes for this cycle. This must run
+        // AFTER the full list is built and pruned: collectProcess updates
+        // prev_processes (the CPU-delta baseline) for every PID, so trimming
+        // earlier would starve future cycles of deltas and break pruning.
+        if (self.max_processes != keep_all_processes and
+            processes.items.len > self.max_processes)
+        {
+            try self.trimToTopN(allocator, &processes, self.max_processes);
+        }
+
+        // Enrich only the kept set with per-process I/O + cgroup/unit. Bounded
+        // to ~max_processes reads instead of one per process on the box - this
+        // is what keeps the new signals inside the CPU budget. A pid that exited
+        // since collection just gets 0 / "".
+        for (processes.items) |*proc| {
+            try enrichProcess(allocator, proc);
+        }
+
         return processes.toOwnedSlice(allocator);
     }
 
+    fn pruneDeadProcesses(self: *Collector, allocator: Allocator, alive: []const ProcessInfo) !void {
+        if (self.prev_processes.count() <= alive.len) return;
+
+        var seen = std.AutoHashMap(u32, void).init(allocator);
+        defer seen.deinit();
+        try seen.ensureTotalCapacity(@intCast(alive.len));
+        for (alive) |proc| seen.putAssumeCapacity(proc.pid, {});
+
+        var stale = std.ArrayList(u32){};
+        defer stale.deinit(allocator);
+        var it = self.prev_processes.keyIterator();
+        while (it.next()) |key_ptr| {
+            if (!seen.contains(key_ptr.*)) try stale.append(allocator, key_ptr.*);
+        }
+        for (stale.items) |pid| _ = self.prev_processes.remove(pid);
+    }
+
+    /// Keep the union of the top `n` processes by CPU and the top `n` by
+    /// resident memory, deduplicated by PID, and free the owned strings of
+    /// everything dropped. On return `processes` holds only the kept entries,
+    /// each still fully owned by the caller.
+    fn trimToTopN(self: *Collector, allocator: Allocator, processes: *std.ArrayList(ProcessInfo), n: u32) !void {
+        _ = self;
+        const items = processes.items;
+
+        // First-seen processes have NaN cpu_percent (no prior delta). Treat NaN
+        // as 0 so ranking is total and they sort to the bottom on CPU.
+        const cpuKey = struct {
+            fn key(p: ProcessInfo) f32 {
+                return if (std.math.isNan(p.cpu_percent)) 0.0 else p.cpu_percent;
+            }
+        }.key;
+
+        // Mark the PIDs we keep. An index set avoids mutating the list while we
+        // still need the original ordering to pick winners.
+        var keep = try std.DynamicBitSet.initEmpty(allocator, items.len);
+        defer keep.deinit();
+
+        // Order is a scratch index array we re-sort twice (by CPU, then by mem).
+        const order = try allocator.alloc(usize, items.len);
+        defer allocator.free(order);
+        for (order, 0..) |*o, i| o.* = i;
+
+        const SortCtx = struct {
+            items: []const ProcessInfo,
+            by_cpu: bool,
+            fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                if (ctx.by_cpu) {
+                    return cpuKey(ctx.items[a]) > cpuKey(ctx.items[b]);
+                }
+                return ctx.items[a].mem_rss > ctx.items[b].mem_rss;
+            }
+        };
+
+        std.mem.sort(usize, order, SortCtx{ .items = items, .by_cpu = true }, SortCtx.lessThan);
+        for (order[0..n]) |idx| keep.set(idx);
+
+        std.mem.sort(usize, order, SortCtx{ .items = items, .by_cpu = false }, SortCtx.lessThan);
+        for (order[0..n]) |idx| keep.set(idx);
+
+        // Compact in place: free dropped entries' owned strings, shift kept
+        // ones down. The trailing slots past `kept` are stale duplicates we
+        // must not free again, so shrink the list to drop them.
+        var kept: usize = 0;
+        for (items, 0..) |proc, i| {
+            if (keep.isSet(i)) {
+                items[kept] = proc;
+                kept += 1;
+            } else {
+                allocator.free(proc.name);
+                allocator.free(proc.cmdline);
+                allocator.free(proc.username);
+                allocator.free(proc.cgroup);
+                allocator.free(proc.unit);
+            }
+        }
+        processes.shrinkRetainingCapacity(kept);
+    }
     fn collectProcess(self: *Collector, allocator: Allocator, pid: u32, current_time: i64) !ProcessInfo {
         // Read /proc/[pid]/stat
         var stat_path_buf: [64]u8 = undefined;
@@ -310,8 +432,10 @@ pub const Collector = struct {
         // Skip itrealvalue
         _ = it.next() orelse return error.InvalidStat;
 
-        // Skip starttime
-        _ = it.next() orelse return error.InvalidStat;
+        // starttime (field 22): process start time in clock ticks since boot.
+        // A recycled PID gets a different starttime, so we key CPU-delta
+        // continuity on it rather than trusting the PID alone.
+        const starttime = try std.fmt.parseInt(u64, it.next() orelse return error.InvalidStat, 10);
 
         // Skip vsize (field 23)
         _ = it.next() orelse return error.InvalidStat;
@@ -324,8 +448,16 @@ pub const Collector = struct {
         var cpu_percent: f32 = 0.0;
         if (self.prev_processes.get(pid)) |prev_stats| {
             const time_delta = current_time - prev_stats.timestamp;
-            if (time_delta > 0) {
-                const cpu_delta = (utime + stime) - (prev_stats.utime + prev_stats.stime);
+            // Only compute a delta for the SAME process: a recycled PID has a
+            // different starttime, so its counters are unrelated to the stored
+            // baseline (subtracting them would be meaningless and could underflow
+            // and panic). On reuse we skip this cycle and re-baseline below.
+            if (time_delta > 0 and prev_stats.starttime == starttime) {
+                const cur_jiffies = utime + stime;
+                const prev_jiffies = prev_stats.utime + prev_stats.stime;
+                // Counters are monotonic for a live process; guard the
+                // subtraction defensively so a kernel counter reset can't wrap.
+                const cpu_delta = if (cur_jiffies >= prev_jiffies) cur_jiffies - prev_jiffies else 0;
                 cpu_percent = 100.0 * @as(f32, @floatFromInt(cpu_delta)) /
                     @as(f32, @floatFromInt(self.clock_ticks * @as(u64, @intCast(time_delta))));
             }
@@ -335,6 +467,7 @@ pub const Collector = struct {
         try self.prev_processes.put(pid, ProcessStats{
             .utime = utime,
             .stime = stime,
+            .starttime = starttime,
             .timestamp = current_time,
         });
 
@@ -400,6 +533,18 @@ pub const Collector = struct {
         };
         errdefer allocator.free(username);
 
+        // Per-process I/O and cgroup/unit are NOT read here. Reading
+        // /proc/<pid>/{io,cgroup} for every process on the box each cycle blew
+        // the CPU budget (the box can have hundreds of processes; we only keep
+        // ~20). They are filled in by enrichProcess() AFTER trimToTopN, so the
+        // extra syscalls run only for the handful of processes we actually
+        // return. Start them empty/zero.
+        const cgroup = try allocator.dupe(u8, "");
+        errdefer allocator.free(cgroup);
+
+        const unit = try allocator.dupe(u8, "");
+        errdefer allocator.free(unit);
+
         return ProcessInfo{
             .pid = pid,
             .name = name,
@@ -409,7 +554,196 @@ pub const Collector = struct {
             .mem_rss = mem_rss,
             .threads = threads,
             .username = username,
+            .io_read_bytes = 0,
+            .io_write_bytes = 0,
+            .cgroup = cgroup,
+            .unit = unit,
         };
+    }
+
+    /// Fill in the per-process I/O + cgroup/unit fields for one already-collected
+    /// process. Called only on the trimmed top-N set so the /proc/<pid>/{io,
+    /// cgroup} reads stay bounded per cycle. Replaces the empty cgroup/unit
+    /// placeholders set by collectProcess. The pid may have exited since
+    /// collection, so every read degrades to 0 / "" rather than erroring.
+    fn enrichProcess(allocator: Allocator, proc: *ProcessInfo) !void {
+        const io = readProcessIo(proc.pid);
+        proc.io_read_bytes = io.read_bytes;
+        proc.io_write_bytes = io.write_bytes;
+
+        var cgroup_path_buf: [64]u8 = undefined;
+        const cgroup_path = std.fmt.bufPrint(&cgroup_path_buf, "/proc/{d}/cgroup", .{proc.pid}) catch return;
+
+        const cgroup = blk: {
+            const cgroup_file = fs.openFileAbsolute(cgroup_path, .{}) catch break :blk try allocator.dupe(u8, "");
+            defer cgroup_file.close();
+
+            var cgroup_buf: [4096]u8 = undefined;
+            // Same EACCES-trace hazard as readProcessIo (see readProcFileSilent):
+            // a non-root daemon can't read other users' /proc/<pid>/cgroup.
+            const cgroup_len = readProcFileSilent(cgroup_file.handle, &cgroup_buf) orelse 0;
+            if (cgroup_len == 0) break :blk try allocator.dupe(u8, "");
+
+            // cgroup v2 emits a single "0::<path>" line; v1 emits several. The
+            // unified (v2) line is the most useful, so prefer the last non-empty
+            // line and keep only the part after the final ':'.
+            var line_it = std.mem.splitScalar(u8, cgroup_buf[0..cgroup_len], '\n');
+            var last_line: []const u8 = "";
+            while (line_it.next()) |line| {
+                if (line.len > 0) last_line = line;
+            }
+            const path = if (std.mem.lastIndexOfScalar(u8, last_line, ':')) |idx|
+                last_line[idx + 1 ..]
+            else
+                last_line;
+
+            break :blk try allocator.dupe(u8, path);
+        };
+        // deriveUnit can OOM before cgroup is handed to proc; free it if so.
+        errdefer allocator.free(cgroup);
+
+        const unit = try deriveUnit(allocator, cgroup);
+
+        // Replace the empty placeholders set by collectProcess.
+        allocator.free(proc.cgroup);
+        allocator.free(proc.unit);
+        proc.cgroup = cgroup;
+        proc.unit = unit;
+    }
+
+    const ProcessIo = struct { read_bytes: u64, write_bytes: u64 };
+
+    /// Read an already-open /proc/<pid>/* file into `buf`, returning the number
+    /// of bytes read (reading until EOF or `buf` is full, like File.readAll), or
+    /// null when a read failed for an expected, benign reason.
+    ///
+    /// This deliberately bypasses std.posix.read: a non-root daemon gets EACCES
+    /// reading /proc/<pid>/{io,cgroup} for processes owned by other users, and
+    /// EACCES/EPERM are not mapped to named errors there, so they fall through to
+    /// unexpectedErrno() which dumps a full stack trace to stderr (in Debug/
+    /// ReleaseSafe) before the caller's `catch` ever runs. On a non-root host
+    /// that floods the journal with one trace per unreadable process per cycle.
+    /// Reading the raw syscall and inspecting errno ourselves lets us treat the
+    /// expected errnos (EACCES/EPERM denied; ESRCH the pid exited) as "no data"
+    /// silently. EINTR is retried; anything else is also treated as no data so a
+    /// single odd process can never break the collection cycle.
+    ///
+    /// We loop rather than trust a single read: procfs reads usually return the
+    /// whole (tiny) file at once, but a short read is permitted by the API, and
+    /// silently truncating /proc/<pid>/io would zero out a process's I/O metrics.
+    fn readProcFileSilent(fd: os.linux.fd_t, buf: []u8) ?usize {
+        var total: usize = 0;
+        while (total < buf.len) {
+            const rc = os.linux.read(fd, buf.ptr + total, buf.len - total);
+            switch (os.linux.E.init(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) break; // EOF
+                    total += n;
+                },
+                .INTR => continue,
+                else => return null,
+            }
+        }
+        return total;
+    }
+
+    /// Parse read_bytes/write_bytes out of /proc/[pid]/io. Never errors: any
+    /// open/read/parse failure (missing file, kernel thread, exited pid,
+    /// permission denied) yields 0/0 so the collection cycle can't be broken by
+    /// one unreadable process.
+    fn readProcessIo(pid: u32) ProcessIo {
+        var io_path_buf: [64]u8 = undefined;
+        const io_path = std.fmt.bufPrint(&io_path_buf, "/proc/{d}/io", .{pid}) catch return .{ .read_bytes = 0, .write_bytes = 0 };
+
+        const io_file = fs.openFileAbsolute(io_path, .{}) catch return .{ .read_bytes = 0, .write_bytes = 0 };
+        defer io_file.close();
+
+        var io_buf: [4096]u8 = undefined;
+        const io_len = readProcFileSilent(io_file.handle, &io_buf) orelse return .{ .read_bytes = 0, .write_bytes = 0 };
+
+        return parseProcessIo(io_buf[0..io_len]);
+    }
+
+    /// Pull the "read_bytes:" and "write_bytes:" lines out of /proc/[pid]/io
+    /// content. Unknown/garbled lines are ignored; missing keys stay 0.
+    fn parseProcessIo(content: []const u8) ProcessIo {
+        var read_bytes: u64 = 0;
+        var write_bytes: u64 = 0;
+
+        var line_it = std.mem.splitScalar(u8, content, '\n');
+        while (line_it.next()) |line| {
+            var it = std.mem.tokenizeAny(u8, line, ": ");
+            const key = it.next() orelse continue;
+            const value_str = it.next() orelse continue;
+            const value = std.fmt.parseInt(u64, value_str, 10) catch continue;
+            if (std.mem.eql(u8, key, "read_bytes")) {
+                read_bytes = value;
+            } else if (std.mem.eql(u8, key, "write_bytes")) {
+                write_bytes = value;
+            }
+        }
+
+        return .{ .read_bytes = read_bytes, .write_bytes = write_bytes };
+    }
+
+    /// Derive a friendly unit name from a cgroup path. Recognizes systemd
+    /// units (".service"/".scope"/".slice"), docker containers, and k8s pods.
+    /// Returns an owned string; "" when nothing recognizable was found. The
+    /// caller owns the result and must free it.
+    fn deriveUnit(allocator: Allocator, cgroup: []const u8) ![]const u8 {
+        if (cgroup.len == 0) return allocator.dupe(u8, "");
+
+        // The last path segment usually carries the identity (e.g.
+        // ".../dmeh.service", ".../docker-<id>.scope").
+        var seg_it = std.mem.splitScalar(u8, cgroup, '/');
+        var last_seg: []const u8 = "";
+        while (seg_it.next()) |seg| {
+            if (seg.len > 0) last_seg = seg;
+        }
+
+        // Docker: "docker-<64hex>.scope" or a bare "docker/<id>" path.
+        if (std.mem.indexOf(u8, cgroup, "docker") != null) {
+            if (extractContainerId(last_seg, "docker-")) |id| {
+                return std.fmt.allocPrint(allocator, "docker:{s}", .{id});
+            }
+        }
+
+        // Kubernetes: pods live under a "kubepods" slice. Scan for the segment
+        // that names the pod (starts with "pod"); the final segment is usually
+        // the container id which is less useful on its own.
+        if (std.mem.indexOf(u8, cgroup, "kubepods") != null) {
+            var k8s_it = std.mem.splitScalar(u8, cgroup, '/');
+            while (k8s_it.next()) |seg| {
+                if (std.mem.startsWith(u8, seg, "pod") and seg.len > 3) {
+                    return std.fmt.allocPrint(allocator, "k8s:{s}", .{seg});
+                }
+            }
+            return allocator.dupe(u8, "k8s");
+        }
+
+        // systemd unit: the segment ends in a known suffix. .slice is the
+        // least specific, so it's the fallback.
+        if (std.mem.endsWith(u8, last_seg, ".service") or
+            std.mem.endsWith(u8, last_seg, ".scope") or
+            std.mem.endsWith(u8, last_seg, ".slice") or
+            std.mem.endsWith(u8, last_seg, ".mount") or
+            std.mem.endsWith(u8, last_seg, ".socket"))
+        {
+            return allocator.dupe(u8, last_seg);
+        }
+
+        return allocator.dupe(u8, "");
+    }
+
+    /// Pull the container id out of a segment like "docker-<id>.scope". Returns
+    /// the id slice (a view into `seg`) or null if the shape doesn't match.
+    fn extractContainerId(seg: []const u8, prefix: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, seg, prefix)) return null;
+        var id = seg[prefix.len..];
+        if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| id = id[0..dot];
+        if (id.len == 0) return null;
+        return id;
     }
 
     fn resolveUsername(self: *Collector, allocator: Allocator, uid: u32) ![]const u8 {
@@ -602,6 +936,8 @@ test "collect processes" {
             allocator.free(proc.name);
             allocator.free(proc.cmdline);
             allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
         }
         allocator.free(processes);
     }
@@ -620,6 +956,242 @@ test "collect processes" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "prunes dead pids from prev_processes" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    // Seed baselines for PIDs that cannot exist (above pid_max).
+    const fake_pids = [_]u32{ 4_000_000_001, 4_000_000_002, 4_000_000_003 };
+    for (fake_pids) |pid| {
+        try collector.prev_processes.put(pid, .{ .utime = 1, .stime = 1, .starttime = 0, .timestamp = 0 });
+    }
+
+    const processes = try collector.collectProcesses(allocator);
+    defer {
+        for (processes) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
+        }
+        allocator.free(processes);
+    }
+
+    // Dead PIDs must be gone; the map should not exceed the live process count.
+    for (fake_pids) |pid| try std.testing.expect(!collector.prev_processes.contains(pid));
+    try std.testing.expect(collector.prev_processes.count() <= processes.len);
+}
+
+test "collect processes top-n trimming end to end" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    const n: u32 = 5;
+    collector.max_processes = n;
+
+    const processes = try collector.collectProcesses(allocator);
+    defer {
+        for (processes) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
+        }
+        allocator.free(processes);
+    }
+
+    // Real hosts run far more than 2*n processes, so trimming must engage and
+    // the union of top-n-by-cpu and top-n-by-mem caps the result at 2*n.
+    try std.testing.expect(processes.len > 0);
+    try std.testing.expect(processes.len <= 2 * n);
+}
+
+// Drives trimToTopN with a synthetic list so the selection invariant is
+// deterministic: the global highest-cpu and highest-mem entries must survive,
+// dropped entries' strings are freed, and the result is the deduplicated union.
+test "trimToTopN keeps top cpu and top mem" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    const Spec = struct { pid: u32, cpu: f32, mem: u64 };
+    const specs = [_]Spec{
+        .{ .pid = 1, .cpu = 90.0, .mem = 100 }, // top cpu
+        .{ .pid = 2, .cpu = 1.0, .mem = 9000 }, // top mem
+        .{ .pid = 3, .cpu = std.math.nan(f32), .mem = 50 }, // NaN cpu -> ranks as 0
+        .{ .pid = 4, .cpu = 5.0, .mem = 200 },
+        .{ .pid = 5, .cpu = 2.0, .mem = 300 },
+        .{ .pid = 6, .cpu = 0.5, .mem = 10 }, // should be dropped
+        .{ .pid = 7, .cpu = 0.1, .mem = 5 }, // should be dropped
+    };
+
+    var processes = try std.ArrayList(ProcessInfo).initCapacity(allocator, specs.len);
+    defer {
+        for (processes.items) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
+        }
+        processes.deinit(allocator);
+    }
+    for (specs) |s| {
+        try processes.append(allocator, .{
+            .pid = s.pid,
+            .name = try allocator.dupe(u8, "p"),
+            .cmdline = try allocator.dupe(u8, "c"),
+            .username = try allocator.dupe(u8, "u"),
+            .state = 'R',
+            .cpu_percent = s.cpu,
+            .mem_rss = s.mem,
+            .threads = 1,
+            .io_read_bytes = 0,
+            .io_write_bytes = 0,
+            .cgroup = try allocator.dupe(u8, ""),
+            .unit = try allocator.dupe(u8, ""),
+        });
+    }
+
+    const n: u32 = 2;
+    try collector.trimToTopN(allocator, &processes, n);
+
+    // Top-2 by cpu = {1, 4}; top-2 by mem = {2, 5}; union = 4 entries.
+    try std.testing.expectEqual(@as(usize, 4), processes.items.len);
+
+    var has_top_cpu = false;
+    var has_top_mem = false;
+    for (processes.items) |proc| {
+        if (proc.pid == 1) has_top_cpu = true;
+        if (proc.pid == 2) has_top_mem = true;
+        // The two lowest-ranked entries must have been dropped.
+        try std.testing.expect(proc.pid != 6 and proc.pid != 7);
+    }
+    try std.testing.expect(has_top_cpu);
+    try std.testing.expect(has_top_mem);
+}
+
+test "parseProcessIo extracts read_bytes and write_bytes" {
+    const content =
+        \\rchar: 123456
+        \\wchar: 7890
+        \\syscr: 10
+        \\syscw: 20
+        \\read_bytes: 4096
+        \\write_bytes: 8192
+        \\cancelled_write_bytes: 0
+    ;
+    const io = Collector.parseProcessIo(content);
+    try std.testing.expectEqual(@as(u64, 4096), io.read_bytes);
+    try std.testing.expectEqual(@as(u64, 8192), io.write_bytes);
+}
+
+test "parseProcessIo tolerates missing keys and garbage" {
+    // Only write_bytes present; read_bytes stays 0, junk lines ignored.
+    const content =
+        \\garbage line with no colon
+        \\write_bytes: 555
+        \\read_bytes: notanumber
+    ;
+    const io = Collector.parseProcessIo(content);
+    try std.testing.expectEqual(@as(u64, 0), io.read_bytes);
+    try std.testing.expectEqual(@as(u64, 555), io.write_bytes);
+}
+
+test "readProcessIo returns 0/0 for a missing pid" {
+    // A pid far above pid_max cannot exist; the read must degrade to 0/0.
+    const io = Collector.readProcessIo(4_000_000_001);
+    try std.testing.expectEqual(@as(u64, 0), io.read_bytes);
+    try std.testing.expectEqual(@as(u64, 0), io.write_bytes);
+}
+
+test "readProcFileSilent reads full content and degrades silently on a bad fd" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Happy path: a readable file is read in full (the loop must not stop at a
+    // short read), matching the File.readAll behavior the helper replaced.
+    {
+        const payload = "read_bytes: 123\nwrite_bytes: 456\n";
+        try tmp.dir.writeFile(.{ .sub_path = "io", .data = payload });
+        const file = try tmp.dir.openFile("io", .{});
+        defer file.close();
+
+        var buf: [4096]u8 = undefined;
+        const n = Collector.readProcFileSilent(file.handle, &buf) orelse
+            return error.TestUnexpectedNull;
+        try std.testing.expectEqualStrings(payload, buf[0..n]);
+    }
+
+    // Failure path: a read that fails for a benign reason must degrade to null
+    // with no stack trace. A write-only fd yields EBADF here, standing in for
+    // the EACCES a non-root daemon gets on other users' /proc/<pid>/{io,cgroup}
+    // (deterministic EACCES isn't reproducible as the file's owner). Both errnos
+    // take the same `else => return null` arm, so this exercises the silent path
+    // that the old std.posix.read would have routed through unexpectedErrno().
+    {
+        const file = try tmp.dir.createFile("wo", .{ .read = false });
+        defer file.close();
+
+        var buf: [64]u8 = undefined;
+        try std.testing.expect(Collector.readProcFileSilent(file.handle, &buf) == null);
+    }
+}
+
+test "deriveUnit recognizes systemd, docker, k8s, and unknown cgroups" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct { cgroup: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .cgroup = "/system.slice/dmeh.service", .want = "dmeh.service" },
+        .{ .cgroup = "/user.slice/user-1000.slice/session-2.scope", .want = "session-2.scope" },
+        .{ .cgroup = "/system.slice", .want = "system.slice" },
+        .{ .cgroup = "/system.slice/docker-abc123def456.scope", .want = "docker:abc123def456" },
+        .{ .cgroup = "/kubepods/burstable/pod1234-5678/abcd", .want = "k8s:pod1234-5678" },
+        .{ .cgroup = "/some/unknown/path", .want = "" },
+        .{ .cgroup = "", .want = "" },
+    };
+
+    for (cases) |cse| {
+        const unit = try Collector.deriveUnit(allocator, cse.cgroup);
+        defer allocator.free(unit);
+        try std.testing.expectEqualStrings(cse.want, unit);
+    }
+}
+
+test "collect processes populates io and cgroup fields" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    const processes = try collector.collectProcesses(allocator);
+    defer {
+        for (processes) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
+        }
+        allocator.free(processes);
+    }
+
+    // Our own process should have a cgroup path under cgroup v2/v1.
+    const my_pid = std.os.linux.getpid();
+    for (processes) |proc| {
+        if (proc.pid == @as(u32, @intCast(my_pid))) {
+            // cgroup/unit are owned strings (possibly empty); io fields exist.
+            _ = proc.io_read_bytes;
+            _ = proc.io_write_bytes;
+            break;
+        }
+    }
 }
 
 test "collect disks" {

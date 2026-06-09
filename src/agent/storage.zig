@@ -5,6 +5,8 @@ const c = @cImport({
     @cInclude("duckdb.h");
 });
 
+extern fn malloc_trim(pad: usize) c_int;
+
 // Import types from other modules (named modules via build.zig)
 const collector = @import("collector");
 const logs = @import("logs");
@@ -263,6 +265,94 @@ pub const Storage = struct {
         self.conn = new_conn;
     }
 
+    /// Refresh DuckDB's connection/database handles and ask glibc to return
+    /// freed heap pages to the OS. This is used as a long-running daemon
+    /// maintenance action: DuckDB can retain anonymous RSS after process-table
+    /// writes/checkpoints even when the DB is healthy.
+    pub fn refresh(self: *Storage) !void {
+        try self.reconnect();
+        _ = malloc_trim(0);
+    }
+
+    /// Quarantine the current DB/WAL by renaming them with a Unix-timestamp
+    /// suffix, then open a fresh database at the original path. Called by the
+    /// main loop when a normal reconnect was already attempted and the DB is
+    /// still unwritable (e.g. the file is permanently too large for memory_limit).
+    ///
+    /// On success, consecutive_insert_failures is reset to 0.
+    /// On error, handles are already closed; the Storage is dead and must only
+    /// be deinit()'d, never reused.
+    pub fn quarantineAndReopen(self: *Storage) !void {
+        if (self.read_only) return error.DatabaseError;
+        if (std.mem.eql(u8, self.db_path, ":memory:")) return error.DatabaseError;
+
+        const ts = std.time.timestamp();
+
+        // Close handles BEFORE renaming (same reason as reconnect: two live
+        // instances on the same path race on the spill dir and crash).
+        // Also safe when called after a failed reconnect (handles already null).
+        c.duckdb_disconnect(&self.conn);
+        c.duckdb_close(&self.db);
+
+        const wedged_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}.wedged-{d}",
+            .{ self.db_path, ts },
+        );
+        defer self.allocator.free(wedged_path);
+
+        // Rename main DB file to preserve it for triage. Required: if this
+        // fails, return the error (caller should exit for a systemd restart).
+        std.fs.renameAbsolute(self.db_path, wedged_path) catch |err| {
+            std.log.err("DuckDB quarantine: rename failed ({s} -> {s}): {}", .{ self.db_path, wedged_path, err });
+            return err;
+        };
+        std.log.warn("DuckDB quarantined: {s} -> {s}", .{ self.db_path, wedged_path });
+
+        // Best-effort: rename WAL file. A missing WAL is normal (DuckDB removes
+        // it on clean checkpoint). Allocation failure is treated as "skip".
+        if (std.fmt.allocPrint(self.allocator, "{s}.wal", .{self.db_path})) |wal_path| {
+            defer self.allocator.free(wal_path);
+            if (std.fmt.allocPrint(self.allocator, "{s}.wal.wedged-{d}", .{ self.db_path, ts })) |wedged_wal| {
+                defer self.allocator.free(wedged_wal);
+                std.fs.renameAbsolute(wal_path, wedged_wal) catch {};
+            } else |_| {}
+        } else |_| {}
+
+        // Open fresh DB at the original path.
+        const c_path = try self.allocator.dupeZ(u8, self.db_path);
+        defer self.allocator.free(c_path);
+
+        var new_db: c.duckdb_database = undefined;
+        const open_state = c.duckdb_open(c_path.ptr, &new_db);
+        if (open_state == c.DuckDBError) return error.DatabaseError;
+        errdefer c.duckdb_close(&new_db);
+
+        var new_conn: c.duckdb_connection = undefined;
+        const conn_state = c.duckdb_connect(new_db, &new_conn);
+        if (conn_state == c.DuckDBError) return error.ConnectionError;
+        errdefer c.duckdb_disconnect(&new_conn);
+
+        try applyMemoryLimit(new_conn, self.memory_limit_mb);
+        try initSchema(new_conn);
+
+        // Restrict the fresh file to 0600 (matches initWithMode).
+        if (std.fs.path.isAbsolute(self.db_path)) {
+            if (std.fs.openFileAbsolute(self.db_path, .{})) |file| {
+                defer file.close();
+                file.chmod(0o600) catch |err| {
+                    std.log.warn("DuckDB chmod 0600 failed for {s}: {}", .{ self.db_path, err });
+                };
+            } else |err| {
+                std.log.warn("DuckDB chmod open failed for {s}: {}", .{ self.db_path, err });
+            }
+        }
+
+        self.db = new_db;
+        self.conn = new_conn;
+        self.consecutive_insert_failures = 0;
+    }
+
     fn initSchema(conn: c.duckdb_connection) !void {
         const schema_sql =
             \\CREATE TABLE IF NOT EXISTS metrics (
@@ -288,8 +378,16 @@ pub const Storage = struct {
             \\  cpu_percent REAL,
             \\  mem_rss BIGINT,
             \\  threads INTEGER,
-            \\  username VARCHAR
+            \\  username VARCHAR,
+            \\  io_read_bytes BIGINT,
+            \\  io_write_bytes BIGINT,
+            \\  cgroup VARCHAR,
+            \\  unit VARCHAR
             \\);
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS io_read_bytes BIGINT;
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS io_write_bytes BIGINT;
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS cgroup VARCHAR;
+            \\ALTER TABLE processes ADD COLUMN IF NOT EXISTS unit VARCHAR;
             \\CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
             \\CREATE INDEX IF NOT EXISTS idx_processes_name ON processes(name);
             \\
@@ -413,6 +511,10 @@ pub const Storage = struct {
             _ = c.duckdb_append_uint64(appender, proc.mem_rss);
             _ = c.duckdb_append_uint32(appender, proc.threads);
             _ = c.duckdb_append_varchar_length(appender, proc.username.ptr, proc.username.len);
+            _ = c.duckdb_append_uint64(appender, proc.io_read_bytes);
+            _ = c.duckdb_append_uint64(appender, proc.io_write_bytes);
+            _ = c.duckdb_append_varchar_length(appender, proc.cgroup.ptr, proc.cgroup.len);
+            _ = c.duckdb_append_varchar_length(appender, proc.unit.ptr, proc.unit.len);
 
             state = c.duckdb_appender_end_row(appender);
             if (state == c.DuckDBError) {
@@ -745,6 +847,27 @@ pub const Storage = struct {
             const username = try self.allocator.dupe(u8, std.mem.span(username_ptr));
             errdefer self.allocator.free(username);
 
+            // Columns 9-12 were added later; on a pre-migration row DuckDB
+            // returns NULL, so guard each before reading.
+            const io_read_bytes = if (c.duckdb_value_is_null(&result, 9, i)) 0 else c.duckdb_value_uint64(&result, 9, i);
+            const io_write_bytes = if (c.duckdb_value_is_null(&result, 10, i)) 0 else c.duckdb_value_uint64(&result, 10, i);
+
+            const cgroup = if (c.duckdb_value_is_null(&result, 11, i))
+                try self.allocator.dupe(u8, "")
+            else blk: {
+                const cgroup_ptr = c.duckdb_value_varchar(&result, 11, i);
+                break :blk try self.allocator.dupe(u8, std.mem.span(cgroup_ptr));
+            };
+            errdefer self.allocator.free(cgroup);
+
+            const unit = if (c.duckdb_value_is_null(&result, 12, i))
+                try self.allocator.dupe(u8, "")
+            else blk: {
+                const unit_ptr = c.duckdb_value_varchar(&result, 12, i);
+                break :blk try self.allocator.dupe(u8, std.mem.span(unit_ptr));
+            };
+            errdefer self.allocator.free(unit);
+
             procs[i] = ProcessInfo{
                 .pid = pid,
                 .name = name,
@@ -754,6 +877,10 @@ pub const Storage = struct {
                 .mem_rss = mem_rss,
                 .threads = threads,
                 .username = username,
+                .io_read_bytes = io_read_bytes,
+                .io_write_bytes = io_write_bytes,
+                .cgroup = cgroup,
+                .unit = unit,
             };
         }
 
@@ -1095,6 +1222,10 @@ test "Storage: insert and retrieve processes" {
         .mem_rss = 50000000,
         .threads = 4,
         .username = "testuser",
+        .io_read_bytes = 111,
+        .io_write_bytes = 222,
+        .cgroup = "/system.slice/test.service",
+        .unit = "test.service",
     };
 
     const procs = [_]ProcessInfo{proc1};
@@ -1107,6 +1238,8 @@ test "Storage: insert and retrieve processes" {
             allocator.free(p.name);
             allocator.free(p.cmdline);
             allocator.free(p.username);
+            allocator.free(p.cgroup);
+            allocator.free(p.unit);
         }
         allocator.free(retrieved);
     }
@@ -1115,6 +1248,10 @@ test "Storage: insert and retrieve processes" {
     try std.testing.expect(retrieved[0].pid == proc1.pid);
     try std.testing.expectEqualStrings(proc1.name, retrieved[0].name);
     try std.testing.expect(retrieved[0].state == 'R');
+    try std.testing.expectEqual(@as(u64, 111), retrieved[0].io_read_bytes);
+    try std.testing.expectEqual(@as(u64, 222), retrieved[0].io_write_bytes);
+    try std.testing.expectEqualStrings(proc1.cgroup, retrieved[0].cgroup);
+    try std.testing.expectEqualStrings(proc1.unit, retrieved[0].unit);
 }
 
 test "Storage: insert and query logs" {
@@ -1184,4 +1321,81 @@ test "Storage: retention cleanup" {
     // Verify data was deleted
     const retrieved = try storage.getLatestMetrics();
     try std.testing.expect(retrieved == null);
+}
+
+test "Storage: refresh reconnects and remains writable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, "metrics.db" });
+    defer allocator.free(db_path);
+
+    var storage = try Storage.init(allocator, db_path);
+    defer storage.deinit();
+
+    const metrics = SystemMetrics{
+        .cpu_percent = 10.0,
+        .cpu_user = 5.0,
+        .cpu_system = 5.0,
+        .cpu_iowait = 0.0,
+        .mem_total = 1_000_000_000,
+        .mem_used = 500_000_000,
+        .mem_percent = 50.0,
+        .swap_total = 0,
+        .swap_used = 0,
+    };
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+    try storage.refresh();
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+}
+
+test "Storage: quarantineAndReopen renames wedged DB and opens fresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, "metrics.db" });
+    defer allocator.free(db_path);
+
+    var storage = try Storage.init(allocator, db_path);
+    defer storage.deinit();
+
+    const metrics = SystemMetrics{
+        .cpu_percent = 10.0,
+        .cpu_user = 5.0,
+        .cpu_system = 5.0,
+        .cpu_iowait = 0.0,
+        .mem_total = 1_000_000_000,
+        .mem_used = 500_000_000,
+        .mem_percent = 50.0,
+        .swap_total = 0,
+        .swap_used = 0,
+    };
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+
+    try storage.quarantineAndReopen();
+
+    // Counter should be reset and the fresh DB should be writable.
+    try std.testing.expectEqual(@as(u32, 0), storage.consecutive_insert_failures);
+    try storage.insertMetrics(std.time.timestamp(), metrics);
+
+    // A .wedged-<timestamp> file should exist in the temp dir.
+    var found_wedged = false;
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+    var iter = iter_dir.iterate();
+    while (try iter.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "metrics.db.wedged-")) {
+            found_wedged = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_wedged);
 }

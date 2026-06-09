@@ -98,6 +98,12 @@ const ProcessPayload = struct {
     mem_rss: u64,
     threads: u32,
     username: []const u8,
+    // cmdline is deliberately omitted (may carry secrets). cgroup/io carry no
+    // secrets and help the AI attribute a host spike to a unit/container.
+    io_read_bytes: u64,
+    io_write_bytes: u64,
+    cgroup: []const u8,
+    unit: []const u8,
 };
 
 const DiskPayload = struct {
@@ -167,6 +173,10 @@ pub fn buildPayload(
             .mem_rss = src.mem_rss,
             .threads = src.threads,
             .username = src.username,
+            .io_read_bytes = src.io_read_bytes,
+            .io_write_bytes = src.io_write_bytes,
+            .cgroup = src.cgroup,
+            .unit = src.unit,
         };
     }
 
@@ -416,6 +426,10 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
             .mem_rss = 1_024,
             .threads = 1,
             .username = "root",
+            .io_read_bytes = 4_096,
+            .io_write_bytes = 8_192,
+            .cgroup = "/system.slice/proc.service",
+            .unit = "proc.service",
         };
     }
 
@@ -443,6 +457,11 @@ test "buildPayload caps processes, sorts by CPU, and omits cmdline" {
     try std.testing.expectEqual(@as(i64, 30), processes.items[0].object.get("pid").?.integer);
     try std.testing.expectEqual(@as(i64, 6), processes.items[24].object.get("pid").?.integer);
     try std.testing.expect(processes.items[0].object.get("cmdline") == null);
+    // cgroup/io ARE pushed (no secrets) and help attribute host spikes.
+    try std.testing.expectEqual(@as(i64, 4_096), processes.items[0].object.get("io_read_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 8_192), processes.items[0].object.get("io_write_bytes").?.integer);
+    try std.testing.expectEqualStrings("/system.slice/proc.service", processes.items[0].object.get("cgroup").?.string);
+    try std.testing.expectEqualStrings("proc.service", processes.items[0].object.get("unit").?.string);
 
     const daemon_self = root.get("daemon_self").?.object;
     try std.testing.expectEqual(@as(i64, 38_000), daemon_self.get("rss_kb").?.integer);

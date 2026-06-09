@@ -1,10 +1,14 @@
 const std = @import("std");
 const output = @import("output.zig");
-const storage_mod = @import("storage");
+const parquet_query = @import("parquet_query");
 const Allocator = std.mem.Allocator;
 
-pub const Storage = storage_mod.Storage;
-pub const QueryResult = storage_mod.QueryResult;
+// The CLI read path now goes through the parquet hot tier (plan 25 cutover).
+// ParquetQuery exposes the same accessor surface the resident Storage did
+// (getLatestMetrics / getMetricsRange / getProcesses / getDisks / queryLogs /
+// rawQuery), so command bodies are unchanged - only the handle type differs.
+pub const Storage = parquet_query.ParquetQuery;
+pub const QueryResult = parquet_query.QueryResult;
 
 // Command: sermon status
 pub fn cmdStatus(
@@ -35,6 +39,8 @@ pub fn cmdStatus(
             allocator.free(p.name);
             allocator.free(p.cmdline);
             allocator.free(p.username);
+            allocator.free(p.cgroup);
+            allocator.free(p.unit);
         }
         if (all_procs.len > 0) allocator.free(all_procs);
     }
@@ -111,6 +117,8 @@ pub fn cmdProcesses(
             allocator.free(p.name);
             allocator.free(p.cmdline);
             allocator.free(p.username);
+            allocator.free(p.cgroup);
+            allocator.free(p.unit);
         }
         if (all_procs.len > 0) allocator.free(all_procs);
     }

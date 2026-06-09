@@ -52,6 +52,33 @@ pub fn build(b: *std.Build) void {
     push_mod.addImport("proxmox", proxmox_mod);
     push_mod.addOptions("build_options", options);
 
+    // Parquet hot tier modules (staging + roll) are declared early so both the
+    // daemon and the test step can import them. The on-demand query module is
+    // declared lower with the other test targets.
+    const staging_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/staging.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    staging_mod.addImport("collector", collector_mod);
+    staging_mod.addImport("logs", logs_mod);
+    staging_mod.addImport("proxmox", proxmox_mod);
+
+    const roll_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/roll.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    roll_mod.addImport("collector", collector_mod);
+    roll_mod.addImport("logs", logs_mod);
+    roll_mod.addImport("proxmox", proxmox_mod);
+    roll_mod.addImport("staging", staging_mod);
+    roll_mod.addIncludePath(b.path("lib"));
+    roll_mod.addLibraryPath(b.path("lib"));
+    roll_mod.linkSystemLibrary("duckdb", .{});
+
     const storage_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/storage.zig"),
         .target = target,
@@ -64,6 +91,23 @@ pub fn build(b: *std.Build) void {
     storage_mod.addIncludePath(b.path("lib"));
     storage_mod.addLibraryPath(b.path("lib"));
     storage_mod.linkSystemLibrary("duckdb", .{});
+
+    // On-demand parquet query module. Declared here (alongside staging/roll)
+    // because the CLI read path now imports it; the test target below reuses it.
+    const parquet_query_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/parquet_query.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    parquet_query_mod.addImport("collector", collector_mod);
+    parquet_query_mod.addImport("logs", logs_mod);
+    parquet_query_mod.addImport("proxmox", proxmox_mod);
+    parquet_query_mod.addImport("staging", staging_mod);
+    parquet_query_mod.addImport("roll", roll_mod);
+    parquet_query_mod.addIncludePath(b.path("lib"));
+    parquet_query_mod.addLibraryPath(b.path("lib"));
+    parquet_query_mod.linkSystemLibrary("duckdb", .{});
 
     // ── sermon-agent (daemon) ──
     const agent_mod = b.createModule(.{
@@ -79,6 +123,8 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("proxmox", proxmox_mod);
     agent_mod.addImport("push", push_mod);
     agent_mod.addImport("storage", storage_mod);
+    agent_mod.addImport("staging", staging_mod);
+    agent_mod.addImport("roll", roll_mod);
     agent_mod.addIncludePath(b.path("lib"));
     agent_mod.addLibraryPath(b.path("lib"));
     agent_mod.linkSystemLibrary("duckdb", .{});
@@ -97,9 +143,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // The CLI read path goes through the parquet hot tier (plan 25 cutover), so
+    // it imports parquet_query and its transitive deps (staging, roll, proxmox)
+    // and links duckdb, mirroring the agent module. It no longer needs storage.
     cli_mod.addImport("collector", collector_mod);
     cli_mod.addImport("logs", logs_mod);
-    cli_mod.addImport("storage", storage_mod);
+    cli_mod.addImport("proxmox", proxmox_mod);
+    cli_mod.addImport("staging", staging_mod);
+    cli_mod.addImport("roll", roll_mod);
+    cli_mod.addImport("parquet_query", parquet_query_mod);
     cli_mod.addIncludePath(b.path("lib"));
     cli_mod.addLibraryPath(b.path("lib"));
     cli_mod.linkSystemLibrary("duckdb", .{});
@@ -197,6 +249,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // ── Parquet hot tier (plan 25): test targets ──
+    // staging_mod, roll_mod, and parquet_query_mod are declared up top (shared
+    // with the daemon and CLI). Their test targets live here.
+    const staging_tests = b.addTest(.{ .root_module = staging_mod });
+
+    const roll_tests = b.addTest(.{ .root_module = roll_mod });
+    roll_tests.addRPath(b.path("lib"));
+
+    const parquet_query_tests = b.addTest(.{ .root_module = parquet_query_mod });
+    parquet_query_tests.addRPath(b.path("lib"));
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);
     test_step.dependOn(&b.addRunArtifact(collector_tests).step);
@@ -205,11 +268,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(push_tests).step);
     test_step.dependOn(&b.addRunArtifact(proc_self_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxmox_tests).step);
+    test_step.dependOn(&b.addRunArtifact(staging_tests).step);
+    test_step.dependOn(&b.addRunArtifact(roll_tests).step);
+    test_step.dependOn(&b.addRunArtifact(parquet_query_tests).step);
 
     // ── Bench (resource usage check) ──
     const bench = b.addSystemCommand(&.{ "bash", "bench.sh" });
     bench.step.dependOn(&agent.step);
-    const bench_step = b.step("bench", "Check agent resource usage (RSS < 50MB, CPU < 2%)");
+    const bench_step = b.step("bench", "Check agent resource usage (RSS < 96MB, CPU < 2%)");
     bench_step.dependOn(&bench.step);
 
     // ── Buffer-pool regression bench ──

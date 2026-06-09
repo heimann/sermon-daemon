@@ -652,7 +652,18 @@ fn jsonU64(v: ?std.json.Value) ?u64 {
     const val = v orelse return null;
     return switch (val) {
         .integer => |i| if (i < 0) 0 else @intCast(i),
-        .float => |f| if (f < 0) 0 else @intFromFloat(f),
+        // Clamp out-of-range floats instead of converting blindly: an
+        // attacker-shaped JSON float whose integer part exceeds u64 max would
+        // otherwise panic @intFromFloat (checked illegal behavior). @intFromFloat
+        // is valid only for f in [0, 2^64); the bound is 2^64 exactly (0x1p64),
+        // NOT @floatFromInt(maxInt(u64)) which rounds up to 2^64 in f64 and would
+        // still let f == 2^64 through into the panic path.
+        .float => |f| if (f < 0)
+            0
+        else if (f >= 0x1p64)
+            std.math.maxInt(u64)
+        else
+            @intFromFloat(f),
         else => null,
     };
 }
@@ -815,6 +826,24 @@ test "parsePveshJson: vmid exceeding u32 max is skipped" {
     defer freeContainers(allocator, entries);
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u32, 42), entries[0].vmid);
+}
+
+test "parsePveshJson: out-of-range maxmem float is clamped, not a panic" {
+    const allocator = std.testing.allocator;
+    // A hostile/MITM'd cluster response can encode maxmem as a float whose
+    // integer part exceeds u64 max; jsonU64 must clamp rather than panic
+    // @intFromFloat. The second row is exactly 2^64 (the f64 boundary case).
+    const json =
+        \\[
+        \\  {"type":"lxc","vmid":1,"name":"a","node":"n","status":"running","maxmem":1e30,"maxcpu":1},
+        \\  {"type":"lxc","vmid":2,"name":"b","node":"n","status":"running","maxmem":18446744073709551616.0,"maxcpu":1}
+        \\]
+    ;
+    const entries = try parsePveshJson(allocator, json);
+    defer freeContainers(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), entries[0].maxmem);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), entries[1].maxmem);
 }
 
 test "parsePveshJson: top-level non-array errors" {

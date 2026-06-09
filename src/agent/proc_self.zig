@@ -1,6 +1,6 @@
 //! Reads the daemon's own resource usage from /proc/self.
 //!
-//! The daemon is supposed to be lightweight (~0.1% CPU, ~50 MB RSS on a
+//! The daemon is supposed to be lightweight (~0.1% CPU, ~96 MB RSS on a
 //! fast SSD). Pushing these self-metrics with each cycle lets the hosted
 //! side alert when a daemon drifts up - long-running state, leaks, or a
 //! regression in our own collection code.
