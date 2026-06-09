@@ -48,6 +48,19 @@
 //!   defense in depth: even were the lock absent, missing a brand-new parquet
 //!   file leaves its rows in the older staging snapshot, counted exactly once.
 //!
+//! DAY COMPACTION shares this same crash contract. roll.compactDay deletes a
+//! sealed day's input parquet BEFORE publishing the merged `<seq>.parquet`, all
+//! under LOCK_EX - so a LIVE query (LOCK_SH) can never observe that window, just
+//! as with the roll. A CRASH mid-compaction can leave a committed manifest with
+//! inputs deleted and the merge not yet published (rows durable in `<seq>
+//! .parquet.building`, which this read path ignores) - the SAME transient,
+//! recoverable miss the roll's `.tmp` orphan creates. roll.recoverCompactions
+//! repairs it at daemon STARTUP under LOCK_EX (right after recoverOrphanTemps),
+//! exactly as recoverOrphanTemps repairs a roll's orphan. The read path stays
+//! manifest-agnostic by design: a query run against a crashed-daemon tree before
+//! that startup recovery completes sees the same transient miss the roll already
+//! accepted, never a double-count.
+//!
 //! The query path is read-only and opens no control channel to the daemon - the
 //! daemon stays write-only.
 
