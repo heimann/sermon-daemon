@@ -304,9 +304,13 @@ pub fn main() !void {
     //       crash) is dropped with its inputs left intact. Must run AFTER orphan-
     //       temp recovery (so a re-published roll temp is a candidate input next
     //       tick) and BEFORE any roll/query. Idempotent; no-op when there's none.
-    roll_mod.recoverCompactions(allocator, root) catch |err| {
-        std.debug.print("Warning: compaction recovery failed: {}\n", .{err});
-    };
+    //
+    //       FATAL on failure: a committed manifest mid-replay can leave rows
+    //       hidden in a `<seq>.building` that queries ignore (deleting inputs
+    //       precedes publishing the building). Proceeding would silently serve a
+    //       short count. Aborting lets a restart retry recovery from the durable
+    //       manifest instead, so no row is ever stranded in a half-published merge.
+    try roll_mod.recoverCompactions(allocator, root);
 
     // One-shot MIGRATION: if a legacy resident metrics.db still exists at the
     // old path, COPY its rows into the parquet tree (best-effort) and rename it

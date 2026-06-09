@@ -55,6 +55,7 @@ pub const RollError = error{
     AppendError,
     CopyError,
     SyncError,
+    CompactionOutputMissing,
     OutOfMemory,
 };
 
@@ -391,6 +392,18 @@ pub fn compactDay(allocator: Allocator, root: []const u8, table: Table, date_str
     const day_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/date={s}", .{ root, table.name(), date_str });
     defer allocator.free(day_dir);
 
+    // (0) Refuse to start if the day still has an UNFINISHED compaction (a
+    // `.manifest` or `.building` left by a crashed run). Starting a fresh merge
+    // over a now-PARTIAL input set would write a SECOND manifest/building; at the
+    // next startup, recovery would publish BOTH the old building (the full input
+    // set) AND the new one (the partial set), double-counting the overlap. The
+    // unfinished compaction must be resolved by recoverCompactions (at the next
+    // daemon start) before this day is eligible again. Skip it for now.
+    if (try dayHasPendingCompaction(day_dir)) {
+        std.log.warn("compaction: day {s}/{s} has a pending compaction artifact - deferring to startup recovery", .{ table.name(), date_str });
+        return;
+    }
+
     // (1) Enumerate every committed `.parquet` under the day dir, recursively,
     // as paths RELATIVE to the day dir (the manifest records relative paths so a
     // moved root still recovers, and the seq hash is root-independent).
@@ -421,19 +434,81 @@ pub fn compactDay(allocator: Allocator, root: []const u8, table: Table, date_str
     // publish even across a crash; before it, recovery just drops the building.
     try writeManifest(allocator, day_dir, seq, final_path, inputs.items);
 
-    // (5) Delete the named inputs; rmdir emptied `hour=*` subdirs.
-    try deleteInputs(allocator, day_dir, inputs.items);
+    // (5)-(7) Delete inputs, publish the building, drop the manifest. This is the
+    // SAME completion logic startup recovery replays from the committed manifest
+    // (completeCompaction), so the live path and the crash path are identical.
+    // Errors PROPAGATE (not best-effort): the manifest stays committed and the
+    // building durable, so a restart's recoverCompactions finishes the exact same
+    // step. compactSealedDays logs the error and moves to the next day; the half-
+    // done day is repaired on the next daemon start. Never leaves a partial state
+    // a later compaction could double-count - the committed manifest pins it.
+    const out_basename = std.fs.path.basename(final_path);
+    try completeCompaction(allocator, day_dir, seq, inputs.items, out_basename);
+    _ = malloc_trim(0);
+}
+
+/// Steps 5-7 of the protocol, shared by the live compaction and crash recovery:
+/// delete each named input still present, rmdir emptied `hour=` dirs, publish the
+/// `<seq>.building` to `<day_dir>/<out_basename>`, then drop `<seq>.manifest`.
+/// The caller MUST hold LOCK_EX. Idempotent: re-running after a partial crash
+/// (some inputs gone, building already published) completes cleanly.
+///
+/// Errors PROPAGATE so a failure leaves the committed manifest in place for the
+/// next recoverCompactions to retry - we never delete the manifest (the recovery
+/// marker) unless the merged file is durably published.
+fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8, input_rels: []const []u8, out_basename: []const u8) !void {
+    // (5) Delete each named input still present (FileNotFound tolerated so a
+    // retried completion finishes), then rmdir emptied hour dirs.
+    try deleteInputs(allocator, day_dir, input_rels);
     try removeEmptyHourDirs(allocator, day_dir);
 
-    // (6) Publish the merged file, fsync dir.
-    try fs.renameAbsolute(building_path, final_path);
-    try fsyncDirOf(final_path);
-
-    // (7) Drop the manifest - the compaction is fully done.
+    const building_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer allocator.free(building_path);
+    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, out_basename });
+    defer allocator.free(final_path);
     const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
     defer allocator.free(manifest_path);
-    fs.deleteFileAbsolute(manifest_path) catch {};
-    _ = malloc_trim(0);
+
+    // (6) Publish the building -> final, then fsync the dir.
+    const final_exists = pathExists(final_path);
+    if (!final_exists) {
+        fs.renameAbsolute(building_path, final_path) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Neither building nor final present, yet the manifest committed
+                // (so the inputs were scheduled for / already deleted). The merged
+                // copy is gone - we must NOT drop the manifest (that would strand
+                // the rows). Preserve the marker and fail so a restart can surface
+                // the loss rather than silently completing. This is unreachable in
+                // the protocol (the building is fsynced durable BEFORE the manifest
+                // commits), so it only fires on out-of-band corruption.
+                std.log.err("compaction completion: both building and final missing for {s} - manifest preserved", .{manifest_path});
+                return error.CompactionOutputMissing;
+            },
+            else => return err,
+        };
+        try fsyncDirOf(final_path);
+    } else {
+        // Final already published (crash after step 6, before step 7): drop the
+        // now-redundant leftover building. Its absence is fine.
+        fs.deleteFileAbsolute(building_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    // (7) Drop the manifest - the compaction is fully done. Only reached once the
+    // merged file is durably published, so the rows are never stranded.
+    try fs.deleteFileAbsolute(manifest_path);
+}
+
+/// True iff `path` exists (any access error other than FileNotFound also reads as
+/// "exists" so we don't mistakenly treat an EACCES'd final as absent).
+fn pathExists(path: []const u8) bool {
+    fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return true,
+    };
+    return true;
 }
 
 /// Recover compactions a crash interrupted, across every table's `date=` dir.
@@ -450,7 +525,18 @@ pub fn compactDay(allocator: Allocator, root: []const u8, table: Table, date_str
 ///     delete the building. Its inputs are all still present and intact.
 ///
 /// Idempotent and safe when there is nothing to recover.
+///
+/// Takes LOCK_EX for the whole sweep, like compactDay/runRetention: recovery
+/// mutates the tree (deletes inputs, publishes a `.building`), and a query holds
+/// LOCK_SH around its enumerate+snapshot. Without the lock a query launched
+/// concurrently with startup recovery could observe the inputs-deleted-but-
+/// building-not-yet-published window and miss rows (queries ignore `.building`).
 pub fn recoverCompactions(allocator: Allocator, root: []const u8) !void {
+    var lock_file = try staging.openRollLock(root, allocator);
+    defer lock_file.close();
+    try std.posix.flock(lock_file.handle, std.posix.LOCK.EX);
+    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
+
     for (Table.all) |table| {
         const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
         defer allocator.free(table_dir);
@@ -523,19 +609,26 @@ fn recoverDay(allocator: Allocator, day_dir: []const u8) !void {
         }
     }
 
-    // Committed manifests FIRST: each replays steps 5-7, which either renames its
-    // `<seq>.building` to the final or drops it - so after this loop a building
-    // that had a manifest no longer exists on disk.
+    // Committed manifests FIRST: each replays steps 5-7 (completeCompaction). On
+    // success the manifest is dropped and its building consumed; on a parse error
+    // BOTH the manifest and its building are intentionally LEFT in place (the day
+    // stays un-compacted, inputs intact) for a human / a later release to inspect.
     for (manifests.items) |manifest_name| {
         const seq = manifest_name[0 .. manifest_name.len - manifest_suffix.len];
         try recoverFromManifest(allocator, day_dir, seq);
     }
 
-    // Remaining buildings are orphans (crash BEFORE the manifest commit): delete
-    // them. The inputs were never touched, so dropping the building loses nothing.
-    // A building already consumed by a manifest above is gone, so its delete here
-    // is a harmless FileNotFound no-op - no need to track which seqs were handled.
+    // Remaining buildings: a building is an ORPHAN (crash BEFORE the manifest
+    // commit) ONLY if no `<seq>.manifest` exists for it. Delete only those - their
+    // inputs were never touched, so dropping the building loses nothing. A
+    // building whose manifest STILL exists (an unparseable manifest left in place
+    // above) is the only complete merged copy and MUST be kept, so we re-check the
+    // manifest on disk per building rather than blindly deleting every one.
     for (buildings.items) |building_name| {
+        const seq = building_name[0 .. building_name.len - building_suffix.len];
+        const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
+        defer allocator.free(manifest_path);
+        if (pathExists(manifest_path)) continue; // committed (e.g. unparseable) - keep the building
         const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, building_name });
         defer allocator.free(p);
         fs.deleteFileAbsolute(p) catch {};
@@ -569,42 +662,11 @@ fn recoverFromManifest(allocator: Allocator, day_dir: []const u8, seq: []const u
     const out_basename = entries.items[0];
     const input_rels = entries.items[1..];
 
-    // (5) Delete each named input still present, then rmdir emptied hour dirs.
-    for (input_rels) |rel| {
-        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, rel });
-        defer allocator.free(p);
-        fs.deleteFileAbsolute(p) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    }
-    try removeEmptyHourDirs(allocator, day_dir);
-
-    // (6) Publish the building -> final. If the final already exists (crash after
-    // step 6 but before step 7), just drop the leftover building.
-    const building_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
-    defer allocator.free(building_path);
-    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, out_basename });
-    defer allocator.free(final_path);
-
-    const final_exists = blk: {
-        fs.accessAbsolute(final_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (final_exists) {
-        fs.deleteFileAbsolute(building_path) catch {};
-    } else {
-        fs.renameAbsolute(building_path, final_path) catch |err| switch (err) {
-            // No building and no final = both gone; nothing to publish. Fall
-            // through to drop the manifest so we don't loop on it.
-            error.FileNotFound => {},
-            else => return err,
-        };
-        fsyncDirOf(final_path) catch {};
-    }
-
-    // (7) Drop the manifest - the compaction is complete.
-    fs.deleteFileAbsolute(manifest_path) catch {};
+    // Replay steps 5-7 via the SAME completion path the live compaction uses.
+    // It deletes the named inputs, publishes the building, and drops the manifest;
+    // on a missing merged copy it PRESERVES the manifest and errors (propagated)
+    // rather than silently completing - so recovery never strands rows.
+    try completeCompaction(allocator, day_dir, seq, input_rels, out_basename);
 }
 
 /// Enumerate every committed `.parquet` under `day_dir`, recursively, as paths
@@ -665,12 +727,17 @@ fn copyMergeToParquet(allocator: Allocator, day_dir: []const u8, inputs: []const
     const escaped_out = try escapeSqlLiteral(allocator, out_path);
     defer allocator.free(escaped_out);
 
-    // union_by_name=true reconciles any column-order/schema drift across the
-    // merged inputs by name (hive_partitioning is irrelevant here: we SELECT *
-    // and the path components are not read as columns). The output is one file.
+    // hive_partitioning=false: the input set can mix depths - a day-level
+    // <seq>.parquet (date key only) from a prior merge alongside hour-level files
+    // (date+hour keys) if an old-timestamp roll landed in a hour leaf after a
+    // compaction. hive=true errors on that inconsistent depth (the same reason
+    // the query path disables it); we SELECT * and never read the path
+    // components as columns, so hive is irrelevant to the merge. union_by_name=
+    // true reconciles any column-order/schema drift across inputs by name. The
+    // output is a single file.
     const sql = try std.fmt.allocPrintSentinel(
         allocator,
-        "COPY (SELECT * FROM read_parquet([{s}], union_by_name=true)) TO '{s}' (FORMAT parquet, COMPRESSION zstd)",
+        "COPY (SELECT * FROM read_parquet([{s}], hive_partitioning=false, union_by_name=true)) TO '{s}' (FORMAT parquet, COMPRESSION zstd)",
         .{ list.items, escaped_out },
         0,
     );
@@ -803,6 +870,27 @@ fn removeEmptyHourDirs(allocator: Allocator, day_dir: []const u8) !void {
 /// `<day_dir>/<seq>.manifest`. Caller frees.
 fn manifestPathOwned(allocator: Allocator, day_dir: []const u8, seq: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, manifest_suffix });
+}
+
+/// True iff `day_dir` holds any unfinished-compaction artifact at the day level -
+/// a `.manifest`, a `.manifest.tmp`, or a `.building`. A fresh compactDay must
+/// not start over such a day (see compactDay step 0): only recoverCompactions
+/// may resolve it, so re-merging a partial input set can't create a second
+/// manifest that double-counts on the next startup.
+fn dayHasPendingCompaction(day_dir: []const u8) !bool {
+    var dir = fs.openDirAbsolute(day_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, manifest_suffix) or
+            std.mem.endsWith(u8, entry.name, manifest_tmp_suffix) or
+            std.mem.endsWith(u8, entry.name, building_suffix)) return true;
+    }
+    return false;
 }
 
 /// Stable hex hash over the SORTED input rel paths (NUL-joined so distinct
@@ -2243,5 +2331,106 @@ test "compaction recovery (d): manifest present, inputs deleted, building alread
     try testing.expectError(error.FileNotFound, fs.accessAbsolute(manifest_path, .{}));
     const after = try countDayFiles(a, root);
     try testing.expectEqual(@as(usize, 1), after.day_level);
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+}
+
+test "compaction: pending artifact defers a fresh compactDay (no second manifest -> no later double-count)" {
+    // Codex BLOCKER: if compactDay ran over a day that already had a committed-
+    // but-unfinished manifest, it would write a SECOND manifest/building over a
+    // now-partial input set, and the next startup recovery would publish BOTH the
+    // old (full) building and the new (partial) one - double-counting. compactDay
+    // must DEFER such a day to recovery; here we inject a committed manifest +
+    // building, then assert compactDay leaves them untouched (no extra artifacts).
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 4, 2); // 8 rows
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const building = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer a.free(building);
+    const final = try std.fmt.allocPrint(a, "{s}/{s}.parquet", .{ day_dir, seq });
+    defer a.free(final);
+    try copyMergeToParquet(a, day_dir, inputs.items, building);
+    try writeManifest(a, day_dir, seq, final, inputs.items);
+
+    // compactDay must DEFER (the pending manifest blocks it): the inputs and the
+    // single committed manifest/building survive untouched - no NEW seq artifact.
+    try compactDay(a, root, .metrics, test_sealed_date);
+    var n_manifests: usize = 0;
+    var n_buildings: usize = 0;
+    {
+        var dir = try fs.openDirAbsolute(day_dir, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |e| {
+            if (e.kind != .file) continue;
+            if (std.mem.endsWith(u8, e.name, manifest_suffix)) n_manifests += 1;
+            if (std.mem.endsWith(u8, e.name, building_suffix)) n_buildings += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), n_manifests); // only the injected one
+    try testing.expectEqual(@as(usize, 1), n_buildings);
+
+    // And recovery still completes the original compaction to exactly 8 rows.
+    try recoverCompactions(a, root);
+    try testing.expectEqual(@as(i64, 8), try dayRowCount(a, root));
+}
+
+test "compaction recovery: an unparseable committed manifest preserves its building (no data loss)" {
+    // Codex HIGH: the parse-error path leaves the manifest in place; recoverDay
+    // must therefore NOT delete that manifest's building (the only complete merged
+    // copy). Inject a committed-but-corrupt manifest + a real building, run
+    // recovery, and assert BOTH survive and no rows are lost.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 3, 2); // 6 rows
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const building = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer a.free(building);
+    try copyMergeToParquet(a, day_dir, inputs.items, building);
+
+    // Write a CORRUPT committed manifest (an unsafe `..` path -> parseManifest
+    // returns error.UnsafeManifestPath).
+    const manifest_path = try manifestPathOwned(a, day_dir, seq);
+    defer a.free(manifest_path);
+    {
+        const f = try fs.createFileAbsolute(manifest_path, .{ .mode = 0o600 });
+        defer f.close();
+        try f.writeAll("out.parquet\n../escape.parquet\n");
+    }
+
+    try recoverCompactions(a, root);
+
+    // Both the manifest AND its building must remain (the day stays un-compacted),
+    // and every original input row is still present: 6 rows, nothing lost.
+    try fs.accessAbsolute(manifest_path, .{});
+    try fs.accessAbsolute(building, .{});
     try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
 }
