@@ -624,14 +624,24 @@ pub fn main() !void {
         // ~one-per-hour-partition to ~one-per-day. Both run under the same EX-lock
         // discipline (taken internally), so they're mutually exclusive with rolls
         // and query snapshots. Compaction runs AFTER retention so it never merges
-        // a day retention is about to drop. Best-effort: a failure is logged.
+        // a day retention is about to drop.
         retention_counter += interval;
         if (retention_counter >= 3600) {
             const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
             roll_mod.runRetention(allocator, root, retention) catch |err| {
                 std.debug.print("Warning: retention cleanup failed: {}\n", .{err});
             };
+            // A PRE-COMMIT compaction failure is best-effort (the day is untouched,
+            // logged, retried next tick). A POST-COMMIT failure
+            // (CompactionCommitIncomplete) is FATAL: a committed manifest may leave
+            // rows only in a `.building` queries ignore, so we must NOT keep serving
+            // short counts. Exit so systemd restarts us; startup recoverCompactions
+            // then finishes the compaction from the durable manifest.
             roll_mod.compactSealedDays(allocator, root) catch |err| {
+                if (err == error.CompactionCommitIncomplete) {
+                    std.debug.print("FATAL: day compaction failed post-commit ({}); exiting so recovery can finish on restart\n", .{err});
+                    std.process.exit(1);
+                }
                 std.debug.print("Warning: day compaction failed: {}\n", .{err});
             };
             retention_counter = 0;
