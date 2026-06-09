@@ -579,7 +579,9 @@ pub const Collector = struct {
             defer cgroup_file.close();
 
             var cgroup_buf: [4096]u8 = undefined;
-            const cgroup_len = cgroup_file.readAll(&cgroup_buf) catch 0;
+            // Same EACCES-trace hazard as readProcessIo (see readProcFileSilent):
+            // a non-root daemon can't read other users' /proc/<pid>/cgroup.
+            const cgroup_len = readProcFileSilent(cgroup_file.handle, &cgroup_buf) orelse 0;
             if (cgroup_len == 0) break :blk try allocator.dupe(u8, "");
 
             // cgroup v2 emits a single "0::<path>" line; v1 emits several. The
@@ -611,9 +613,45 @@ pub const Collector = struct {
 
     const ProcessIo = struct { read_bytes: u64, write_bytes: u64 };
 
+    /// Read an already-open /proc/<pid>/* file into `buf`, returning the number
+    /// of bytes read (reading until EOF or `buf` is full, like File.readAll), or
+    /// null when a read failed for an expected, benign reason.
+    ///
+    /// This deliberately bypasses std.posix.read: a non-root daemon gets EACCES
+    /// reading /proc/<pid>/{io,cgroup} for processes owned by other users, and
+    /// EACCES/EPERM are not mapped to named errors there, so they fall through to
+    /// unexpectedErrno() which dumps a full stack trace to stderr (in Debug/
+    /// ReleaseSafe) before the caller's `catch` ever runs. On a non-root host
+    /// that floods the journal with one trace per unreadable process per cycle.
+    /// Reading the raw syscall and inspecting errno ourselves lets us treat the
+    /// expected errnos (EACCES/EPERM denied; ESRCH the pid exited) as "no data"
+    /// silently. EINTR is retried; anything else is also treated as no data so a
+    /// single odd process can never break the collection cycle.
+    ///
+    /// We loop rather than trust a single read: procfs reads usually return the
+    /// whole (tiny) file at once, but a short read is permitted by the API, and
+    /// silently truncating /proc/<pid>/io would zero out a process's I/O metrics.
+    fn readProcFileSilent(fd: os.linux.fd_t, buf: []u8) ?usize {
+        var total: usize = 0;
+        while (total < buf.len) {
+            const rc = os.linux.read(fd, buf.ptr + total, buf.len - total);
+            switch (os.linux.E.init(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) break; // EOF
+                    total += n;
+                },
+                .INTR => continue,
+                else => return null,
+            }
+        }
+        return total;
+    }
+
     /// Parse read_bytes/write_bytes out of /proc/[pid]/io. Never errors: any
-    /// open/read/parse failure (missing file, kernel thread, exited pid) yields
-    /// 0/0 so the collection cycle can't be broken by one unreadable process.
+    /// open/read/parse failure (missing file, kernel thread, exited pid,
+    /// permission denied) yields 0/0 so the collection cycle can't be broken by
+    /// one unreadable process.
     fn readProcessIo(pid: u32) ProcessIo {
         var io_path_buf: [64]u8 = undefined;
         const io_path = std.fmt.bufPrint(&io_path_buf, "/proc/{d}/io", .{pid}) catch return .{ .read_bytes = 0, .write_bytes = 0 };
@@ -622,7 +660,7 @@ pub const Collector = struct {
         defer io_file.close();
 
         var io_buf: [4096]u8 = undefined;
-        const io_len = io_file.readAll(&io_buf) catch return .{ .read_bytes = 0, .write_bytes = 0 };
+        const io_len = readProcFileSilent(io_file.handle, &io_buf) orelse return .{ .read_bytes = 0, .write_bytes = 0 };
 
         return parseProcessIo(io_buf[0..io_len]);
     }
@@ -1071,6 +1109,39 @@ test "readProcessIo returns 0/0 for a missing pid" {
     const io = Collector.readProcessIo(4_000_000_001);
     try std.testing.expectEqual(@as(u64, 0), io.read_bytes);
     try std.testing.expectEqual(@as(u64, 0), io.write_bytes);
+}
+
+test "readProcFileSilent reads full content and degrades silently on a bad fd" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Happy path: a readable file is read in full (the loop must not stop at a
+    // short read), matching the File.readAll behavior the helper replaced.
+    {
+        const payload = "read_bytes: 123\nwrite_bytes: 456\n";
+        try tmp.dir.writeFile(.{ .sub_path = "io", .data = payload });
+        const file = try tmp.dir.openFile("io", .{});
+        defer file.close();
+
+        var buf: [4096]u8 = undefined;
+        const n = Collector.readProcFileSilent(file.handle, &buf) orelse
+            return error.TestUnexpectedNull;
+        try std.testing.expectEqualStrings(payload, buf[0..n]);
+    }
+
+    // Failure path: a read that fails for a benign reason must degrade to null
+    // with no stack trace. A write-only fd yields EBADF here, standing in for
+    // the EACCES a non-root daemon gets on other users' /proc/<pid>/{io,cgroup}
+    // (deterministic EACCES isn't reproducible as the file's owner). Both errnos
+    // take the same `else => return null` arm, so this exercises the silent path
+    // that the old std.posix.read would have routed through unexpectedErrno().
+    {
+        const file = try tmp.dir.createFile("wo", .{ .read = false });
+        defer file.close();
+
+        var buf: [64]u8 = undefined;
+        try std.testing.expect(Collector.readProcFileSilent(file.handle, &buf) == null);
+    }
 }
 
 test "deriveUnit recognizes systemd, docker, k8s, and unknown cgroups" {
