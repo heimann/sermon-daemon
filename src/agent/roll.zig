@@ -528,8 +528,12 @@ fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8
     const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
     defer allocator.free(manifest_path);
 
-    // (6) Publish the building -> final, then fsync the dir.
-    const final_exists = pathExists(final_path);
+    // (6) Publish the building -> final, then fsync the dir. Probe the final with
+    // a CHECKED existence: only a confirmed FileNotFound takes the "publish"
+    // branch; any OTHER access error (EIO/EACCES/...) is propagated so we never
+    // mistake an unreadable final for a published one and then drop the building +
+    // manifest (which would lose rows). The manifest stays committed for retry.
+    const final_exists = try pathExistsChecked(final_path);
     if (!final_exists) {
         fs.renameAbsolute(building_path, final_path) catch |err| switch (err) {
             error.FileNotFound => {
@@ -566,12 +570,26 @@ fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8
     try fsyncDirOf(manifest_path);
 }
 
-/// True iff `path` exists (any access error other than FileNotFound also reads as
-/// "exists" so we don't mistakenly treat an EACCES'd final as absent).
+/// CONSERVATIVE existence probe: a non-FileNotFound access error reads as
+/// "exists". Used by recoverDay's keep-the-building decision, where assuming a
+/// manifest might exist is the SAFE choice (we keep the building rather than
+/// risk deleting the only merged copy).
 fn pathExists(path: []const u8) bool {
     fs.accessAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return true,
+    };
+    return true;
+}
+
+/// CHECKED existence probe: only a confirmed FileNotFound returns false; any
+/// other access error PROPAGATES. Used by completeCompaction so an unreadable
+/// final is never mistaken for a published one (which would drop the building +
+/// manifest and lose rows) - the error preserves the committed manifest for retry.
+fn pathExistsChecked(path: []const u8) !bool {
+    fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
     };
     return true;
 }
@@ -847,6 +865,18 @@ fn copyMergeToParquet(allocator: Allocator, day_dir: []const u8, inputs: []const
 fn writeManifest(allocator: Allocator, day_dir: []const u8, seq: []const u8, final_path: []const u8, inputs: []const []u8) !void {
     const out_basename = std.fs.path.basename(final_path);
 
+    // Refuse to commit an AMBIGUOUS manifest: an input whose name is not a safe
+    // rel path (e.g. contains a newline, which the newline-delimited format would
+    // split into bogus lines, making recovery delete the wrong paths). This
+    // aborts the compaction PRE-COMMIT (best-effort: the day stays untouched)
+    // rather than ever writing a manifest recovery could misread.
+    for (inputs) |rel| {
+        if (!isSafeRelPath(rel)) {
+            std.log.warn("compaction: input {s} is not a safe manifest rel path - skipping day", .{rel});
+            return error.UnsafeManifestPath;
+        }
+    }
+
     var body = std.ArrayList(u8){};
     defer body.deinit(allocator);
     try body.appendSlice(allocator, out_basename);
@@ -907,6 +937,12 @@ fn isSafeRelPath(p: []const u8) bool {
     if (p.len == 0) return false;
     if (p[0] == '/') return false;
     if (std.mem.indexOfScalar(u8, p, '\\') != null) return false;
+    // Reject ANY control char (< 0x20). The manifest is newline-delimited, so an
+    // embedded '\n'/'\r' in a filename would be split into bogus lines and make
+    // recovery delete the wrong paths (a double-count risk). Rejecting all
+    // controls is stricter than necessary but never excludes a real input (the
+    // daemon only writes `hour=HH/<seq>.parquet` / `<seq>.parquet`).
+    for (p) |ch| if (ch < 0x20) return false;
     var it = std.mem.splitScalar(u8, p, '/');
     while (it.next()) |comp| {
         if (comp.len == 0) return false; // empty component (leading/trailing/doubled `/`)
@@ -2714,6 +2750,50 @@ test "compaction recovery: a truncated manifest with <2 inputs is fatal, inputs 
     try testing.expectEqual(@as(usize, 3), after.in_hours);
     try testing.expectEqual(@as(usize, 0), after.day_level);
     try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+}
+
+test "compaction: isSafeRelPath rejects traversal, separators, controls; accepts real layout" {
+    // Codex round-6 MEDIUM: the manifest is newline-delimited delete authority,
+    // so a rel path with a newline/CR/control or odd component must be rejected.
+    try testing.expect(isSafeRelPath("hour=00/abcd1234.parquet")); // real hour-level
+    try testing.expect(isSafeRelPath("abcd1234.parquet")); // real day-level
+    try testing.expect(!isSafeRelPath("../escape.parquet"));
+    try testing.expect(!isSafeRelPath("/abs.parquet"));
+    try testing.expect(!isSafeRelPath("a\nb.parquet")); // embedded newline
+    try testing.expect(!isSafeRelPath("a\rb.parquet")); // embedded CR
+    try testing.expect(!isSafeRelPath("a\\b.parquet")); // backslash
+    try testing.expect(!isSafeRelPath("hour=00//x.parquet")); // empty component
+    try testing.expect(!isSafeRelPath("./x.parquet")); // dot component
+    try testing.expect(!isSafeRelPath("")); // empty
+}
+
+test "compaction: writeManifest refuses an input with a newline (no ambiguous manifest)" {
+    // Codex round-6 MEDIUM: writeManifest is the commit authority - it must refuse
+    // an input whose name would split into bogus manifest lines, aborting the
+    // compaction PRE-COMMIT rather than ever committing a misreadable manifest.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    const day_dir = try std.fmt.allocPrint(a, "{s}/metrics/date=2023-11-14", .{root});
+    defer a.free(day_dir);
+    try makePathAbsolute(day_dir);
+
+    var bad = [_][]u8{
+        try a.dupe(u8, "hour=00/a.parquet"),
+        try a.dupe(u8, "hour=01/b\nc.parquet"), // newline -> ambiguous
+    };
+    defer for (bad) |b| a.free(b);
+    const final = try std.fmt.allocPrint(a, "{s}/deadbeef.parquet", .{day_dir});
+    defer a.free(final);
+
+    try testing.expectError(error.UnsafeManifestPath, writeManifest(a, day_dir, "deadbeef", final, &bad));
+    // No manifest (or tmp) was committed.
+    const mpath = try manifestPathOwned(a, day_dir, "deadbeef");
+    defer a.free(mpath);
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(mpath, .{}));
 }
 
 test "compaction recovery: a fully-completed day is a clean no-op (idempotent re-run)" {
