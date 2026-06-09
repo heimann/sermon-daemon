@@ -298,6 +298,16 @@ pub fn main() !void {
         std.debug.print("Warning: orphan-temp recovery failed: {}\n", .{err});
     };
 
+    //   1b. recoverCompactions: finish or roll back any day-compaction a crash
+    //       interrupted. A committed `<seq>.manifest` replays its named-input
+    //       deletes + publish exactly; an orphan `<seq>.building` (pre-commit
+    //       crash) is dropped with its inputs left intact. Must run AFTER orphan-
+    //       temp recovery (so a re-published roll temp is a candidate input next
+    //       tick) and BEFORE any roll/query. Idempotent; no-op when there's none.
+    roll_mod.recoverCompactions(allocator, root) catch |err| {
+        std.debug.print("Warning: compaction recovery failed: {}\n", .{err});
+    };
+
     // One-shot MIGRATION: if a legacy resident metrics.db still exists at the
     // old path, COPY its rows into the parquet tree (best-effort) and rename it
     // to metrics.db.migrated (kept for rollback). A failure is logged and the
@@ -603,15 +613,22 @@ pub fn main() !void {
             }
         }
 
-        // ── RETENTION (hourly) ──
+        // ── RETENTION + COMPACTION (hourly) ──
         // Retention drops whole stale date= partitions (best-effort, non-fatal).
-        // Compaction is a DEFERRED follow-up: queries tolerate the file count at
-        // the current roll cadence, and retention bounds the tree.
+        // Compaction then merges each SEALED day (a date= dir older than today/
+        // UTC) into one day-level file, shrinking the per-query file count from
+        // ~one-per-hour-partition to ~one-per-day. Both run under the same EX-lock
+        // discipline (taken internally), so they're mutually exclusive with rolls
+        // and query snapshots. Compaction runs AFTER retention so it never merges
+        // a day retention is about to drop. Best-effort: a failure is logged.
         retention_counter += interval;
         if (retention_counter >= 3600) {
             const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
             roll_mod.runRetention(allocator, root, retention) catch |err| {
                 std.debug.print("Warning: retention cleanup failed: {}\n", .{err});
+            };
+            roll_mod.compactSealedDays(allocator, root) catch |err| {
+                std.debug.print("Warning: day compaction failed: {}\n", .{err});
             };
             retention_counter = 0;
         }
