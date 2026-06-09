@@ -486,16 +486,32 @@ fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8
         return error.UnsafeManifestPath;
     }
 
+    // A real compaction only commits when it merged >= 2 inputs, so a committed
+    // manifest must list >= 2 inputs. A truncated-but-parseable manifest with 0-1
+    // inputs (e.g. just the output line) would otherwise publish the building
+    // while leaving the original inputs in place - a double-count. Treat it as a
+    // corrupt committed manifest (fatal) rather than completing.
+    if (input_rels.len < 2) {
+        std.log.warn("compaction completion: manifest lists {d} inputs (<2) - corrupt, refusing", .{input_rels.len});
+        return error.EmptyManifest;
+    }
+
     // Every input the manifest authorizes us to DELETE must be a committed
-    // `.parquet` (the only thing a compaction ever consumes). Requiring the
-    // `.parquet` suffix rejects a parseable-but-corrupt manifest that lists a
-    // reserved artifact - `<seq>.manifest`, `<seq>.parquet.building`, or any
-    // non-parquet file - so recovery can never delete its own marker/building or
-    // an unrelated file before publishing. `.parquet.building`/`.manifest` end in
-    // `.building`/`.manifest`, so they fail this check.
+    // `.parquet` (the only thing a compaction ever consumes) AND must not be the
+    // output basename itself. Requiring the `.parquet` suffix rejects a parseable-
+    // but-corrupt manifest that lists a reserved artifact - `<seq>.manifest`,
+    // `<seq>.parquet.building`, or any non-parquet file. Rejecting an input equal
+    // to `out_basename` prevents recovery (after a crash that left the final
+    // published but the manifest present) from deleting the published final as an
+    // "input" and then failing with no merged copy left. `.parquet.building` /
+    // `.manifest` end in `.building`/`.manifest`, so they fail the suffix check.
     for (input_rels) |rel| {
         if (!std.mem.endsWith(u8, rel, ".parquet")) {
             std.log.warn("compaction completion: manifest input {s} is not a `.parquet` - refusing", .{rel});
+            return error.UnsafeManifestPath;
+        }
+        if (std.mem.eql(u8, rel, out_basename)) {
+            std.log.warn("compaction completion: manifest input {s} equals the output - refusing", .{rel});
             return error.UnsafeManifestPath;
         }
     }
@@ -2627,21 +2643,76 @@ test "compaction recovery: a manifest listing a non-parquet input is refused, no
     defer a.free(building);
     try copyMergeToParquet(a, day_dir, inputs.items, building);
 
-    // Committed manifest whose output is correct but whose INPUT line is the
-    // building basename (ends in `.building`, not `.parquet`) -> refused.
+    // Committed manifest with the correct output and 2 input lines, one of which
+    // is the building basename (ends in `.building`, not `.parquet`) -> the
+    // parquet-suffix input check refuses it (and the >=2 input count is met, so
+    // it is the suffix check, not the count check, that fires).
     const manifest_path = try manifestPathOwned(a, day_dir, seq);
     defer a.free(manifest_path);
     {
-        const body = try std.fmt.allocPrint(a, "{s}.parquet\n{s}{s}\n", .{ seq, seq, building_suffix });
+        var body = std.ArrayList(u8){};
+        defer body.deinit(a);
+        try body.appendSlice(a, seq);
+        try body.appendSlice(a, ".parquet\n"); // output line
+        try body.appendSlice(a, inputs.items[0]); // a real `.parquet` input
+        try body.append(a, '\n');
+        try body.appendSlice(a, seq); // and the reserved building artifact
+        try body.appendSlice(a, building_suffix);
+        try body.append(a, '\n');
+        const f = try fs.createFileAbsolute(manifest_path, .{ .mode = 0o600 });
+        defer f.close();
+        try f.writeAll(body.items);
+    }
+
+    try testing.expectError(error.UnsafeManifestPath, recoverCompactions(a, root));
+    // The building and all real inputs survive (nothing was deleted): 6 rows.
+    try fs.accessAbsolute(building, .{});
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+}
+
+test "compaction recovery: a truncated manifest with <2 inputs is fatal, inputs kept" {
+    // Codex round-5 HIGH: a committed manifest listing fewer than 2 inputs (e.g.
+    // just the output line, from a truncating crash) must NOT publish the building
+    // while leaving the originals - that double-counts. It is fatal and the day is
+    // preserved.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 3, 2); // 6 rows
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const building = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer a.free(building);
+    try copyMergeToParquet(a, day_dir, inputs.items, building);
+
+    // Manifest with ONLY the output line (a truncated commit).
+    const manifest_path = try manifestPathOwned(a, day_dir, seq);
+    defer a.free(manifest_path);
+    {
+        const body = try std.fmt.allocPrint(a, "{s}.parquet\n", .{seq});
         defer a.free(body);
         const f = try fs.createFileAbsolute(manifest_path, .{ .mode = 0o600 });
         defer f.close();
         try f.writeAll(body);
     }
 
-    try testing.expectError(error.UnsafeManifestPath, recoverCompactions(a, root));
-    // The building and all real inputs survive (nothing was deleted): 6 rows.
-    try fs.accessAbsolute(building, .{});
+    try testing.expectError(error.EmptyManifest, recoverCompactions(a, root));
+    // The original inputs are untouched (the building was NOT published over them).
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 3), after.in_hours);
+    try testing.expectEqual(@as(usize, 0), after.day_level);
     try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
 }
 
