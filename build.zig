@@ -34,6 +34,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // OTLP local collector (plan 26). Pure OTLP/JSON parsing + log-record
+    // mapping today; the std.http.Server listen loop lands in a later phase
+    // (gated behind receiver_enabled = false). Depends only on `logs` for the
+    // canonical on-host log representation it maps into.
+    const otlp_receiver_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/otlp_receiver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    otlp_receiver_mod.addImport("logs", logs_mod);
+
     const proxmox_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/proxmox.zig"),
         .target = target,
@@ -122,6 +133,7 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("proc_self", proc_self_mod);
     agent_mod.addImport("proxmox", proxmox_mod);
     agent_mod.addImport("push", push_mod);
+    agent_mod.addImport("otlp_receiver", otlp_receiver_mod);
     agent_mod.addImport("storage", storage_mod);
     agent_mod.addImport("staging", staging_mod);
     agent_mod.addImport("roll", roll_mod);
@@ -241,6 +253,38 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const otlp_receiver_tests = b.addTest(.{
+        .root_module = otlp_receiver_mod,
+    });
+
+    // Tests for the daemon entrypoint (Config parsing, incl. plan 26 OTLP
+    // receiver fields). Mirrors the agent module's imports + duckdb linkage so
+    // the test binary compiles; only the `test` blocks run.
+    const agent_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    agent_test_mod.addImport("collector", collector_mod);
+    agent_test_mod.addImport("logs", logs_mod);
+    agent_test_mod.addImport("rules", rules_mod);
+    agent_test_mod.addImport("proc_self", proc_self_mod);
+    agent_test_mod.addImport("proxmox", proxmox_mod);
+    agent_test_mod.addImport("push", push_mod);
+    agent_test_mod.addImport("otlp_receiver", otlp_receiver_mod);
+    agent_test_mod.addImport("storage", storage_mod);
+    agent_test_mod.addImport("staging", staging_mod);
+    agent_test_mod.addImport("roll", roll_mod);
+    agent_test_mod.addIncludePath(b.path("lib"));
+    agent_test_mod.addLibraryPath(b.path("lib"));
+    agent_test_mod.linkSystemLibrary("duckdb", .{});
+
+    const agent_tests = b.addTest(.{
+        .root_module = agent_test_mod,
+    });
+    agent_tests.addRPath(b.path("lib"));
+
     const proxmox_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/agent/proxmox.zig"),
@@ -267,6 +311,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(rules_tests).step);
     test_step.dependOn(&b.addRunArtifact(push_tests).step);
     test_step.dependOn(&b.addRunArtifact(proc_self_tests).step);
+    test_step.dependOn(&b.addRunArtifact(otlp_receiver_tests).step);
+    test_step.dependOn(&b.addRunArtifact(agent_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxmox_tests).step);
     test_step.dependOn(&b.addRunArtifact(staging_tests).step);
     test_step.dependOn(&b.addRunArtifact(roll_tests).step);
