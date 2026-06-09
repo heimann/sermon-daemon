@@ -56,6 +56,9 @@ pub const RollError = error{
     CopyError,
     SyncError,
     CompactionOutputMissing,
+    CompactionCommitIncomplete,
+    EmptyManifest,
+    UnsafeManifestPath,
     OutOfMemory,
 };
 
@@ -372,8 +375,15 @@ pub fn compactSealedDays(allocator: Allocator, root: []const u8) !void {
 
         for (days.items) |date_str| {
             compactDay(allocator, root, table, date_str) catch |err| {
-                std.log.warn("compaction: day {s}/{s} failed: {} - continuing", .{ table.name(), date_str, err });
                 _ = malloc_trim(0);
+                // A POST-COMMIT failure (CommitIncomplete) is FATAL: the manifest
+                // is committed and rows may live only in the un-published building,
+                // which queries ignore. Propagate so the daemon stops serving short
+                // counts; a restart's recoverCompactions finishes from the durable
+                // manifest. A PRE-COMMIT failure touched no inputs (the day is
+                // exactly as before) - log it and move to the next day.
+                if (err == error.CompactionCommitIncomplete) return err;
+                std.log.warn("compaction: day {s}/{s} failed pre-commit: {} - continuing", .{ table.name(), date_str, err });
             };
         }
     }
@@ -437,13 +447,19 @@ pub fn compactDay(allocator: Allocator, root: []const u8, table: Table, date_str
     // (5)-(7) Delete inputs, publish the building, drop the manifest. This is the
     // SAME completion logic startup recovery replays from the committed manifest
     // (completeCompaction), so the live path and the crash path are identical.
-    // Errors PROPAGATE (not best-effort): the manifest stays committed and the
-    // building durable, so a restart's recoverCompactions finishes the exact same
-    // step. compactSealedDays logs the error and moves to the next day; the half-
-    // done day is repaired on the next daemon start. Never leaves a partial state
-    // a later compaction could double-count - the committed manifest pins it.
+    //
+    // A failure HERE is POST-COMMIT: the manifest is committed and rows may live
+    // only in the (queries-ignore-it) building until the merge is published. We
+    // surface it as a DISTINCT `CompactionCommitIncomplete` so compactSealedDays
+    // treats it as FATAL (vs a best-effort pre-commit failure, which left every
+    // input untouched). The committed manifest pins the exact recovery step, so a
+    // restart's recoverCompactions finishes it - never leaving a partial state a
+    // later compaction could double-count.
     const out_basename = std.fs.path.basename(final_path);
-    try completeCompaction(allocator, day_dir, seq, inputs.items, out_basename);
+    completeCompaction(allocator, day_dir, seq, inputs.items, out_basename) catch |err| {
+        std.log.err("compaction: day {s}/{s} completion failed post-commit: {} - manifest committed, recovery will finish on restart", .{ table.name(), date_str, err });
+        return error.CompactionCommitIncomplete;
+    };
     _ = malloc_trim(0);
 }
 
@@ -457,6 +473,15 @@ pub fn compactDay(allocator: Allocator, root: []const u8, table: Table, date_str
 /// next recoverCompactions to retry - we never delete the manifest (the recovery
 /// marker) unless the merged file is durably published.
 fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8, input_rels: []const []u8, out_basename: []const u8) !void {
+    // The output line is durable recovery authority; validate it is a bare
+    // basename (no path separator, no `..`) so a tampered manifest cannot make us
+    // publish/drop a file outside the day dir. Compaction always writes
+    // `<seq>.parquet`, so require exactly that.
+    if (std.mem.indexOfScalar(u8, out_basename, '/') != null or !std.mem.endsWith(u8, out_basename, ".parquet")) {
+        std.log.err("compaction completion: manifest output basename {s} is not a plain `<seq>.parquet` - refusing", .{out_basename});
+        return error.UnsafeManifestPath;
+    }
+
     // (5) Delete each named input still present (FileNotFound tolerated so a
     // retried completion finishes), then rmdir emptied hour dirs.
     try deleteInputs(allocator, day_dir, input_rels);
@@ -489,16 +514,22 @@ fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8
         try fsyncDirOf(final_path);
     } else {
         // Final already published (crash after step 6, before step 7): drop the
-        // now-redundant leftover building. Its absence is fine.
+        // now-redundant leftover building, then fsync so the deletion is durable.
         fs.deleteFileAbsolute(building_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
+        try fsyncDirOf(building_path);
     }
 
-    // (7) Drop the manifest - the compaction is fully done. Only reached once the
-    // merged file is durably published, so the rows are never stranded.
+    // (7) Drop the manifest, then fsync the dir so the removal is DURABLE. The
+    // manifest delete is part of the crash protocol: without the fsync a crash
+    // here could resurrect the committed manifest, forcing recovery to replay an
+    // already-complete compaction (and possibly hit CompactionOutputMissing once
+    // the building is gone). Only reached after the merged file is durably
+    // published, so the rows are never stranded.
     try fs.deleteFileAbsolute(manifest_path);
+    try fsyncDirOf(manifest_path);
 }
 
 /// True iff `path` exists (any access error other than FileNotFound also reads as
@@ -642,12 +673,20 @@ fn recoverFromManifest(allocator: Allocator, day_dir: []const u8, seq: []const u
     const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
     defer allocator.free(manifest_path);
 
+    // A committed manifest is the recovery AUTHORITY: a crash may have already
+    // deleted some of its inputs, so we cannot safely "leave the day uncompacted"
+    // if we can't read it - those rows might survive ONLY in the building. A
+    // truncated/garbage/empty committed manifest is therefore FATAL (propagated):
+    // startup aborts, the manifest + building are preserved on disk, and a human
+    // can inspect rather than the daemon silently serving a short count. (The
+    // building itself stays put: recoverDay's orphan loop skips any building whose
+    // manifest still exists.)
     var entries = parseManifest(allocator, manifest_path) catch |err| {
-        // A truncated/garbage manifest cannot be trusted to name inputs; leaving
-        // it (and the building) in place is the safe choice - inputs stay intact,
-        // the day is just un-compacted. Log and move on.
-        std.log.warn("compaction recovery: cannot parse manifest {s}: {} - leaving day uncompacted", .{ manifest_path, err });
-        return;
+        // Logged at warn (the FATAL signal is the propagated error + main.zig's
+        // abort, not the log level); err-level here would also trip the test
+        // runner's "logged errors" check on the deliberate fatal-path test.
+        std.log.warn("compaction recovery: cannot parse committed manifest {s}: {} - aborting (preserved for inspection)", .{ manifest_path, err });
+        return err;
     };
     defer {
         for (entries.items) |e| allocator.free(e);
@@ -656,8 +695,8 @@ fn recoverFromManifest(allocator: Allocator, day_dir: []const u8, seq: []const u
 
     // Manifest layout: line 0 = output basename, lines 1.. = input rel paths.
     if (entries.items.len == 0) {
-        std.log.warn("compaction recovery: empty manifest {s} - leaving day uncompacted", .{manifest_path});
-        return;
+        std.log.warn("compaction recovery: empty committed manifest {s} - aborting (preserved for inspection)", .{manifest_path});
+        return error.EmptyManifest;
     }
     const out_basename = entries.items[0];
     const input_rels = entries.items[1..];
@@ -2389,11 +2428,11 @@ test "compaction: pending artifact defers a fresh compactDay (no second manifest
     try testing.expectEqual(@as(i64, 8), try dayRowCount(a, root));
 }
 
-test "compaction recovery: an unparseable committed manifest preserves its building (no data loss)" {
-    // Codex HIGH: the parse-error path leaves the manifest in place; recoverDay
-    // must therefore NOT delete that manifest's building (the only complete merged
-    // copy). Inject a committed-but-corrupt manifest + a real building, run
-    // recovery, and assert BOTH survive and no rows are lost.
+test "compaction recovery: an unparseable committed manifest is FATAL and preserves its building + inputs" {
+    // Codex HIGH: a committed manifest is recovery authority - a crash may have
+    // already deleted some of its inputs, so an unreadable one cannot be safely
+    // skipped. Recovery must ABORT (propagate the error) and leave the manifest +
+    // building + every input on disk for inspection - never silently proceed.
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2417,7 +2456,7 @@ test "compaction recovery: an unparseable committed manifest preserves its build
     try copyMergeToParquet(a, day_dir, inputs.items, building);
 
     // Write a CORRUPT committed manifest (an unsafe `..` path -> parseManifest
-    // returns error.UnsafeManifestPath).
+    // returns error.UnsafeManifestPath, which recovery propagates as fatal).
     const manifest_path = try manifestPathOwned(a, day_dir, seq);
     defer a.free(manifest_path);
     {
@@ -2426,11 +2465,35 @@ test "compaction recovery: an unparseable committed manifest preserves its build
         try f.writeAll("out.parquet\n../escape.parquet\n");
     }
 
-    try recoverCompactions(a, root);
+    // Recovery ABORTS rather than completing or skipping.
+    try testing.expectError(error.UnsafeManifestPath, recoverCompactions(a, root));
 
-    // Both the manifest AND its building must remain (the day stays un-compacted),
-    // and every original input row is still present: 6 rows, nothing lost.
+    // Manifest, building, and all original inputs survive: nothing lost, the day
+    // is left exactly as the crash left it for a human / a later release.
     try fs.accessAbsolute(manifest_path, .{});
     try fs.accessAbsolute(building, .{});
     try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+}
+
+test "compaction recovery: a fully-completed day is a clean no-op (idempotent re-run)" {
+    // Guards the durability concern: once a compaction is complete (manifest gone,
+    // single day-level file), a later recovery pass must NOT touch it - no
+    // resurrected manifest, no CompactionOutputMissing, rowcount stable.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 4, 2); // 8 rows
+    try compactDay(a, root, .metrics, test_sealed_date);
+    try testing.expectEqual(@as(i64, 8), try dayRowCount(a, root));
+
+    // Two more recovery passes: each is a no-op, the day file + rowcount stay put.
+    try recoverCompactions(a, root);
+    try recoverCompactions(a, root);
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 1), after.day_level);
+    try testing.expectEqual(@as(usize, 0), after.in_hours);
+    try testing.expectEqual(@as(i64, 8), try dayRowCount(a, root));
 }
