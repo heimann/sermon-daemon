@@ -297,6 +297,543 @@ fn dayStartUnix(date_str: []const u8) ?i64 {
 }
 
 // ============================================================================
+// Day-level compaction (plan 25 follow-up)
+// ============================================================================
+//
+// GRAIN: one file per table per SEALED day. With a ~1h roll interval each
+// `hour=HH` leaf already holds ~1 parquet, so the file count a query pays for is
+// the NUMBER of hour-partitions (~24/day, ~168 over the 7-day window). Compaction
+// merges a whole sealed `date=YYYY-MM-DD` directory (one strictly OLDER than
+// today/UTC, so we never fight an active roll into today's hour leaf) into a
+// SINGLE file `<root>/<table>/date=YYYY-MM-DD/<seq>.parquet` - note the merged
+// file sits at the DAY level, NOT under an `hour=` subdir - and then removes the
+// day's `hour=*` subdirs.
+//
+// CRASH PROTOCOL (per-compaction MANIFEST): the prior, removed compaction
+// attempt double-counted twice because its recovery deleted "all files except
+// the new one", which raced concurrent rolls and stacked crashes. The manifest
+// fixes that by naming EXACTLY the inputs to delete, so recovery can never touch
+// a file the compaction did not consume. For a sealed day dir D of table T,
+// under LOCK_EX:
+//   1. Enumerate every `.parquet` under D (recursively) -> input set I. |I|<=1: skip.
+//   2. seq = stable hash of the SORTED input relative paths (deterministic ->
+//      an interrupted compaction re-runs to the SAME output name, idempotent).
+//   3. COPY the merge to `D/<seq>.parquet.building`; fsync the file AND D.
+//   4. Write `D/<seq>.manifest.tmp` (output basename + each input rel path),
+//      fsync it, atomic-rename -> `D/<seq>.manifest` = COMMIT POINT, fsync D.
+//   5. Delete every input in I; rmdir the now-empty `hour=*` subdirs.
+//   6. Rename `D/<seq>.parquet.building` -> `D/<seq>.parquet`; fsync D.
+//   7. Delete `D/<seq>.manifest`.
+// `.manifest`/`.building` end in neither `.parquet` nor `.parquet.tmp`, so the
+// query glob (collectParquetFiles) and recoverOrphanTemps both ignore them.
+
+const building_suffix = ".parquet.building";
+const manifest_suffix = ".manifest";
+const manifest_tmp_suffix = ".manifest.tmp";
+
+/// Compact every SEALED day (a `date=` dir strictly older than today/UTC) of
+/// every table that still has more than one parquet file or any `hour=` subdir.
+/// Runs each day's merge under LOCK_EX (the same discipline as the roll and
+/// retention) so it is mutually exclusive with rolls and query snapshots. Few
+/// such dirs exist per hourly tick. Best-effort per day: a failure on one is
+/// logged and the rest still proceed.
+pub fn compactSealedDays(allocator: Allocator, root: []const u8) !void {
+    const today = todayUtcDays();
+    for (Table.all) |table| {
+        const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+        defer allocator.free(table_dir);
+
+        var dir = fs.openDirAbsolute(table_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+
+        // Collect candidate sealed-day directory NAMES first (a single iterate),
+        // then close the iterator before mutating the tree under each compaction.
+        var days = std.ArrayList([]u8){};
+        defer {
+            for (days.items) |d| allocator.free(d);
+            days.deinit(allocator);
+        }
+        {
+            defer dir.close();
+            var it = dir.iterate();
+            while (try it.next()) |entry| {
+                if (entry.kind != .directory) continue;
+                if (!std.mem.startsWith(u8, entry.name, "date=")) continue;
+                const day = dayIndexFromName(entry.name["date=".len..]) orelse continue;
+                // SEALED guard: only days strictly OLDER than today (UTC). Today's
+                // dir still receives active rolls, so leave it untouched.
+                if (day >= today) continue;
+                try days.append(allocator, try allocator.dupe(u8, entry.name["date=".len..]));
+            }
+        }
+
+        for (days.items) |date_str| {
+            compactDay(allocator, root, table, date_str) catch |err| {
+                std.log.warn("compaction: day {s}/{s} failed: {} - continuing", .{ table.name(), date_str, err });
+                _ = malloc_trim(0);
+            };
+        }
+    }
+}
+
+/// Compact one sealed day directory `<root>/<table>/date=<date_str>` into a
+/// single day-level `<seq>.parquet`, following the 7-step manifest protocol in
+/// the section header. Takes LOCK_EX for the whole critical section. A no-op
+/// (returns without writing) when the day has <= 1 input parquet.
+pub fn compactDay(allocator: Allocator, root: []const u8, table: Table, date_str: []const u8) !void {
+    var lock_file = try staging.openRollLock(root, allocator);
+    defer lock_file.close();
+    try std.posix.flock(lock_file.handle, std.posix.LOCK.EX);
+    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
+
+    const day_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/date={s}", .{ root, table.name(), date_str });
+    defer allocator.free(day_dir);
+
+    // (1) Enumerate every committed `.parquet` under the day dir, recursively,
+    // as paths RELATIVE to the day dir (the manifest records relative paths so a
+    // moved root still recovers, and the seq hash is root-independent).
+    var inputs = try collectDayInputs(allocator, day_dir);
+    defer {
+        for (inputs.items) |p| allocator.free(p);
+        inputs.deinit(allocator);
+    }
+    if (inputs.items.len <= 1) return; // nothing to merge
+
+    // (2) Stable seq from the SORTED input relative paths -> deterministic output
+    // name, so an interrupted+retried compaction targets the SAME files.
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(allocator, inputs.items);
+    defer allocator.free(seq);
+
+    const building_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer allocator.free(building_path);
+    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}.parquet", .{ day_dir, seq });
+    defer allocator.free(final_path);
+
+    // (3) Merge all inputs into the `.building` file, then fsync file + dir.
+    try copyMergeToParquet(allocator, day_dir, inputs.items, building_path);
+    try fsyncFileAndDir(building_path);
+
+    // (4) Write + fsync the manifest tmp, then atomic-rename to the committed
+    // manifest = COMMIT POINT. After this, recovery completes the deletion +
+    // publish even across a crash; before it, recovery just drops the building.
+    try writeManifest(allocator, day_dir, seq, final_path, inputs.items);
+
+    // (5) Delete the named inputs; rmdir emptied `hour=*` subdirs.
+    try deleteInputs(allocator, day_dir, inputs.items);
+    try removeEmptyHourDirs(allocator, day_dir);
+
+    // (6) Publish the merged file, fsync dir.
+    try fs.renameAbsolute(building_path, final_path);
+    try fsyncDirOf(final_path);
+
+    // (7) Drop the manifest - the compaction is fully done.
+    const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
+    defer allocator.free(manifest_path);
+    fs.deleteFileAbsolute(manifest_path) catch {};
+    _ = malloc_trim(0);
+}
+
+/// Recover compactions a crash interrupted, across every table's `date=` dir.
+/// Call at daemon STARTUP under LOCK_EX, AFTER recoverOrphanTemps and BEFORE the
+/// loop. Two cases per day dir:
+///
+///   - a `<seq>.manifest` exists (compaction was PAST its commit point): replay
+///     steps 5-7 deterministically - delete any of the manifest's named inputs
+///     still present, rmdir emptied `hour=` dirs, then publish `<seq>.building`
+///     to `<seq>.parquet` (or drop the building if the final already exists),
+///     then delete the manifest. This deletes EXACTLY the manifest's inputs -
+///     never a concurrently-rolled file, never a prior merge.
+///   - a `<seq>.building` WITHOUT a matching `.manifest` (crash BEFORE commit):
+///     delete the building. Its inputs are all still present and intact.
+///
+/// Idempotent and safe when there is nothing to recover.
+pub fn recoverCompactions(allocator: Allocator, root: []const u8) !void {
+    for (Table.all) |table| {
+        const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
+        defer allocator.free(table_dir);
+
+        var dir = fs.openDirAbsolute(table_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+
+        var day_names = std.ArrayList([]u8){};
+        defer {
+            for (day_names.items) |d| allocator.free(d);
+            day_names.deinit(allocator);
+        }
+        {
+            defer dir.close();
+            var it = dir.iterate();
+            while (try it.next()) |entry| {
+                if (entry.kind != .directory) continue;
+                if (!std.mem.startsWith(u8, entry.name, "date=")) continue;
+                try day_names.append(allocator, try allocator.dupe(u8, entry.name));
+            }
+        }
+
+        for (day_names.items) |day_name| {
+            const day_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ table_dir, day_name });
+            defer allocator.free(day_dir);
+            try recoverDay(allocator, day_dir);
+        }
+    }
+}
+
+/// Recover one day dir: handle every `<seq>.manifest` (committed) and every
+/// orphan `<seq>.building` without a manifest (pre-commit crash).
+fn recoverDay(allocator: Allocator, day_dir: []const u8) !void {
+    // Collect manifest + building basenames in a single non-recursive scan of
+    // the day dir (manifests/buildings only ever sit at the day level).
+    var manifests = std.ArrayList([]u8){};
+    defer {
+        for (manifests.items) |m| allocator.free(m);
+        manifests.deinit(allocator);
+    }
+    var buildings = std.ArrayList([]u8){};
+    defer {
+        for (buildings.items) |b| allocator.free(b);
+        buildings.deinit(allocator);
+    }
+
+    {
+        var dir = fs.openDirAbsolute(day_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, manifest_tmp_suffix)) {
+                // An un-renamed manifest tmp is a pre-commit crash artifact: the
+                // committed `.manifest` never appeared, so treat it like an
+                // orphan and delete it (its building, if any, is handled below).
+                const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, entry.name });
+                defer allocator.free(p);
+                fs.deleteFileAbsolute(p) catch {};
+            } else if (std.mem.endsWith(u8, entry.name, manifest_suffix)) {
+                try manifests.append(allocator, try allocator.dupe(u8, entry.name));
+            } else if (std.mem.endsWith(u8, entry.name, building_suffix)) {
+                try buildings.append(allocator, try allocator.dupe(u8, entry.name));
+            }
+        }
+    }
+
+    // Committed manifests FIRST: each replays steps 5-7, which either renames its
+    // `<seq>.building` to the final or drops it - so after this loop a building
+    // that had a manifest no longer exists on disk.
+    for (manifests.items) |manifest_name| {
+        const seq = manifest_name[0 .. manifest_name.len - manifest_suffix.len];
+        try recoverFromManifest(allocator, day_dir, seq);
+    }
+
+    // Remaining buildings are orphans (crash BEFORE the manifest commit): delete
+    // them. The inputs were never touched, so dropping the building loses nothing.
+    // A building already consumed by a manifest above is gone, so its delete here
+    // is a harmless FileNotFound no-op - no need to track which seqs were handled.
+    for (buildings.items) |building_name| {
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, building_name });
+        defer allocator.free(p);
+        fs.deleteFileAbsolute(p) catch {};
+    }
+}
+
+/// Replay steps 5-7 for a committed `<seq>.manifest`: delete the listed inputs
+/// still present, rmdir emptied `hour=` dirs, publish the building (or drop it if
+/// the final already exists), then delete the manifest.
+fn recoverFromManifest(allocator: Allocator, day_dir: []const u8, seq: []const u8) !void {
+    const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
+    defer allocator.free(manifest_path);
+
+    var entries = parseManifest(allocator, manifest_path) catch |err| {
+        // A truncated/garbage manifest cannot be trusted to name inputs; leaving
+        // it (and the building) in place is the safe choice - inputs stay intact,
+        // the day is just un-compacted. Log and move on.
+        std.log.warn("compaction recovery: cannot parse manifest {s}: {} - leaving day uncompacted", .{ manifest_path, err });
+        return;
+    };
+    defer {
+        for (entries.items) |e| allocator.free(e);
+        entries.deinit(allocator);
+    }
+
+    // Manifest layout: line 0 = output basename, lines 1.. = input rel paths.
+    if (entries.items.len == 0) {
+        std.log.warn("compaction recovery: empty manifest {s} - leaving day uncompacted", .{manifest_path});
+        return;
+    }
+    const out_basename = entries.items[0];
+    const input_rels = entries.items[1..];
+
+    // (5) Delete each named input still present, then rmdir emptied hour dirs.
+    for (input_rels) |rel| {
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, rel });
+        defer allocator.free(p);
+        fs.deleteFileAbsolute(p) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+    try removeEmptyHourDirs(allocator, day_dir);
+
+    // (6) Publish the building -> final. If the final already exists (crash after
+    // step 6 but before step 7), just drop the leftover building.
+    const building_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer allocator.free(building_path);
+    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, out_basename });
+    defer allocator.free(final_path);
+
+    const final_exists = blk: {
+        fs.accessAbsolute(final_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (final_exists) {
+        fs.deleteFileAbsolute(building_path) catch {};
+    } else {
+        fs.renameAbsolute(building_path, final_path) catch |err| switch (err) {
+            // No building and no final = both gone; nothing to publish. Fall
+            // through to drop the manifest so we don't loop on it.
+            error.FileNotFound => {},
+            else => return err,
+        };
+        fsyncDirOf(final_path) catch {};
+    }
+
+    // (7) Drop the manifest - the compaction is complete.
+    fs.deleteFileAbsolute(manifest_path) catch {};
+}
+
+/// Enumerate every committed `.parquet` under `day_dir`, recursively, as paths
+/// RELATIVE to `day_dir`. Skips in-flight `.parquet.tmp` (a roll temp) and the
+/// `.building` (a prior interrupted compaction's output) so neither is consumed
+/// as an input. Caller frees each item + the list.
+fn collectDayInputs(allocator: Allocator, day_dir: []const u8) !std.ArrayList([]u8) {
+    var out = std.ArrayList([]u8){};
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+
+    var dir = fs.openDirAbsolute(day_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return out,
+        else => return err,
+    };
+    defer dir.close();
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        // Match ONLY committed `.parquet`. `.parquet.tmp` and `.building` both
+        // fail endsWith(".parquet") in a way that excludes them: `.parquet.tmp`
+        // ends in ".tmp" and `.building` ends in ".building". Be explicit.
+        if (!std.mem.endsWith(u8, entry.basename, ".parquet")) continue;
+        try out.append(allocator, try allocator.dupe(u8, entry.path));
+    }
+    return out;
+}
+
+/// COPY the union of `inputs` (paths relative to `day_dir`) into `out_path` as a
+/// single zstd parquet, via a transient in-memory DuckDB. read_parquet reads the
+/// explicit absolute-path list (NOT a glob) so exactly the named inputs merge.
+fn copyMergeToParquet(allocator: Allocator, day_dir: []const u8, inputs: []const []u8, out_path: []const u8) !void {
+    var db: c.duckdb_database = undefined;
+    if (c.duckdb_open(":memory:", &db) == c.DuckDBError) return RollError.DatabaseError;
+    defer c.duckdb_close(&db);
+    var conn: c.duckdb_connection = undefined;
+    if (c.duckdb_connect(db, &conn) == c.DuckDBError) return RollError.ConnectionError;
+    defer c.duckdb_disconnect(&conn);
+
+    // Build the escaped, single-quoted, comma-separated absolute-path list.
+    var list = std.ArrayList(u8){};
+    defer list.deinit(allocator);
+    for (inputs, 0..) |rel, idx| {
+        if (idx != 0) try list.append(allocator, ',');
+        const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, rel });
+        defer allocator.free(abs);
+        const escaped = try escapeSqlLiteral(allocator, abs);
+        defer allocator.free(escaped);
+        try list.append(allocator, '\'');
+        try list.appendSlice(allocator, escaped);
+        try list.append(allocator, '\'');
+    }
+
+    const escaped_out = try escapeSqlLiteral(allocator, out_path);
+    defer allocator.free(escaped_out);
+
+    // union_by_name=true reconciles any column-order/schema drift across the
+    // merged inputs by name (hive_partitioning is irrelevant here: we SELECT *
+    // and the path components are not read as columns). The output is one file.
+    const sql = try std.fmt.allocPrintSentinel(
+        allocator,
+        "COPY (SELECT * FROM read_parquet([{s}], union_by_name=true)) TO '{s}' (FORMAT parquet, COMPRESSION zstd)",
+        .{ list.items, escaped_out },
+        0,
+    );
+    defer allocator.free(sql);
+
+    var result: c.duckdb_result = undefined;
+    const state = c.duckdb_query(conn, sql.ptr, &result);
+    defer c.duckdb_destroy_result(&result);
+    if (state == c.DuckDBError) {
+        std.log.err("compaction COPY merge error: {s}", .{c.duckdb_result_error(&result)});
+        return RollError.CopyError;
+    }
+    _ = malloc_trim(0);
+}
+
+/// Write `<day_dir>/<seq>.manifest.tmp` (output basename on line 0, each input
+/// rel path on its own line), fsync it, then atomic-rename to
+/// `<day_dir>/<seq>.manifest` and fsync the dir. The rename is the COMMIT POINT.
+fn writeManifest(allocator: Allocator, day_dir: []const u8, seq: []const u8, final_path: []const u8, inputs: []const []u8) !void {
+    const out_basename = std.fs.path.basename(final_path);
+
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, out_basename);
+    try body.append(allocator, '\n');
+    for (inputs) |rel| {
+        try body.appendSlice(allocator, rel);
+        try body.append(allocator, '\n');
+    }
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, manifest_tmp_suffix });
+    defer allocator.free(tmp_path);
+    const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
+    defer allocator.free(manifest_path);
+
+    {
+        const f = try fs.createFileAbsolute(tmp_path, .{ .mode = 0o600 });
+        defer f.close();
+        try f.writeAll(body.items);
+        try f.sync();
+    }
+    try fs.renameAbsolute(tmp_path, manifest_path); // COMMIT POINT
+    try fsyncDirOf(manifest_path);
+}
+
+/// Parse a manifest into its newline-separated entries (line 0 = output
+/// basename, the rest = input rel paths). Rejects any entry with a leading `/`
+/// or a `..` path component so a tampered manifest cannot escape the day dir on
+/// delete. Caller frees each item + the list.
+fn parseManifest(allocator: Allocator, manifest_path: []const u8) !std.ArrayList([]u8) {
+    var out = std.ArrayList([]u8){};
+    errdefer {
+        for (out.items) |e| allocator.free(e);
+        out.deinit(allocator);
+    }
+
+    const f = try fs.openFileAbsolute(manifest_path, .{});
+    defer f.close();
+    // A manifest lists a bounded number of small rel paths; cap the read.
+    const data = try f.readToEndAlloc(allocator, 8 * 1024 * 1024);
+    defer allocator.free(data);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (!isSafeRelPath(line)) return error.UnsafeManifestPath;
+        try out.append(allocator, try allocator.dupe(u8, line));
+    }
+    return out;
+}
+
+/// A rel path is safe to join under the day dir iff it is relative (no leading
+/// `/`) and contains no `..` path component. Guards manifest-driven deletes.
+fn isSafeRelPath(p: []const u8) bool {
+    if (p.len == 0) return false;
+    if (p[0] == '/') return false;
+    var it = std.mem.splitScalar(u8, p, '/');
+    while (it.next()) |comp| {
+        if (std.mem.eql(u8, comp, "..")) return false;
+    }
+    return true;
+}
+
+/// Delete each input (rel path) under `day_dir`. A missing file is tolerated so
+/// a retried compaction (some inputs already gone) still completes.
+fn deleteInputs(allocator: Allocator, day_dir: []const u8, inputs: []const []u8) !void {
+    for (inputs) |rel| {
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, rel });
+        defer allocator.free(p);
+        fs.deleteFileAbsolute(p) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+}
+
+/// Remove every now-empty `hour=*` subdir of `day_dir` (best-effort: a non-empty
+/// dir or a transient error is skipped). Called after the day's inputs are
+/// deleted so the merged day-level file is the only content left.
+fn removeEmptyHourDirs(allocator: Allocator, day_dir: []const u8) !void {
+    var dir = fs.openDirAbsolute(day_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+
+    var hour_dirs = std.ArrayList([]u8){};
+    defer {
+        for (hour_dirs.items) |h| allocator.free(h);
+        hour_dirs.deinit(allocator);
+    }
+    {
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            if (!std.mem.startsWith(u8, entry.name, "hour=")) continue;
+            try hour_dirs.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+    }
+
+    for (hour_dirs.items) |hour_name| {
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, hour_name });
+        defer allocator.free(p);
+        // deleteDirAbsolute removes only an EMPTY dir; a stray non-parquet file
+        // would make it ENOTEMPTY, which we skip rather than blow away data.
+        fs.deleteDirAbsolute(p) catch {};
+    }
+}
+
+/// `<day_dir>/<seq>.manifest`. Caller frees.
+fn manifestPathOwned(allocator: Allocator, day_dir: []const u8, seq: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, manifest_suffix });
+}
+
+/// Stable hex hash over the SORTED input rel paths (NUL-joined so distinct
+/// path sets cannot collide via concatenation). Deterministic: the same input
+/// set always yields the same seq, so a retried compaction reuses one output name.
+fn seqFromRelPaths(allocator: Allocator, sorted_rels: []const []u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (sorted_rels) |rel| {
+        hasher.update(rel);
+        hasher.update(&[_]u8{0});
+    }
+    return std.fmt.allocPrint(allocator, "{x:0>16}", .{hasher.final()});
+}
+
+fn lessThanSlice(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Days since the unix epoch for a `YYYY-MM-DD` partition NAME, or null if
+/// malformed. Reuses dayStartUnix's calendar math (its result / s_per_day).
+fn dayIndexFromName(date_str: []const u8) ?i64 {
+    const start = dayStartUnix(date_str) orelse return null;
+    return @divFloor(start, std.time.s_per_day);
+}
+
+/// Today's date as days-since-epoch (UTC), for the sealed-day guard.
+fn todayUtcDays() i64 {
+    return @divFloor(std.time.timestamp(), std.time.s_per_day);
+}
+
+// ============================================================================
 // One-shot legacy metrics.db migration
 // ============================================================================
 
@@ -375,10 +912,10 @@ fn migrateTable(allocator: Allocator, conn: c.duckdb_connection, root: []const u
 
     // Write ONE deterministic file <root>/<table>/migrated.parquet (no
     // PARTITION_BY). A re-run after a crash overwrites this same path, so the
-    // migration is idempotent and never double-counts. The query glob
-    // <root>/<table>/**/*.parquet still matches this file; with
-    // hive_partitioning the absent date=/hour= keys read as NULL, which is fine -
-    // queries filter on the real `timestamp` column, not the hive keys.
+    // migration is idempotent and never double-counts. collectParquetFiles walks
+    // the whole table tree so this file is included; the query reads its explicit
+    // data columns (hive_partitioning is off), so the absent date=/hour= path
+    // components don't matter - queries filter on the real `timestamp` column.
     const out_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, table.name() });
     defer allocator.free(out_dir);
     try makePathAbsolute(out_dir);
@@ -1379,4 +1916,332 @@ test "roll: recoverOrphanTemps is a no-op when there are no temps" {
 
     try recoverOrphanTemps(a, root);
     try testing.expectEqual(@as(i64, 1), try parquetCount(a, res.parquet_path));
+}
+
+// ----------------------------------------------------------------------------
+// Day-compaction tests (crash-injection at each protocol phase)
+// ----------------------------------------------------------------------------
+
+/// A fixed SEALED day far enough in the past that the sealed guard (date < today
+/// UTC) always holds, plus its days-since-epoch parts for building hour leaves.
+const test_sealed_date = "2023-11-14"; // 1_700_000_000 lands here (UTC)
+
+/// Build `<root>/metrics/date=<test_sealed_date>/hour=<HH>/<seq>.parquet` for a
+/// fresh hour leaf, each holding `rows` metrics rows, via a real roll then a move
+/// into the chosen hour dir. Returns nothing; total rowcount is rows*hours.
+fn seedSealedDay(a: Allocator, root: []const u8, hours: usize, rows_per_hour: usize) !void {
+    // The roll partitions by the row timestamp; 1_700_000_000 is in date=2023-11-14
+    // hour=22 UTC. We don't depend on which hour the roll picks - after producing
+    // each file we relocate it into a distinct hour leaf so the day has N leaves.
+    var h: usize = 0;
+    while (h < hours) : (h += 1) {
+        var stg = try staging.Staging.open(a, root);
+        defer stg.deinit();
+        var r: usize = 0;
+        while (r < rows_per_hour) : (r += 1) {
+            // Distinct timestamps per file so dedup checks are meaningful.
+            const ts: i64 = 1_700_000_000 + @as(i64, @intCast(h)) * 100 + @as(i64, @intCast(r));
+            try stg.appendMetrics(ts, sampleMetrics());
+        }
+        try stg.sync();
+        const res = (try rollTable(a, root, &stg, .metrics)).?;
+        defer a.free(res.parquet_path);
+
+        // Relocate into a deterministic hour leaf for this file.
+        const hour_dir = try std.fmt.allocPrint(a, "{s}/metrics/date={s}/hour={d:0>2}", .{ root, test_sealed_date, h });
+        defer a.free(hour_dir);
+        try makePathAbsolute(hour_dir);
+        const base = std.fs.path.basename(res.parquet_path);
+        const dest = try std.fmt.allocPrint(a, "{s}/{s}", .{ hour_dir, base });
+        defer a.free(dest);
+        try fs.renameAbsolute(res.parquet_path, dest);
+    }
+}
+
+/// Count all rows under `<root>/metrics/date=<test_sealed_date>/**` plus the
+/// day-level file, via the same read_parquet path the query uses.
+fn dayRowCount(a: Allocator, root: []const u8) !i64 {
+    const glob = try std.fmt.allocPrint(a, "{s}/metrics/date={s}/**/*.parquet", .{ root, test_sealed_date });
+    defer a.free(glob);
+    var db: c.duckdb_database = undefined;
+    try testing.expect(c.duckdb_open(":memory:", &db) != c.DuckDBError);
+    defer c.duckdb_close(&db);
+    var conn: c.duckdb_connection = undefined;
+    try testing.expect(c.duckdb_connect(db, &conn) != c.DuckDBError);
+    defer c.duckdb_disconnect(&conn);
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT COUNT(*) FROM read_parquet('{s}', hive_partitioning=false, union_by_name=true)", .{glob}, 0);
+    defer a.free(sql);
+    var result: c.duckdb_result = undefined;
+    try testing.expect(c.duckdb_query(conn, sql.ptr, &result) != c.DuckDBError);
+    defer c.duckdb_destroy_result(&result);
+    return c.duckdb_value_int64(&result, 0, 0);
+}
+
+fn dayDirPath(a: Allocator, root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}/metrics/date={s}", .{ root, test_sealed_date });
+}
+
+/// Count `.parquet` files directly under a path that is NOT under an hour= dir
+/// (the day level) plus those under hour=* dirs. Returns {day_level, in_hours}.
+fn countDayFiles(a: Allocator, root: []const u8) !struct { day_level: usize, in_hours: usize } {
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+    var dir = try fs.openDirAbsolute(day_dir, .{ .iterate = true });
+    defer dir.close();
+    var day_level: usize = 0;
+    var in_hours: usize = 0;
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".parquet")) continue;
+        if (std.mem.indexOf(u8, entry.path, "hour=") != null) in_hours += 1 else day_level += 1;
+    }
+    return .{ .day_level = day_level, .in_hours = in_hours };
+}
+
+test "compaction: happy path merges many hour files into one day file, same rowcount" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 4, 3); // 4 hour leaves, 3 rows each = 12
+    try testing.expectEqual(@as(i64, 12), try dayRowCount(a, root));
+    const before = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 4), before.in_hours);
+    try testing.expectEqual(@as(usize, 0), before.day_level);
+
+    try compactDay(a, root, .metrics, test_sealed_date);
+
+    // Exactly one DAY-LEVEL file, no hour-level files, and the hour= dirs are gone.
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 1), after.day_level);
+    try testing.expectEqual(@as(usize, 0), after.in_hours);
+    // Rowcount unchanged: no dup, no loss.
+    try testing.expectEqual(@as(i64, 12), try dayRowCount(a, root));
+}
+
+test "compaction: idempotent re-run is a no-op (single file already)" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 3, 2); // 6 rows
+    try compactDay(a, root, .metrics, test_sealed_date);
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+
+    // Second run: only one day-level file remains (|I| <= 1) so it's a no-op.
+    try compactDay(a, root, .metrics, test_sealed_date);
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 1), after.day_level);
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+}
+
+test "compaction: sealed-only guard - today's day dir is never compacted" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    // Build TWO hour leaves under TODAY's date via a normal roll at `now`.
+    const now = std.time.timestamp();
+    {
+        var stg = try staging.Staging.open(a, root);
+        defer stg.deinit();
+        try stg.appendMetrics(now, sampleMetrics());
+        try stg.sync();
+        const r1 = (try rollTable(a, root, &stg, .metrics)).?;
+        a.free(r1.parquet_path);
+        try stg.appendMetrics(now + 1, sampleMetrics());
+        try stg.sync();
+        const r2 = (try rollTable(a, root, &stg, .metrics)).?;
+        a.free(r2.parquet_path);
+    }
+
+    // compactSealedDays must skip today: its hour leaves stay intact.
+    try compactSealedDays(a, root);
+
+    const today_str = blk: {
+        const ts: u64 = @intCast(now);
+        const ep = std.time.epoch.EpochSeconds{ .secs = ts };
+        const yd = ep.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        break :blk try std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1 });
+    };
+    defer a.free(today_str);
+
+    const day_dir = try std.fmt.allocPrint(a, "{s}/metrics/date={s}", .{ root, today_str });
+    defer a.free(day_dir);
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    // Both hour-level files survive: today was not touched.
+    try testing.expectEqual(@as(usize, 2), inputs.items.len);
+}
+
+test "compaction recovery (a): orphan .building, no manifest -> dropped, inputs intact" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 3, 2); // 6 rows across 3 hour leaves
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    // Inject a pre-commit crash: a `<seq>.building` with NO manifest. We make a
+    // real merged file (so it has real bytes) but place it as `.building`.
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const building = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer a.free(building);
+    try copyMergeToParquet(a, day_dir, inputs.items, building);
+
+    // Recovery must DROP the building and leave every input intact: rowcount 6.
+    try recoverCompactions(a, root);
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(building, .{}));
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+    // Inputs still in their hour leaves (un-compacted).
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 3), after.in_hours);
+    try testing.expectEqual(@as(usize, 0), after.day_level);
+}
+
+test "compaction recovery (b): manifest committed, all inputs + building present -> publish, no dup" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 4, 2); // 8 rows
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const building = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer a.free(building);
+    const final = try std.fmt.allocPrint(a, "{s}/{s}.parquet", .{ day_dir, seq });
+    defer a.free(final);
+
+    // Inject the post-commit state: building written, manifest committed, but the
+    // inputs NOT yet deleted and the building NOT yet renamed (crash in step 5).
+    try copyMergeToParquet(a, day_dir, inputs.items, building);
+    try writeManifest(a, day_dir, seq, final, inputs.items);
+
+    try recoverCompactions(a, root);
+
+    // Recovery deletes the named inputs and publishes the building: one day-level
+    // file, no hour files, rowcount unchanged at 8 (no double-count).
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 1), after.day_level);
+    try testing.expectEqual(@as(usize, 0), after.in_hours);
+    try testing.expectEqual(@as(i64, 8), try dayRowCount(a, root));
+}
+
+test "compaction recovery (c): manifest committed, SOME inputs already deleted -> completes, no dup" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 4, 2); // 8 rows
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const building = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer a.free(building);
+    const final = try std.fmt.allocPrint(a, "{s}/{s}.parquet", .{ day_dir, seq });
+    defer a.free(final);
+
+    try copyMergeToParquet(a, day_dir, inputs.items, building);
+    try writeManifest(a, day_dir, seq, final, inputs.items);
+
+    // Simulate a crash PARTWAY through step 5: delete the FIRST input only.
+    {
+        const p = try std.fmt.allocPrint(a, "{s}/{s}", .{ day_dir, inputs.items[0] });
+        defer a.free(p);
+        try fs.deleteFileAbsolute(p);
+    }
+
+    try recoverCompactions(a, root);
+
+    // Recovery deletes the remaining inputs and publishes: exactly one day file,
+    // rowcount unchanged at 8 (the building holds all 8; no dup, no loss).
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 1), after.day_level);
+    try testing.expectEqual(@as(usize, 0), after.in_hours);
+    try testing.expectEqual(@as(i64, 8), try dayRowCount(a, root));
+}
+
+test "compaction recovery (d): manifest present, inputs deleted, building already renamed -> drop manifest" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 3, 2); // 6 rows
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const final = try std.fmt.allocPrint(a, "{s}/{s}.parquet", .{ day_dir, seq });
+    defer a.free(final);
+
+    // Inject the near-complete state: final already published, inputs deleted,
+    // hour dirs removed, but the manifest NOT yet dropped (crash between 6 and 7).
+    try copyMergeToParquet(a, day_dir, inputs.items, final);
+    try writeManifest(a, day_dir, seq, final, inputs.items);
+    try deleteInputs(a, day_dir, inputs.items);
+    try removeEmptyHourDirs(a, day_dir);
+
+    const manifest_path = try manifestPathOwned(a, day_dir, seq);
+    defer a.free(manifest_path);
+    try fs.accessAbsolute(manifest_path, .{}); // manifest is present pre-recovery
+
+    try recoverCompactions(a, root);
+
+    // Recovery just drops the manifest; the final stays, rowcount unchanged at 6.
+    try testing.expectError(error.FileNotFound, fs.accessAbsolute(manifest_path, .{}));
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 1), after.day_level);
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
 }
