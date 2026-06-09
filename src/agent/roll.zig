@@ -486,6 +486,20 @@ fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8
         return error.UnsafeManifestPath;
     }
 
+    // Every input the manifest authorizes us to DELETE must be a committed
+    // `.parquet` (the only thing a compaction ever consumes). Requiring the
+    // `.parquet` suffix rejects a parseable-but-corrupt manifest that lists a
+    // reserved artifact - `<seq>.manifest`, `<seq>.parquet.building`, or any
+    // non-parquet file - so recovery can never delete its own marker/building or
+    // an unrelated file before publishing. `.parquet.building`/`.manifest` end in
+    // `.building`/`.manifest`, so they fail this check.
+    for (input_rels) |rel| {
+        if (!std.mem.endsWith(u8, rel, ".parquet")) {
+            std.log.warn("compaction completion: manifest input {s} is not a `.parquet` - refusing", .{rel});
+            return error.UnsafeManifestPath;
+        }
+    }
+
     // (5) Delete each named input still present (FileNotFound tolerated so a
     // retried completion finishes), then rmdir emptied hour dirs.
     try deleteInputs(allocator, day_dir, input_rels);
@@ -886,13 +900,44 @@ fn isSafeRelPath(p: []const u8) bool {
     return true;
 }
 
-/// Delete each input (rel path) under `day_dir`. A missing file is tolerated so
-/// a retried compaction (some inputs already gone) still completes.
+/// Delete each input (rel path) under `day_dir`, then fsync every distinct parent
+/// directory the deletions touched so the UNLINKS ARE DURABLE before the caller
+/// proceeds to delete the manifest. Without this, an input deleted from a
+/// `hour=*` subdir might NOT be persisted (only the day dir is fsynced later); a
+/// crash after the manifest removal could then resurrect that input alongside the
+/// published final - a double-count with no manifest left to clean it up. A
+/// missing file is tolerated so a retried completion (some inputs already gone)
+/// still finishes.
 fn deleteInputs(allocator: Allocator, day_dir: []const u8, inputs: []const []u8) !void {
+    // Track distinct parent dirs to fsync once each (typically the few hour= dirs).
+    var parents = std.ArrayList([]u8){};
+    defer {
+        for (parents.items) |p| allocator.free(p);
+        parents.deinit(allocator);
+    }
+
     for (inputs) |rel| {
         const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, rel });
         defer allocator.free(p);
         fs.deleteFileAbsolute(p) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        const parent = std.fs.path.dirname(p) orelse day_dir;
+        var seen = false;
+        for (parents.items) |existing| {
+            if (std.mem.eql(u8, existing, parent)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try parents.append(allocator, try allocator.dupe(u8, parent));
+    }
+
+    // Make the unlinks durable. EINVAL-tolerant; a parent already rmdir'd by a
+    // concurrent step reads as FileNotFound, which we tolerate.
+    for (parents.items) |parent| {
+        fsyncDir(parent) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -2553,6 +2598,51 @@ test "compaction recovery: a parseable manifest with the wrong output name is re
     const wrong = try std.fmt.allocPrint(a, "{s}/other.parquet", .{day_dir});
     defer a.free(wrong);
     try testing.expectError(error.FileNotFound, fs.accessAbsolute(wrong, .{}));
+}
+
+test "compaction recovery: a manifest listing a non-parquet input is refused, nothing deleted" {
+    // Codex round-4 HIGH: input lines are delete authority, so each must be a
+    // committed `.parquet`. A parseable manifest naming a reserved artifact (here
+    // the building itself) must be refused BEFORE any delete, so recovery can't
+    // unlink its own marker/building or an unrelated file.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 3, 2); // 6 rows
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+    const building = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
+    defer a.free(building);
+    try copyMergeToParquet(a, day_dir, inputs.items, building);
+
+    // Committed manifest whose output is correct but whose INPUT line is the
+    // building basename (ends in `.building`, not `.parquet`) -> refused.
+    const manifest_path = try manifestPathOwned(a, day_dir, seq);
+    defer a.free(manifest_path);
+    {
+        const body = try std.fmt.allocPrint(a, "{s}.parquet\n{s}{s}\n", .{ seq, seq, building_suffix });
+        defer a.free(body);
+        const f = try fs.createFileAbsolute(manifest_path, .{ .mode = 0o600 });
+        defer f.close();
+        try f.writeAll(body);
+    }
+
+    try testing.expectError(error.UnsafeManifestPath, recoverCompactions(a, root));
+    // The building and all real inputs survive (nothing was deleted): 6 rows.
+    try fs.accessAbsolute(building, .{});
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
 }
 
 test "compaction recovery: a fully-completed day is a clean no-op (idempotent re-run)" {
