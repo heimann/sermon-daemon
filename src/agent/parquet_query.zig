@@ -7,7 +7,7 @@
 //!
 //! Each view is:
 //!
-//!     read_parquet(['<f1>','<f2>',...], hive_partitioning=true, union_by_name=true)
+//!     read_parquet(['<f1>','<f2>',...], hive_partitioning=false, union_by_name=true)
 //!       UNION ALL <table>_staging
 //!
 //! where the file list is an EXPLICIT, SQL-escaped set of parquet paths FROZEN
@@ -471,11 +471,19 @@ fn stagingTempDdl(allocator: Allocator, table: Table) ![:0]u8 {
 /// the lock. Every path is double-quote-escaped (escapeSqlLiteral) so a path
 /// containing a single quote can neither break the literal nor inject.
 ///
-/// We SELECT the explicit column list (not `*`) from the parquet side because
-/// `hive_partitioning=true` appends synthetic `date`/`hour` partition columns,
-/// which would otherwise make the parquet branch wider than the staging branch
-/// and break the UNION ALL's column-count check. The explicit list also keeps
-/// column ordering identical across both branches and the row readers.
+/// We SELECT the explicit column list (not `*`) from the parquet side so the
+/// parquet branch's column set matches the staging branch and the row readers.
+///
+/// hive_partitioning is DISABLED. Day-compaction (roll.compactDay) merges a
+/// sealed day's hour-partitioned files into a single `date=X/<seq>.parquet` at
+/// the DAY level, so the tree holds MIXED partition depths: un-compacted days
+/// at `date=X/hour=Y/...` (date+hour keys) and compacted days at `date=X/...`
+/// (date key only). DuckDB's `hive_partitioning=true` errors on that
+/// inconsistent depth within one read_parquet call. We never use the hive
+/// date/hour keys anyway - queries filter on the real `timestamp` data column,
+/// retention parses the date from the directory NAME, not via hive - so turning
+/// hive off lets the mixed-depth file set read uniformly. `union_by_name=true`
+/// stays on so schema differences across files are reconciled by column name.
 fn createView(allocator: Allocator, pq: *ParquetQuery, table: Table, files: []const []const u8) !void {
     const temp_name = table.name();
     const cols = columnList(table);
@@ -485,7 +493,7 @@ fn createView(allocator: Allocator, pq: *ParquetQuery, table: Table, files: []co
         defer allocator.free(file_list);
         break :blk try std.fmt.allocPrintSentinel(
             allocator,
-            "CREATE VIEW {s} AS SELECT {s} FROM read_parquet([{s}], hive_partitioning=true, union_by_name=true) UNION ALL SELECT {s} FROM {s}_staging",
+            "CREATE VIEW {s} AS SELECT {s} FROM read_parquet([{s}], hive_partitioning=false, union_by_name=true) UNION ALL SELECT {s} FROM {s}_staging",
             .{ table.name(), cols, file_list, cols, temp_name },
             0,
         );
@@ -994,4 +1002,76 @@ test "parquet_query: typed getters over union (processes + logs)" {
         a.free(all_logs);
     }
     try testing.expectEqual(@as(usize, 2), all_logs.len);
+}
+
+test "parquet_query: mixed-depth tree (day-merged + hour-partitioned) reads each row once" {
+    // The hive-depth fix: one sealed day is compacted to date=X/<seq>.parquet
+    // (date key only), while another stays hour-partitioned at date=Y/hour=Z/...
+    // (date+hour keys). With hive_partitioning=false the mixed-depth file set
+    // reads cleanly and every row is returned exactly once - no miss, no dup.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    // Helper: roll one metrics row at `ts` then relocate the file into
+    // <root>/metrics/date=<date>/hour=<hh>/ so we control the leaf layout.
+    const Seed = struct {
+        fn one(alloc: Allocator, r: []const u8, ts: i64, date: []const u8, hh: usize) !void {
+            var stg = try staging.Staging.open(alloc, r);
+            defer stg.deinit();
+            try stg.appendMetrics(ts, sampleMetrics(1.0));
+            try stg.sync();
+            const res = (try roll.rollTable(alloc, r, &stg, .metrics)).?;
+            defer alloc.free(res.parquet_path);
+            const hour_dir = try std.fmt.allocPrint(alloc, "{s}/metrics/date={s}/hour={d:0>2}", .{ r, date, hh });
+            defer alloc.free(hour_dir);
+            try makeDirsForTest(hour_dir);
+            const base = std.fs.path.basename(res.parquet_path);
+            const dest = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ hour_dir, base });
+            defer alloc.free(dest);
+            try fs.renameAbsolute(res.parquet_path, dest);
+        }
+    };
+
+    // Day A (2023-11-14): 3 hour leaves, one row each, then compact to a day file.
+    try Seed.one(a, root, 1_700_000_000, "2023-11-14", 0);
+    try Seed.one(a, root, 1_700_000_100, "2023-11-14", 1);
+    try Seed.one(a, root, 1_700_000_200, "2023-11-14", 2);
+    try roll.compactDay(a, root, .metrics, "2023-11-14");
+
+    // Day B (2022-04-15): 2 hour leaves, one row each, left hour-partitioned.
+    try Seed.one(a, root, 1_650_000_000, "2022-04-15", 0);
+    try Seed.one(a, root, 1_650_000_100, "2022-04-15", 1);
+
+    var pq = try initParquetQuery(a, root);
+    defer pq.deinit();
+
+    var cnt = try pq.rawQuery("SELECT COUNT(*) AS n FROM metrics");
+    defer cnt.deinit();
+    try testing.expectEqualStrings("5", cnt.rows[0][0].?); // 3 + 2, no miss
+
+    var distinct = try pq.rawQuery("SELECT COUNT(DISTINCT timestamp) AS n FROM metrics");
+    defer distinct.deinit();
+    try testing.expectEqualStrings("5", distinct.rows[0][0].?); // no dup
+}
+
+/// Recursively create an absolute directory path for tests (mkdir -p). roll.zig
+/// has an internal makePathAbsolute but it isn't pub; this small helper keeps the
+/// test self-contained.
+fn makeDirsForTest(path: []const u8) !void {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, path, i + 1, '/')) |idx| {
+        const prefix = path[0..idx];
+        if (prefix.len != 0) fs.makeDirAbsolute(prefix) catch |e| switch (e) {
+            error.PathAlreadyExists => {},
+            else => return e,
+        };
+        i = idx;
+    }
+    fs.makeDirAbsolute(path) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
 }
