@@ -516,11 +516,6 @@ fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8
         }
     }
 
-    // (5) Delete each named input still present (FileNotFound tolerated so a
-    // retried completion finishes), then rmdir emptied hour dirs.
-    try deleteInputs(allocator, day_dir, input_rels);
-    try removeEmptyHourDirs(allocator, day_dir);
-
     const building_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ day_dir, seq, building_suffix });
     defer allocator.free(building_path);
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ day_dir, out_basename });
@@ -528,31 +523,33 @@ fn completeCompaction(allocator: Allocator, day_dir: []const u8, seq: []const u8
     const manifest_path = try manifestPathOwned(allocator, day_dir, seq);
     defer allocator.free(manifest_path);
 
-    // (6) Publish the building -> final, then fsync the dir. Probe the final with
-    // a CHECKED existence: only a confirmed FileNotFound takes the "publish"
-    // branch; any OTHER access error (EIO/EACCES/...) is propagated so we never
-    // mistake an unreadable final for a published one and then drop the building +
-    // manifest (which would lose rows). The manifest stays committed for retry.
+    // PROVE THE MERGED COPY EXISTS BEFORE DELETING ANY INPUT. Either the final is
+    // already published, or the `.building` is present to publish. If NEITHER is
+    // confirmed present, REFUSE here - before unlinking - so an inputs-present /
+    // merge-missing state (out-of-band corruption) stays recoverable instead of
+    // converting into actual row loss. Both probes are CHECKED: a non-FileNotFound
+    // access error (EIO/EACCES) propagates rather than being read as "exists" or
+    // "absent". The manifest + inputs are preserved for a restart to retry.
     const final_exists = try pathExistsChecked(final_path);
+    const building_exists = try pathExistsChecked(building_path);
+    if (!final_exists and !building_exists) {
+        std.log.warn("compaction completion: both building and final missing for {s} - manifest + inputs preserved", .{manifest_path});
+        return error.CompactionOutputMissing;
+    }
+
+    // (5) Now that a merged copy is proven present, delete each named input still
+    // present (FileNotFound tolerated so a retried completion finishes) and fsync
+    // the touched dirs, then rmdir emptied hour dirs.
+    try deleteInputs(allocator, day_dir, input_rels);
+    try removeEmptyHourDirs(allocator, day_dir);
+
+    // (6) Publish the building -> final (or, if the final is already published
+    // from a prior partial run, drop the now-redundant leftover building), then
+    // fsync the dir so the change is durable.
     if (!final_exists) {
-        fs.renameAbsolute(building_path, final_path) catch |err| switch (err) {
-            error.FileNotFound => {
-                // Neither building nor final present, yet the manifest committed
-                // (so the inputs were scheduled for / already deleted). The merged
-                // copy is gone - we must NOT drop the manifest (that would strand
-                // the rows). Preserve the marker and fail so a restart can surface
-                // the loss rather than silently completing. This is unreachable in
-                // the protocol (the building is fsynced durable BEFORE the manifest
-                // commits), so it only fires on out-of-band corruption.
-                std.log.err("compaction completion: both building and final missing for {s} - manifest preserved", .{manifest_path});
-                return error.CompactionOutputMissing;
-            },
-            else => return err,
-        };
+        try fs.renameAbsolute(building_path, final_path);
         try fsyncDirOf(final_path);
     } else {
-        // Final already published (crash after step 6, before step 7): drop the
-        // now-redundant leftover building, then fsync so the deletion is durable.
         fs.deleteFileAbsolute(building_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
@@ -2794,6 +2791,48 @@ test "compaction: writeManifest refuses an input with a newline (no ambiguous ma
     const mpath = try manifestPathOwned(a, day_dir, "deadbeef");
     defer a.free(mpath);
     try testing.expectError(error.FileNotFound, fs.accessAbsolute(mpath, .{}));
+}
+
+test "compaction recovery: committed manifest with inputs present but NO merged copy refuses without deleting" {
+    // Codex round-7 HIGH: completeCompaction must PROVE a merged copy (final or
+    // building) exists BEFORE unlinking inputs. If neither exists but the inputs
+    // do, recovery must refuse (fatal) and leave every input in place - never
+    // unlink first and then fail, which would lose rows.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    defer a.free(root);
+
+    try seedSealedDay(a, root, 3, 2); // 6 rows across 3 hour leaves
+    const day_dir = try dayDirPath(a, root);
+    defer a.free(day_dir);
+
+    var inputs = try collectDayInputs(a, day_dir);
+    defer {
+        for (inputs.items) |p| a.free(p);
+        inputs.deinit(a);
+    }
+    std.mem.sort([]u8, inputs.items, {}, lessThanSlice);
+    const seq = try seqFromRelPaths(a, inputs.items);
+    defer a.free(seq);
+
+    // Commit a manifest but write NO building and NO final (out-of-band loss of
+    // the merged copy with inputs intact).
+    const final = try std.fmt.allocPrint(a, "{s}/{s}.parquet", .{ day_dir, seq });
+    defer a.free(final);
+    try writeManifest(a, day_dir, seq, final, inputs.items);
+
+    try testing.expectError(error.CompactionOutputMissing, recoverCompactions(a, root));
+
+    // Every input survives (nothing was unlinked): 6 rows, manifest preserved.
+    const after = try countDayFiles(a, root);
+    try testing.expectEqual(@as(usize, 3), after.in_hours);
+    try testing.expectEqual(@as(usize, 0), after.day_level);
+    try testing.expectEqual(@as(i64, 6), try dayRowCount(a, root));
+    const manifest_path = try manifestPathOwned(a, day_dir, seq);
+    defer a.free(manifest_path);
+    try fs.accessAbsolute(manifest_path, .{});
 }
 
 test "compaction recovery: a fully-completed day is a clean no-op (idempotent re-run)" {
