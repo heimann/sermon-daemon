@@ -34,10 +34,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // OTLP local collector (plan 26). Pure OTLP/JSON parsing + log-record
-    // mapping today; the std.http.Server listen loop lands in a later phase
-    // (gated behind receiver_enabled = false). Depends only on `logs` for the
-    // canonical on-host log representation it maps into.
+    // OTLP local collector (plan 26). OTLP/JSON parsing + log-record mapping
+    // plus the localhost listen/forward loop (phase 2), spawned only when
+    // receiver_enabled = true. Depends only on `logs` for the canonical
+    // on-host log representation it maps into.
     const otlp_receiver_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/otlp_receiver.zig"),
         .target = target,

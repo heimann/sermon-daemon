@@ -71,8 +71,8 @@ const Config = struct {
     // Master switch for the localhost OTLP/HTTP receiver. Default false: opening
     // a listening socket is new attack surface for a daemon that is otherwise
     // outbound-only, so an operator must opt in. When false the receiver thread
-    // is never spawned and no socket is opened (the listen loop is a phase-2 TODO
-    // stub - see src/agent/otlp_receiver.zig and docs/plans/26-...).
+    // is never spawned and no socket is opened (see src/agent/otlp_receiver.zig
+    // and docs/plans/26-daemon-otlp-local-collector.md).
     receiver_enabled: ?bool = null,
     // Localhost port for the OTLP/HTTP listener (OTLP/HTTP standard port 4318).
     // Binds 127.0.0.1 only.
@@ -135,10 +135,13 @@ fn loadRules(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Pa
     };
 }
 
-var running: bool = true;
+// Shutdown flag. Atomic because it is now read across threads: the collection
+// loop AND the OTLP receiver thread (plan 26) both poll it. The atomic store
+// stays async-signal-safe, so flipping it from sigHandler remains correct.
+var running: std.atomic.Value(bool) = .init(true);
 
 fn sigHandler(_: c_int) callconv(.c) void {
-    running = false;
+    running.store(false, .seq_cst);
 }
 
 fn readConfigPathArg(allocator: std.mem.Allocator) !?[]const u8 {
@@ -229,8 +232,7 @@ pub fn main() !void {
         default_roll_interval_s;
 
     // ── OTLP local collector config (plan 26) ──
-    // Parsed and surfaced now; the listen loop is a phase-2 TODO stub, so the
-    // receiver is never spawned regardless. Default off.
+    // Default off; the receiver thread is spawned below only when enabled.
     const receiver_enabled: bool = if (config) |c|
         c.value.receiver_enabled orelse default_receiver_enabled
     else
@@ -299,21 +301,53 @@ pub fn main() !void {
         std.debug.print("Warning: --key is set but --server is missing - remote push is disabled\n", .{});
     }
 
-    // OTLP receiver (plan 26): the listen loop is a phase-2 TODO stub, so even
-    // with receiver_enabled = true nothing listens yet. Surface the intent (and
-    // a missing-token warning, mirroring the --server/--key warnings) so the
-    // config is visible without implying a socket is open. otlp_receiver_mod is
-    // referenced here so the module is wired in and its stub stays linked.
-    otlp_receiver_mod.runReceiverStub();
+    // ── OTLP receiver (plan 26 phase 2): localhost listen + forward ──
+    // Spawned on its own thread ONLY when receiver_enabled = true (default
+    // off: a listening socket is new attack surface for an otherwise
+    // outbound-only daemon). Binds 127.0.0.1 only. Forwarding needs BOTH
+    // server_url and otlp_token; with either missing the receiver runs in
+    // receive-and-drop mode (still accepts and 200s so local SDKs don't
+    // error/retry - the on-host value of dropped records lands with phase 3
+    // persistence) and the warning below makes the drop explicit, mirroring
+    // the --server/--key warnings above.
+    var hosted_forwarder: otlp_receiver_mod.HostedForwarder = undefined;
+    var otlp_receiver: ?otlp_receiver_mod.Receiver = null;
     if (receiver_enabled) {
-        std.debug.print(
-            "Note: receiver_enabled=true (port {d}) but the OTLP receiver listen loop is not yet implemented (plan 26 phase 2) - no socket is opened\n",
-            .{receiver_port},
-        );
-        if (otlp_token == null) {
-            std.debug.print("Warning: receiver_enabled is set but otlp_token is missing - OTLP forwarding would be disabled\n", .{});
+        const forwarder: otlp_receiver_mod.Forwarder = blk: {
+            if (server_url) |url| {
+                if (otlp_token) |token| {
+                    hosted_forwarder = .{ .server_url = url, .otlp_token = token };
+                    break :blk hosted_forwarder.forwarder();
+                }
+            }
+            std.debug.print(
+                "Warning: receiver_enabled is set but {s} is missing - received OTLP is accepted and dropped (forwarding disabled; on-host persistence is plan 26 phase 3)\n",
+                .{if (server_url == null) "server_url" else "otlp_token"},
+            );
+            break :blk otlp_receiver_mod.drop_forwarder;
+        };
+        // A failed bind (port taken, no privileges) disables the receiver for
+        // this run but must not take the collection loop down with it.
+        if (otlp_receiver_mod.Receiver.init(allocator, receiver_port, &running, forwarder)) |receiver| {
+            otlp_receiver = receiver;
+        } else |err| {
+            std.debug.print("Warning: OTLP receiver failed to listen on 127.0.0.1:{d}: {} - receiver disabled this run\n", .{ receiver_port, err });
+        }
+        if (otlp_receiver) |*receiver| {
+            // start() runs on the receiver's final address (the optional's
+            // payload lives in main's frame for the daemon's lifetime).
+            if (receiver.start()) {
+                std.debug.print("OTLP receiver listening on 127.0.0.1:{d} (POST /v1/logs)\n", .{receiver.boundPort()});
+            } else |err| {
+                std.debug.print("Warning: OTLP receiver thread spawn failed: {} - receiver disabled this run\n", .{err});
+                receiver.stop(); // no thread yet; closes the listener
+                otlp_receiver = null;
+            }
         }
     }
+    // Shutdown: the signal flips `running`; stop() then wakes the blocked
+    // accept via shutdown() on the listener and joins the thread.
+    defer if (otlp_receiver) |*receiver| receiver.stop();
 
     // Expand ~ in db path
     const final_db_path = try expandPath(allocator, db_path);
@@ -489,7 +523,7 @@ pub fn main() !void {
     defer ct_metrics_state.deinit();
 
     // Main collection loop
-    while (running) {
+    while (running.load(.seq_cst)) {
         const now = std.time.timestamp();
 
         // Collect data (no DB lock held)
@@ -777,7 +811,7 @@ pub fn main() !void {
 
         // Sleep until next interval (interruptible)
         var remaining: u64 = interval;
-        while (remaining > 0 and running) {
+        while (remaining > 0 and running.load(.seq_cst)) {
             std.Thread.sleep(1 * std.time.ns_per_s);
             remaining -= 1;
         }
