@@ -72,10 +72,12 @@ const CpuStats = struct {
     /// iowait "can decrease in certain conditions", and we ship ReleaseFast
     /// builds where an unchecked u64 subtraction wraps to a near-2^64 value
     /// instead of trapping - one backwards tick would report an absurd
-    /// percentage and poison the whole sample. Every field is clamped (not
-    /// just iowait) so a delta's total() is the sum of the clamped fields:
-    /// each field delta then never exceeds the total, keeping all derived
-    /// percentages within 0-100 even on the tick where a counter stepped back.
+    /// numerator and poison the whole sample. Every field is clamped (not
+    /// just iowait) so each field's contribution to cpu_percent/user/system/
+    /// iowait can never go negative. These are the numerators only; the
+    /// denominator is the aggregate-total delta (see collectMetrics), not the
+    /// sum of these clamped fields, so one field's reset can't shrink the
+    /// denominator and inflate the other percentages.
     fn deltaSince(self: CpuStats, prev: CpuStats) CpuStats {
         return .{
             .user = self.user -| prev.user,
@@ -86,6 +88,39 @@ const CpuStats = struct {
             .irq = self.irq -| prev.irq,
             .softirq = self.softirq -| prev.softirq,
             .steal = self.steal -| prev.steal,
+        };
+    }
+
+    const Percentages = struct {
+        cpu: f32 = 0.0,
+        user: f32 = 0.0,
+        system: f32 = 0.0,
+        iowait: f32 = 0.0,
+    };
+
+    /// Derived CPU percentages for the interval `prev` -> `self`. The
+    /// denominator is the aggregate-total delta, saturated at 0 so a backwards
+    /// counter can't wrap it. Crucially this is total() -| total(), NOT the sum
+    /// of the per-field clamped deltas: if one counter resets while others
+    /// advance, the aggregate total only shrinks by that field's real
+    /// regression - summing clamped fields instead would drop the reset field's
+    /// whole share from the denominator and inflate every other percentage.
+    /// Numerators come from deltaSince (each clamped at 0), and because a
+    /// clamped numerator can briefly exceed the aggregate denominator on a reset
+    /// tick, every percentage is clamped to 0-100 so one field's wrap can't push
+    /// another past 100. Returns all-zero when the interval has no net jiffies.
+    fn percentagesSince(self: CpuStats, prev: CpuStats) Percentages {
+        const total_delta = self.total() -| prev.total();
+        if (total_delta == 0) return .{};
+
+        const delta = self.deltaSince(prev);
+        const total_f: f32 = @floatFromInt(total_delta);
+        const busy = total_delta -| delta.idle;
+        return .{
+            .cpu = std.math.clamp(100.0 * @as(f32, @floatFromInt(busy)) / total_f, 0.0, 100.0),
+            .user = std.math.clamp(100.0 * @as(f32, @floatFromInt(delta.user + delta.nice)) / total_f, 0.0, 100.0),
+            .system = std.math.clamp(100.0 * @as(f32, @floatFromInt(delta.system)) / total_f, 0.0, 100.0),
+            .iowait = std.math.clamp(100.0 * @as(f32, @floatFromInt(delta.iowait)) / total_f, 0.0, 100.0),
         };
     }
 };
@@ -143,35 +178,18 @@ pub const Collector = struct {
         const cpu_stats = try self.readCpuStats();
         const mem_stats = try self.readMemStats();
 
-        // Calculate CPU percentages
-        var cpu_percent: f32 = 0.0;
-        var cpu_user: f32 = 0.0;
-        var cpu_system: f32 = 0.0;
-        var cpu_iowait: f32 = 0.0;
-
-        if (self.prev_cpu) |prev| {
-            // Clamped per-field deltas (see CpuStats.deltaSince): summing them
-            // for the total keeps total_delta >= each field delta by
-            // construction, so the divisions below cannot exceed 100% and
-            // total_delta - delta.idle cannot underflow.
-            const delta = cpu_stats.deltaSince(prev);
-            const total_delta = delta.total();
-            if (total_delta > 0) {
-                const total_f: f32 = @floatFromInt(total_delta);
-                cpu_percent = 100.0 * @as(f32, @floatFromInt(total_delta - delta.idle)) / total_f;
-                cpu_user = 100.0 * @as(f32, @floatFromInt(delta.user + delta.nice)) / total_f;
-                cpu_system = 100.0 * @as(f32, @floatFromInt(delta.system)) / total_f;
-                cpu_iowait = 100.0 * @as(f32, @floatFromInt(delta.iowait)) / total_f;
-            }
-        }
+        // Calculate CPU percentages. percentagesSince centralizes the
+        // saturating-denominator + clamped-numerator math (see CpuStats); the
+        // first sample has no baseline and stays all-zero.
+        const cpu = if (self.prev_cpu) |prev| cpu_stats.percentagesSince(prev) else CpuStats.Percentages{};
 
         self.prev_cpu = cpu_stats;
 
         return SystemMetrics{
-            .cpu_percent = cpu_percent,
-            .cpu_user = cpu_user,
-            .cpu_system = cpu_system,
-            .cpu_iowait = cpu_iowait,
+            .cpu_percent = cpu.cpu,
+            .cpu_user = cpu.user,
+            .cpu_system = cpu.system,
+            .cpu_iowait = cpu.iowait,
             .mem_total = mem_stats.total,
             .mem_used = mem_stats.used,
             .mem_percent = mem_stats.percent,
@@ -1000,29 +1018,114 @@ test "deltaSince clamps counters that step backwards" {
     try std.testing.expectEqual(@as(u64, 0), clamped.total());
 
     // The documented case: iowait alone decreases while the rest advance. The
-    // iowait delta clamps to 0 and the summed total only loses iowait's share.
+    // iowait field delta clamps to 0 (this struct's total() is not the
+    // percentage denominator - see the percentagesSince test below).
     var iowait_back = advanced;
     iowait_back.iowait = 50;
     const partial = iowait_back.deltaSince(base);
     try std.testing.expectEqual(@as(u64, 0), partial.iowait);
-    try std.testing.expectEqual(@as(u64, 99), partial.total());
 }
 
-// Regression: an iowait counter that went backwards between cycles must clamp
-// to a 0 delta, not wrap. Before the clamp this very test panicked in Debug
-// (integer overflow) and produced an absurd cpu_iowait percent in ReleaseFast.
+// Finding 1 (Codex MEDIUM): the percentage denominator must be the aggregate
+// total delta, not the sum of per-field clamped deltas. When one counter resets
+// while the others advance, summing the clamped fields drops the reset field's
+// whole share from the denominator and inflates every other percentage. With
+// the aggregate denominator the survivors keep their true shares. This is a
+// pure unit test on the delta helper - no live /proc/stat, no tracked process.
+test "percentagesSince keeps survivors sane when one counter resets" {
+    const base = CpuStats{
+        .user = 1000,
+        .nice = 0,
+        .system = 1000,
+        .idle = 6000,
+        .iowait = 1000,
+        .irq = 0,
+        .softirq = 0,
+        .steal = 0,
+    };
+
+    // Baseline interval, every counter advances by a known amount. Aggregate
+    // delta = 10+10+70+10 = 100 jiffies, so each survivor's share is its jiffy
+    // delta in percent.
+    const advanced = CpuStats{
+        .user = 1010,
+        .nice = 0,
+        .system = 1010,
+        .idle = 6070,
+        .iowait = 1010,
+        .irq = 0,
+        .softirq = 0,
+        .steal = 0,
+    };
+    const normal = advanced.percentagesSince(base);
+    try std.testing.expectApproxEqAbs(@as(f32, 30.0), normal.cpu, 0.001); // 100-70 idle
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), normal.user, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), normal.system, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), normal.iowait, 0.001);
+
+    // Headline inflation case: idle (the dominant counter) resets hard
+    // (6070 -> 60) while the busy counters advanced exactly as above. The true
+    // aggregate net is (10 user + 10 system + 10 iowait) - 6010 idle = very
+    // negative, so percentagesSince saturates the denominator to 0 and reports
+    // all-zero - the corrupt sample is dropped, not published. The buggy
+    // sum-of-clamped denominator would instead be 30 busy jiffies (idle's 6010
+    // regression dropped entirely), reporting cpu_percent = 30/30 = 100% busy
+    // out of thin air. That fabricated 100% is exactly the inflation this finding
+    // guards against.
+    var idle_reset = advanced;
+    idle_reset.idle = 60;
+    const reset = idle_reset.percentagesSince(base);
+    try std.testing.expectEqual(@as(f32, 0.0), reset.cpu);
+    try std.testing.expectEqual(@as(f32, 0.0), reset.user);
+    try std.testing.expectEqual(@as(f32, 0.0), reset.system);
+    try std.testing.expectEqual(@as(f32, 0.0), reset.iowait);
+
+    // Partial reset that keeps the aggregate positive: only iowait steps back
+    // (1000 -> 990) while user/system/idle advance. Aggregate net stays clearly
+    // positive, so the survivors keep their honest shares - iowait reads 0 and
+    // does NOT steal denominator from the others (no inflation, no underflow).
+    var iowait_reset = advanced;
+    iowait_reset.iowait = 990;
+    const partial_reset = iowait_reset.percentagesSince(base);
+    // Aggregate net = 10 user + 10 system + 70 idle - 10 iowait = 80 jiffies.
+    try std.testing.expectEqual(@as(f32, 0.0), partial_reset.iowait);
+    try std.testing.expectApproxEqAbs(@as(f32, 12.5), partial_reset.user, 0.001); // 10/80
+    try std.testing.expectApproxEqAbs(@as(f32, 12.5), partial_reset.system, 0.001); // 10/80
+    try std.testing.expect(partial_reset.cpu >= 0.0 and partial_reset.cpu <= 100.0);
+
+    // First-sample / no-progress guard: equal snapshots yield all-zero.
+    const flat = base.percentagesSince(base);
+    try std.testing.expectEqual(@as(f32, 0.0), flat.cpu);
+    try std.testing.expectEqual(@as(f32, 0.0), flat.user);
+
+    // A purely backwards interval (every counter regressed) saturates the
+    // denominator to 0 and returns all-zero rather than wrapping.
+    const all_back = base.percentagesSince(advanced);
+    try std.testing.expectEqual(@as(f32, 0.0), all_back.cpu);
+    try std.testing.expectEqual(@as(f32, 0.0), all_back.iowait);
+}
+
+// Integration smoke test over the live /proc/stat path: an iowait counter that
+// went backwards between cycles must not panic or wrap, and cpu_iowait must
+// clamp to 0 with the other percentages staying in range. The deterministic
+// per-field accounting (and the partial-reset inflation guard) lives in the
+// percentagesSince unit test above - this one only proves the live parse +
+// aggregate-total() denominator survive a backwards counter end to end.
 test "collectMetrics survives an iowait counter decrease" {
     const allocator = std.testing.allocator;
     var collector = try Collector.init(allocator);
     defer collector.deinit();
 
-    // Establish a real baseline, then forge it: iowait far above anything the
-    // next live /proc/stat read can report, idle lowered so the cycle has a
-    // guaranteed positive total delta.
+    // Establish a real baseline, then forge it: push iowait a billion jiffies
+    // above its real value (far more than any single cycle could advance, so
+    // the next live read is guaranteed to show a decrease) while staying well
+    // clear of u64 max so the aggregate total() denominator doesn't overflow.
+    // The huge backwards iowait step drives the aggregate net negative, so the
+    // sample saturates to all-zero - which is the point: cpu_iowait must read 0
+    // and nothing may wrap or panic on the prev.total() path.
     _ = try collector.collectMetrics();
     const prev = &collector.prev_cpu.?;
-    prev.iowait = std.math.maxInt(u64);
-    prev.idle -|= 1000;
+    prev.iowait +|= 1_000_000_000;
 
     const metrics = try collector.collectMetrics();
     try std.testing.expectEqual(@as(f32, 0.0), metrics.cpu_iowait);
