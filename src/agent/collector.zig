@@ -66,6 +66,28 @@ const CpuStats = struct {
         return self.user + self.nice + self.system + self.idle +
             self.iowait + self.irq + self.softirq + self.steal;
     }
+
+    /// Per-field jiffy deltas since `prev`, each saturating at 0. The
+    /// /proc/stat counters are nominally monotonic, but proc(5) warns that
+    /// iowait "can decrease in certain conditions", and we ship ReleaseFast
+    /// builds where an unchecked u64 subtraction wraps to a near-2^64 value
+    /// instead of trapping - one backwards tick would report an absurd
+    /// percentage and poison the whole sample. Every field is clamped (not
+    /// just iowait) so a delta's total() is the sum of the clamped fields:
+    /// each field delta then never exceeds the total, keeping all derived
+    /// percentages within 0-100 even on the tick where a counter stepped back.
+    fn deltaSince(self: CpuStats, prev: CpuStats) CpuStats {
+        return .{
+            .user = self.user -| prev.user,
+            .nice = self.nice -| prev.nice,
+            .system = self.system -| prev.system,
+            .idle = self.idle -| prev.idle,
+            .iowait = self.iowait -| prev.iowait,
+            .irq = self.irq -| prev.irq,
+            .softirq = self.softirq -| prev.softirq,
+            .steal = self.steal -| prev.steal,
+        };
+    }
 };
 
 const ProcessStats = struct {
@@ -128,13 +150,18 @@ pub const Collector = struct {
         var cpu_iowait: f32 = 0.0;
 
         if (self.prev_cpu) |prev| {
-            const total_delta = cpu_stats.total() - prev.total();
+            // Clamped per-field deltas (see CpuStats.deltaSince): summing them
+            // for the total keeps total_delta >= each field delta by
+            // construction, so the divisions below cannot exceed 100% and
+            // total_delta - delta.idle cannot underflow.
+            const delta = cpu_stats.deltaSince(prev);
+            const total_delta = delta.total();
             if (total_delta > 0) {
-                const idle_delta = cpu_stats.idle - prev.idle;
-                cpu_percent = 100.0 * @as(f32, @floatFromInt(total_delta - idle_delta)) / @as(f32, @floatFromInt(total_delta));
-                cpu_user = 100.0 * @as(f32, @floatFromInt((cpu_stats.user + cpu_stats.nice) - (prev.user + prev.nice))) / @as(f32, @floatFromInt(total_delta));
-                cpu_system = 100.0 * @as(f32, @floatFromInt(cpu_stats.system - prev.system)) / @as(f32, @floatFromInt(total_delta));
-                cpu_iowait = 100.0 * @as(f32, @floatFromInt(cpu_stats.iowait - prev.iowait)) / @as(f32, @floatFromInt(total_delta));
+                const total_f: f32 = @floatFromInt(total_delta);
+                cpu_percent = 100.0 * @as(f32, @floatFromInt(total_delta - delta.idle)) / total_f;
+                cpu_user = 100.0 * @as(f32, @floatFromInt(delta.user + delta.nice)) / total_f;
+                cpu_system = 100.0 * @as(f32, @floatFromInt(delta.system)) / total_f;
+                cpu_iowait = 100.0 * @as(f32, @floatFromInt(delta.iowait)) / total_f;
             }
         }
 
@@ -455,9 +482,9 @@ pub const Collector = struct {
             if (time_delta > 0 and prev_stats.starttime == starttime) {
                 const cur_jiffies = utime + stime;
                 const prev_jiffies = prev_stats.utime + prev_stats.stime;
-                // Counters are monotonic for a live process; guard the
+                // Counters are monotonic for a live process; saturate the
                 // subtraction defensively so a kernel counter reset can't wrap.
-                const cpu_delta = if (cur_jiffies >= prev_jiffies) cur_jiffies - prev_jiffies else 0;
+                const cpu_delta = cur_jiffies -| prev_jiffies;
                 cpu_percent = 100.0 * @as(f32, @floatFromInt(cpu_delta)) /
                     @as(f32, @floatFromInt(self.clock_ticks * @as(u64, @intCast(time_delta))));
             }
@@ -923,6 +950,134 @@ test "collect metrics" {
     const metrics2 = try collector.collectMetrics();
     try std.testing.expect(metrics2.mem_total > 0);
     try std.testing.expect(metrics2.mem_percent >= 0.0 and metrics2.mem_percent <= 100.0);
+}
+
+// proc(5) documents that iowait "can decrease in certain conditions"; the
+// other /proc/stat counters get the same treatment because we cannot afford a
+// wrap on any of them. Each field stepping backwards must yield a 0 delta,
+// never a near-2^64 wrap.
+test "deltaSince clamps counters that step backwards" {
+    const base = CpuStats{
+        .user = 100,
+        .nice = 100,
+        .system = 100,
+        .idle = 100,
+        .iowait = 100,
+        .irq = 100,
+        .softirq = 100,
+        .steal = 100,
+    };
+
+    // All counters advanced: plain subtraction.
+    const advanced = CpuStats{
+        .user = 110,
+        .nice = 101,
+        .system = 105,
+        .idle = 180,
+        .iowait = 102,
+        .irq = 100,
+        .softirq = 100,
+        .steal = 103,
+    };
+    const delta = advanced.deltaSince(base);
+    try std.testing.expectEqual(@as(u64, 10), delta.user);
+    try std.testing.expectEqual(@as(u64, 80), delta.idle);
+    try std.testing.expectEqual(@as(u64, 2), delta.iowait);
+    try std.testing.expectEqual(@as(u64, 101), delta.total());
+
+    // Every field one below the baseline: each delta clamps to 0.
+    const stepped_back = CpuStats{
+        .user = 99,
+        .nice = 99,
+        .system = 99,
+        .idle = 99,
+        .iowait = 99,
+        .irq = 99,
+        .softirq = 99,
+        .steal = 99,
+    };
+    const clamped = stepped_back.deltaSince(base);
+    try std.testing.expectEqual(@as(u64, 0), clamped.total());
+
+    // The documented case: iowait alone decreases while the rest advance. The
+    // iowait delta clamps to 0 and the summed total only loses iowait's share.
+    var iowait_back = advanced;
+    iowait_back.iowait = 50;
+    const partial = iowait_back.deltaSince(base);
+    try std.testing.expectEqual(@as(u64, 0), partial.iowait);
+    try std.testing.expectEqual(@as(u64, 99), partial.total());
+}
+
+// Regression: an iowait counter that went backwards between cycles must clamp
+// to a 0 delta, not wrap. Before the clamp this very test panicked in Debug
+// (integer overflow) and produced an absurd cpu_iowait percent in ReleaseFast.
+test "collectMetrics survives an iowait counter decrease" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    // Establish a real baseline, then forge it: iowait far above anything the
+    // next live /proc/stat read can report, idle lowered so the cycle has a
+    // guaranteed positive total delta.
+    _ = try collector.collectMetrics();
+    const prev = &collector.prev_cpu.?;
+    prev.iowait = std.math.maxInt(u64);
+    prev.idle -|= 1000;
+
+    const metrics = try collector.collectMetrics();
+    try std.testing.expectEqual(@as(f32, 0.0), metrics.cpu_iowait);
+    try std.testing.expect(metrics.cpu_percent >= 0.0 and metrics.cpu_percent <= 100.0);
+    try std.testing.expect(metrics.cpu_user >= 0.0 and metrics.cpu_user <= 100.0);
+    try std.testing.expect(metrics.cpu_system >= 0.0 and metrics.cpu_system <= 100.0);
+}
+
+// Same wrap class for the per-process path: a stored jiffy baseline above the
+// live counters (kernel counter reset) must clamp to 0% CPU, not wrap.
+test "collectProcesses clamps a process jiffy counter decrease" {
+    const allocator = std.testing.allocator;
+    var collector = try Collector.init(allocator);
+    defer collector.deinit();
+
+    const first = try collector.collectProcesses(allocator);
+    for (first) |proc| {
+        allocator.free(proc.name);
+        allocator.free(proc.cmdline);
+        allocator.free(proc.username);
+        allocator.free(proc.cgroup);
+        allocator.free(proc.unit);
+    }
+    allocator.free(first);
+
+    // Forge our own baseline: jiffies far above the live counters, timestamp
+    // backdated so the delta window is open. starttime is left intact so the
+    // PID-reuse guard still matches the live process.
+    const my_pid: u32 = @intCast(std.os.linux.getpid());
+    const entry = collector.prev_processes.getPtr(my_pid) orelse return error.TestPidNotTracked;
+    entry.utime = std.math.maxInt(u64) / 2;
+    entry.stime = std.math.maxInt(u64) / 2;
+    entry.timestamp -= 10;
+
+    const processes = try collector.collectProcesses(allocator);
+    defer {
+        for (processes) |proc| {
+            allocator.free(proc.name);
+            allocator.free(proc.cmdline);
+            allocator.free(proc.username);
+            allocator.free(proc.cgroup);
+            allocator.free(proc.unit);
+        }
+        allocator.free(processes);
+    }
+
+    var found = false;
+    for (processes) |proc| {
+        if (proc.pid == my_pid) {
+            found = true;
+            try std.testing.expectEqual(@as(f32, 0.0), proc.cpu_percent);
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "collect processes" {
