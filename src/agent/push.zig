@@ -360,6 +360,11 @@ pub fn pushMetrics(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
+    // For https URLs this fetch verifies the server cert against the system CA
+    // bundle and enforces hostname/SAN matching by default (zig 0.15.2): both a
+    // self-signed cert and a SAN mismatch fail with error.TlsInitializationFailed
+    // before any bytes are sent. Verified empirically 2026-06-09 against a local
+    // TLS server with positive and negative controls.
     const result = try client.fetch(.{
         .location = .{ .url = ingest_url },
         .method = .POST,
