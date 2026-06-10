@@ -251,20 +251,159 @@ pub const max_body_bytes: usize = 1024 * 1024;
 /// stops sending mid-request would otherwise block the single-threaded accept
 /// loop forever; with the deadline the blocked read errors out and the
 /// connection is dropped, so the loop always returns to accept().
+///
+/// CAVEAT this alone does NOT cover: SO_RCVTIMEO is an *inactivity* timeout, it
+/// re-arms on every byte. A client dribbling one byte every <10s makes progress
+/// the kernel never times out, holding the single-threaded loop indefinitely -
+/// and stop() only shuts the LISTENER, not the accepted stream, so shutdown
+/// would hang on that client. The `ConnWatchdog` below adds the missing
+/// *absolute* per-request deadline AND a stop()-triggered interrupt of the
+/// in-flight accepted fd, so a slow-drip client can never wedge the loop or
+/// block shutdown.
 pub const read_timeout_s: isize = 10;
+
+/// Absolute per-request deadline enforced by `ConnWatchdog`, independent of the
+/// inactivity-based `read_timeout_s`. Once a connection has been accepted, the
+/// whole serve (read head + body + inline forward) must finish within this many
+/// seconds or the watchdog shutdown()s the active fd to unblock it. Generous
+/// relative to read_timeout_s/forward_timeout_s (which fire first under normal
+/// stalls); this is the hard ceiling that also bounds a slow-drip client that
+/// keeps SO_RCVTIMEO from ever firing.
+pub const request_deadline_s: i64 = 30;
+
+/// Single-connection watchdog: makes both an absolute per-request deadline and
+/// stop() able to INTERRUPT the one in-flight blocking syscall on the accept
+/// loop. The accept loop is single-threaded and serves one connection at a
+/// time, so there is at most one "active fd" to watch.
+///
+/// The loop thread calls `arm(fd)` with whichever fd it is about to block on
+/// (the accepted inbound socket while reading the request; the forward socket
+/// once the inline forward has connected) and `disarm()` when the serve ends.
+/// A dedicated watchdog thread sleeps on `wake` until either (a) the active
+/// connection's absolute deadline passes or (b) stop() fires `wake` with
+/// running=false; in either case it `shutdown(.both)`s the currently-armed fd,
+/// which unblocks the loop thread's blocked recv/send/handshake immediately.
+///
+/// The deadline is set once when the serve begins and stays fixed across re-arms
+/// (the fd changes as the serve moves from inbound read to forward, the deadline
+/// does not), so the watchdog bounds the WHOLE serve, not each phase separately.
+///
+/// fd-reuse safety: `arm`/`disarm` and the watchdog's read+shutdown all hold the
+/// same `mutex`, so the watchdog only ever shutdown()s the fd that is armed at
+/// that instant - never a number the loop thread has already disarmed and the
+/// kernel has since handed to an unrelated socket.
+///
+/// RESIDUAL (documented, not hidden): the watchdog can only interrupt an fd that
+/// EXISTS. The forward's connect phase - DNS + TCP connect + TLS handshake done
+/// inside std.http.Client.connect - creates the socket internally and does not
+/// expose it until connect() returns, so that phase is NOT covered by this
+/// watchdog and remains bounded only by the kernel's connect timeout. See
+/// `forward_timeout_s` and HostedForwarder.forward for the full accounting.
+pub const ConnWatchdog = struct {
+    mutex: std.Thread.Mutex = .{},
+    wake: std.Thread.ResetEvent = .{},
+    running: *std.atomic.Value(bool),
+    // -1 == nothing armed. The deadline is an absolute monotonic-ish wall-clock
+    // ms (std.time.milliTimestamp); only its ordering against "now" matters.
+    active_fd: std.posix.socket_t = -1,
+    deadline_ms: i64 = 0,
+    thread: ?std.Thread = null,
+
+    /// Spawn the watchdog thread. Mirrors Receiver.start: kept out of init so the
+    /// thread captures the watchdog's final address.
+    pub fn start(self: *ConnWatchdog) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Wake the watchdog (so it observes running=false) and join it. Safe to call
+    /// whether or not `start` ran.
+    pub fn stop(self: *ConnWatchdog) void {
+        self.wake.set();
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    /// Mark `fd` as the active blocking fd and (re)start the deadline window.
+    /// `fresh_deadline` true sets a new absolute deadline (serve start); false
+    /// keeps the existing deadline (re-arming onto a different fd mid-serve, e.g.
+    /// moving from the inbound socket to the forward socket).
+    pub fn arm(self: *ConnWatchdog, fd: std.posix.socket_t, fresh_deadline: bool) void {
+        self.mutex.lock();
+        self.active_fd = fd;
+        if (fresh_deadline) self.deadline_ms = std.time.milliTimestamp() + request_deadline_s * std.time.ms_per_s;
+        self.mutex.unlock();
+        // Re-arm the watchdog's timing against the (possibly new) deadline/fd.
+        self.wake.set();
+    }
+
+    /// Clear the active fd (serve finished); the watchdog has nothing to shutdown
+    /// until the next `arm`.
+    pub fn disarm(self: *ConnWatchdog) void {
+        self.mutex.lock();
+        self.active_fd = -1;
+        self.mutex.unlock();
+    }
+
+    fn run(self: *ConnWatchdog) void {
+        while (true) {
+            const stopping = !self.running.load(.seq_cst);
+
+            // Reset the wake BEFORE sampling the state, so an arm()/stop() that
+            // fires while we evaluate is not lost: it leaves the event set and
+            // the next timedWait returns immediately to re-evaluate.
+            self.wake.reset();
+
+            self.mutex.lock();
+            const fd = self.active_fd;
+            const deadline = self.deadline_ms;
+            const now = std.time.milliTimestamp();
+            // Interrupt the in-flight connection when EITHER the absolute request
+            // deadline has passed OR stop() is shutting the receiver down. We read
+            // active_fd and shutdown it in the SAME critical section the loop
+            // thread's arm()/disarm() take, so we can never shutdown an fd number
+            // the loop thread has already disarmed and the kernel has reused - the
+            // lock alone serializes us against arm/disarm, no extra recheck needed.
+            if (fd != -1 and (stopping or now >= deadline)) {
+                std.posix.shutdown(fd, .both) catch {};
+            }
+            self.mutex.unlock();
+
+            // stop() observed: the in-flight fd (if any) has been interrupted, so
+            // the loop thread's serve unblocks and the accept thread can join.
+            if (stopping) return;
+
+            // Sleep until the next deadline (armed) or indefinitely (idle), woken
+            // early by arm()/disarm()/stop(). A still-armed-but-not-yet-expired
+            // connection wakes us exactly at its deadline; nothing armed waits a
+            // bounded poll so a missed wake still re-evaluates within a second.
+            const timeout_ns: u64 = if (fd == -1)
+                std.time.ns_per_s
+            else if (now >= deadline)
+                std.time.ns_per_s // just shut it; poll for the disarm
+            else
+                @as(u64, @intCast(deadline - now)) * std.time.ns_per_ms;
+            self.wake.timedWait(timeout_ns) catch {};
+        }
+    }
+};
 
 /// The forward seam. The receiver hands each request's mapped entries to this
 /// function pointer so tests can fake the forwarder; main.zig wires in the
 /// real hosted forwarder (`HostedForwarder`) or `drop_forwarder` when the
 /// hosted credentials are missing. `arena` is the per-request arena - anything
 /// the forwarder allocates from it dies with the request, and `entries` are
-/// only valid for the duration of the call.
+/// only valid for the duration of the call. `watchdog` (when non-null) lets a
+/// real socket forwarder register its connected fd so the absolute request
+/// deadline and stop() can interrupt a stalled TLS handshake / send / recv;
+/// fakes ignore it.
 pub const Forwarder = struct {
     ctx: ?*anyopaque = null,
-    forwardFn: *const fn (ctx: ?*anyopaque, arena: Allocator, entries: []const logs_mod.LogEntry) anyerror!void,
+    forwardFn: *const fn (ctx: ?*anyopaque, arena: Allocator, entries: []const logs_mod.LogEntry, watchdog: ?*ConnWatchdog) anyerror!void,
 
-    pub fn forward(f: Forwarder, arena: Allocator, entries: []const logs_mod.LogEntry) anyerror!void {
-        return f.forwardFn(f.ctx, arena, entries);
+    pub fn forward(f: Forwarder, arena: Allocator, entries: []const logs_mod.LogEntry, watchdog: ?*ConnWatchdog) anyerror!void {
+        return f.forwardFn(f.ctx, arena, entries, watchdog);
     }
 };
 
@@ -276,7 +415,7 @@ pub const Forwarder = struct {
 /// is enabled-but-unwired instead of silently accepting-and-dropping telemetry.
 pub const drop_forwarder = Forwarder{ .forwardFn = dropForward };
 
-fn dropForward(_: ?*anyopaque, _: Allocator, _: []const logs_mod.LogEntry) anyerror!void {
+fn dropForward(_: ?*anyopaque, _: Allocator, _: []const logs_mod.LogEntry, _: ?*ConnWatchdog) anyerror!void {
     return error.OtlpForwardingNotConfigured;
 }
 
@@ -289,10 +428,25 @@ fn dropForward(_: ?*anyopaque, _: Allocator, _: []const logs_mod.LogEntry) anyer
 /// knob (verified against std/http/Client.zig in zig 0.15.2: FetchOptions has no
 /// timeout field, and fetch connects + sends + receives internally). So we
 /// pre-connect via client.connect, set the socket deadline on that connection's
-/// fd, then drive client.request over it. This bounds the request write and the
-/// response read; the connect() itself (DNS + TCP + TLS handshake) is bounded
-/// only by the kernel's connect timeout, not this value - acceptable for a v1
-/// inline forward, and removed entirely once forwarding is decoupled from accept.
+/// fd, then drive client.request over it.
+///
+/// WHAT IS BOUNDED, precisely (do not over-claim):
+///   - request write + response read: SO_SNDTIMEO/SO_RCVTIMEO above, AND - once
+///     connect() returns and we register the fd with the ConnWatchdog - the
+///     absolute request deadline and a stop()-triggered shutdown. So a peer that
+///     completes the handshake then stalls cannot wedge the loop or block
+///     shutdown beyond `request_deadline_s`.
+///   - connect() itself (DNS resolution + TCP connect + TLS handshake): NOT
+///     bounded by this value and NOT interruptible by the watchdog, because
+///     std.http.Client.connect creates the socket internally and does not expose
+///     the fd until it returns (verified against std/http/Client.zig 0.15.2:
+///     connectTcp -> net.tcpConnectToHost does blocking getAddressList + connect,
+///     then a blocking TLS handshake; Connection.Plain/Tls.create are private, so
+///     we cannot substitute a non-blocking connect without reimplementing that
+///     path or taking a dependency). This phase is bounded only by the kernel's
+///     connect timeout. Acceptable for a v1 inline forward against a same-host
+///     trusted hosted endpoint; the whole inline forward (and this residual) is
+///     removed once forwarding is decoupled from accept onto its own thread.
 pub const forward_timeout_s: isize = 10;
 
 /// Forwards mapped records to the hosted OTLP receiver (sermon-web plan 23):
@@ -311,7 +465,7 @@ pub const HostedForwarder = struct {
         return .{ .ctx = self, .forwardFn = forward };
     }
 
-    fn forward(ctx: ?*anyopaque, arena: Allocator, entries: []const logs_mod.LogEntry) anyerror!void {
+    fn forward(ctx: ?*anyopaque, arena: Allocator, entries: []const logs_mod.LogEntry, watchdog: ?*ConnWatchdog) anyerror!void {
         const self: *HostedForwarder = @ptrCast(@alignCast(ctx.?));
         if (entries.len == 0) return;
 
@@ -338,10 +492,19 @@ pub const HostedForwarder = struct {
 
         // Pre-connect so we can set the deadline on the socket BEFORE any
         // request byte moves. keep_alive=false on the request below tears this
-        // connection down after the one POST (no pooling across requests).
+        // connection down after the one POST (no pooling across requests). The
+        // connect() above is the watchdog's blind spot (see forward_timeout_s);
+        // everything from here on runs against an fd we can hand to the watchdog.
         const connection = try client.connect(host, port, protocol);
         const deadline = std.posix.timeval{ .sec = forward_timeout_s, .usec = 0 };
         const fd = connection.stream_reader.getStream().handle;
+        // Now that the forward fd exists, move the watchdog onto it (keeping the
+        // serve's absolute deadline) so the absolute request deadline AND stop()
+        // can interrupt a peer that completed the handshake then stalled mid
+        // send/recv - the inactivity timeval below only covers a stall with zero
+        // bytes flowing, not a slow drip. On return the receiver re-arms the
+        // watchdog onto the inbound fd to finish writing the local response.
+        if (watchdog) |wd| wd.arm(fd, false);
         inline for (.{ std.posix.SO.SNDTIMEO, std.posix.SO.RCVTIMEO }) |opt| {
             std.posix.setsockopt(fd, std.posix.SOL.SOCKET, opt, std.mem.asBytes(&deadline)) catch |err| {
                 // Without the deadline a hung forward could wedge the accept
@@ -478,6 +641,11 @@ pub const Receiver = struct {
     listener6: ?std.net.Server,
     running: *std.atomic.Value(bool),
     forwarder: Forwarder,
+    // Per-connection watchdog: gives the single-threaded accept loop an absolute
+    // request deadline and lets stop() interrupt the one in-flight serve, so a
+    // slow-drip client (one that keeps SO_RCVTIMEO from ever firing) can neither
+    // wedge the loop nor hang shutdown. See ConnWatchdog.
+    watchdog: ConnWatchdog,
     thread: ?std.Thread = null,
 
     pub fn init(
@@ -518,6 +686,7 @@ pub const Receiver = struct {
             .listener6 = listener6,
             .running = running,
             .forwarder = forwarder,
+            .watchdog = .{ .running = running },
         };
     }
 
@@ -528,25 +697,36 @@ pub const Receiver = struct {
         return self.listener.listen_address.getPort();
     }
 
-    /// Spawn the accept-loop thread. Separate from `init` so the thread only
-    /// ever captures the Receiver's FINAL address - call this after the struct
-    /// has been moved to where it will live.
+    /// Spawn the watchdog thread and the accept-loop thread. Separate from `init`
+    /// so the threads only ever capture the Receiver's FINAL address - call this
+    /// after the struct has been moved to where it will live. The watchdog starts
+    /// first so it is already watching before the first connection can arm it.
     pub fn start(self: *Receiver) !void {
+        try self.watchdog.start();
+        errdefer self.watchdog.stop();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
     /// Unblock the accept loop, join the thread, close both listeners. Safe to
-    /// call whether or not `start` succeeded. An in-flight request finishes
-    /// first (bounded by `read_timeout_s` against a hung client), so join can
-    /// take up to that long in the worst case. shutdown() on each listener wakes
-    /// a blocked accept/poll; the fds are only closed after the thread joins.
+    /// call whether or not `start` succeeded. shutdown() on each listener wakes a
+    /// blocked accept/poll; the watchdog (woken via running=false) interrupts any
+    /// in-flight serve - including a slow-drip client or a stalled forward - so
+    /// the accept thread joins promptly (within request_deadline_s in the worst
+    /// case, immediately when stop() races an active fd). The watchdog thread is
+    /// joined only AFTER the accept thread, since it must stay alive to interrupt
+    /// that last in-flight serve. The fds are only closed after both threads join.
     pub fn stop(self: *Receiver) void {
         std.posix.shutdown(self.listener.stream.handle, .both) catch {};
         if (self.listener6) |l6| std.posix.shutdown(l6.stream.handle, .both) catch {};
+        // running=false was set by the caller (or set it ourselves defensively so
+        // the watchdog interrupts even if stop() is called standalone in a test).
+        self.running.store(false, .seq_cst);
+        self.watchdog.wake.set();
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
+        self.watchdog.stop();
         self.listener.deinit();
         if (self.listener6) |*l6| l6.deinit();
     }
@@ -621,6 +801,13 @@ pub const Receiver = struct {
     /// request per connection (no keep-alive) naturally bounds how long a
     /// single producer can hold the single-threaded loop; SDKs reconnect.
     fn serveConnection(self: *Receiver, stream: std.net.Stream) void {
+        // Arm the watchdog on the inbound fd with a FRESH absolute deadline for
+        // the whole serve. SO_RCVTIMEO below only catches a total stall; the
+        // watchdog is what bounds a slow-drip client that keeps it from firing,
+        // and what lets stop() interrupt this serve mid-read. disarm on exit.
+        self.watchdog.arm(stream.handle, true);
+        defer self.watchdog.disarm();
+
         const timeout = std.posix.timeval{ .sec = read_timeout_s, .usec = 0 };
         std.posix.setsockopt(
             stream.handle,
@@ -646,12 +833,12 @@ pub const Receiver = struct {
         // A malformed/empty head (or a read deadline firing) leaves nothing
         // useful to respond to; just drop the connection.
         var request = http_server.receiveHead() catch return;
-        self.handleRequest(&request) catch |err| {
+        self.handleRequest(&request, stream.handle) catch |err| {
             std.log.warn("otlp receiver: request handling failed: {}", .{err});
         };
     }
 
-    fn handleRequest(self: *Receiver, request: *std.http.Server.Request) !void {
+    fn handleRequest(self: *Receiver, request: *std.http.Server.Request, inbound_fd: std.posix.socket_t) !void {
         // Every response sets keep_alive = false (one request per connection),
         // which also means respond() never tries to drain an unread body.
         if (request.head.method != .POST) {
@@ -724,7 +911,15 @@ pub const Receiver = struct {
         // the OTLP-spec retryable status, so the SDK holds and re-sends instead.
         // Phase 3 persistence is what will let an accepted record survive a
         // forward failure and turn this back into an unconditional 200.
-        self.forwarder.forward(arena, entries.items) catch |err| {
+        // The real (socket) forwarder moves the watchdog onto its connected fd so
+        // the absolute deadline / stop() can interrupt a stalled forward. The
+        // moment it returns - success or error - re-arm the watchdog onto the
+        // inbound fd (same serve deadline, not a fresh one) so the local response
+        // write is watched and the dog is never left pointing at the now-closed
+        // forward fd. This must run BEFORE either respond() below.
+        const forward_result = self.forwarder.forward(arena, entries.items, &self.watchdog);
+        self.watchdog.arm(inbound_fd, false);
+        forward_result catch |err| {
             std.log.warn("otlp receiver: forward to hosted /v1/logs failed: {} - 503 so the SDK retries", .{err});
             return request.respond("", .{ .status = .service_unavailable, .keep_alive = false });
         };
@@ -932,7 +1127,7 @@ const TestForwarder = struct {
     identifiers: std.ArrayList(?[]u8) = .empty,
     fail: bool = false,
 
-    fn forward(ctx: ?*anyopaque, _: Allocator, entries: []const logs_mod.LogEntry) anyerror!void {
+    fn forward(ctx: ?*anyopaque, _: Allocator, entries: []const logs_mod.LogEntry, _: ?*ConnWatchdog) anyerror!void {
         const self: *TestForwarder = @ptrCast(@alignCast(ctx.?));
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -988,6 +1183,86 @@ test "receiver stop() unblocks the blocked accept and joins within a deadline" {
     const before_ms = std.time.milliTimestamp();
     receiver.stop(); // must shutdown-wake the accept; a plain close would not be safe
     const elapsed_ms = std.time.milliTimestamp() - before_ms;
+    try std.testing.expect(elapsed_ms < 5_000);
+}
+
+test "ConnWatchdog absolute deadline interrupts a blocked read" {
+    // Prove the deadline path (not the stop path) wakes a blocked syscall: arm
+    // the watchdog on the read-end of a connected TCP pair whose peer never
+    // sends, then block on read(). The watchdog's shutdown(.both) at the deadline
+    // makes the read return (0 bytes / error) instead of hanging forever. A short
+    // deadline keeps this deterministic and fast; we set deadline_ms directly so
+    // the test does not depend on the production request_deadline_s.
+    var listener = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{});
+    defer listener.deinit();
+    const client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    const server_conn = try listener.accept();
+    defer server_conn.stream.close();
+
+    var running = std.atomic.Value(bool).init(true);
+    var watchdog = ConnWatchdog{ .running = &running };
+    try watchdog.start();
+    defer {
+        running.store(false, .seq_cst);
+        watchdog.stop();
+    }
+
+    // Arm with a fresh deadline, then overwrite it with a near-immediate one so
+    // the watchdog fires within ~50ms regardless of request_deadline_s.
+    watchdog.arm(client.handle, true);
+    watchdog.mutex.lock();
+    watchdog.deadline_ms = std.time.milliTimestamp() + 50;
+    watchdog.mutex.unlock();
+    watchdog.wake.set();
+
+    // This read would block indefinitely (peer is silent); the watchdog's
+    // deadline shutdown is the ONLY thing that unblocks it. If the watchdog were
+    // broken this test hangs, which the test runner surfaces as a timeout.
+    var buf: [16]u8 = undefined;
+    const before_ms = std.time.milliTimestamp();
+    _ = client.read(&buf) catch {};
+    const elapsed_ms = std.time.milliTimestamp() - before_ms;
+    watchdog.disarm();
+    // Returned promptly after the deadline, not after request_deadline_s.
+    try std.testing.expect(elapsed_ms < 5_000);
+}
+
+test "receiver stop() interrupts an in-flight serve via the watchdog and joins" {
+    const allocator = std.testing.allocator;
+
+    var running = std.atomic.Value(bool).init(true);
+    var receiver = try Receiver.init(allocator, 0, &running, drop_forwarder);
+    try receiver.start();
+
+    // Open a connection and send a PARTIAL request head (no terminating
+    // CRLFCRLF), then never finish. This wedges the accept loop inside
+    // receiveHead reading this fd: SO_RCVTIMEO re-arms on each byte, so a
+    // slow-drip client could hold it indefinitely and the listener shutdown
+    // alone (the pre-existing mechanism) would not touch this already-accepted
+    // stream. Only the watchdog shutting down the inbound fd can unblock it.
+    const stream = try std.net.tcpConnectToAddress(receiver.listener.listen_address);
+    defer stream.close();
+    try stream.writeAll("POST /v1/logs HTTP/1.1\r\nhost: 127.0.0.1\r\n");
+
+    // Deterministically wait until the accept loop has armed the watchdog on the
+    // accepted inbound fd - that is the happens-before signal that the serve is
+    // in flight (no fixed sleep as the sync point). Then stop(): the watchdog
+    // observes running=false, shutdown()s the armed inbound fd, the blocked read
+    // errors out, and the accept thread joins promptly.
+    while (true) {
+        receiver.watchdog.mutex.lock();
+        const armed = receiver.watchdog.active_fd != -1;
+        receiver.watchdog.mutex.unlock();
+        if (armed) break;
+        std.atomic.spinLoopHint();
+    }
+
+    running.store(false, .seq_cst);
+    const before_ms = std.time.milliTimestamp();
+    receiver.stop();
+    const elapsed_ms = std.time.milliTimestamp() - before_ms;
+    // Joined promptly via the watchdog interrupt, NOT after request_deadline_s.
     try std.testing.expect(elapsed_ms < 5_000);
 }
 
