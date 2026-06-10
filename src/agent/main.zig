@@ -313,16 +313,23 @@ pub fn main() !void {
     var hosted_forwarder: otlp_receiver_mod.HostedForwarder = undefined;
     var otlp_receiver: ?otlp_receiver_mod.Receiver = null;
     if (receiver_enabled) {
+        // Empty string == unset for forwarding: a blank otlp_token or server_url
+        // in config.json would otherwise pass the null check and drive a forward
+        // that is guaranteed to fail (bad URL / empty Bearer). Collapsing empty
+        // to "not configured" routes it to drop_forwarder, which the receiver
+        // turns into an honest 503 instead of an inevitable failed forward.
+        const url_set: ?[]const u8 = if (server_url) |u| (if (u.len > 0) u else null) else null;
+        const token_set: ?[]const u8 = if (otlp_token) |t| (if (t.len > 0) t else null) else null;
         const forwarder: otlp_receiver_mod.Forwarder = blk: {
-            if (server_url) |url| {
-                if (otlp_token) |token| {
+            if (url_set) |url| {
+                if (token_set) |token| {
                     hosted_forwarder = .{ .server_url = url, .otlp_token = token };
                     break :blk hosted_forwarder.forwarder();
                 }
             }
             std.debug.print(
-                "Warning: receiver_enabled is set but {s} is missing - received OTLP is accepted and dropped (forwarding disabled; on-host persistence is plan 26 phase 3)\n",
-                .{if (server_url == null) "server_url" else "otlp_token"},
+                "Warning: receiver_enabled is set but {s} is missing or empty - received OTLP cannot be forwarded and the receiver answers 503 (no on-host persistence until plan 26 phase 3)\n",
+                .{if (url_set == null) "server_url" else "otlp_token"},
             );
             break :blk otlp_receiver_mod.drop_forwarder;
         };
