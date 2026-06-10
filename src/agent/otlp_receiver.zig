@@ -138,10 +138,19 @@ pub fn syslogPriorityFromSeverity(severity_number: ?i64) u8 {
 /// The same goes for a value that parses but whose seconds overflow i64: this
 /// field is producer-controlled, and an unchecked cast here would panic - and
 /// a panic aborts the whole daemon, not just this request.
+///
+/// A NEGATIVE value is also treated as invalid (falls back to `now`, exactly
+/// like absent). OTLP `timeUnixNano` is unsigned, so a negative is malformed -
+/// but more than that, letting it through poisons the forward: buildForwardBody
+/// re-serializes the stored seconds as nanoseconds, so a negative timestamp
+/// becomes a negative `timeUnixNano` on the wire, the hosted side rejects the
+/// whole batch, and the receiver answers 503 forever on the same records. We
+/// parse signed (i128) only to detect-and-reject the negative, not to keep it.
 pub fn unixSecondsFromNano(time_unix_nano: ?[]const u8, now: i64) i64 {
     const s = time_unix_nano orelse return now;
     if (s.len == 0) return now;
     const nanos = std.fmt.parseInt(i128, s, 10) catch return now;
+    if (nanos < 0) return now;
     return std.math.cast(i64, @divTrunc(nanos, std.time.ns_per_s)) orelse now;
 }
 
@@ -747,6 +756,12 @@ test "unixSecondsFromNano converts nanos to seconds and falls back to now" {
     // Fits in i128 but the seconds overflow i64: must fall back, not panic.
     try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("10000000000000000000000000000", 42));
     try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("-10000000000000000000000000000", 42));
+    // A SMALL parseable negative (OTLP timeUnixNano is unsigned, so this is
+    // malformed) must also fall back to now, not pass through as negative
+    // seconds: a negative timestamp re-serializes to a negative timeUnixNano on
+    // the forward, the hosted side rejects the batch, and we 503 it forever.
+    try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("-1000000000", 42));
+    try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("-1", 42));
 }
 
 test "mapLogRecord maps an OTLP log record to an owned LogEntry" {
