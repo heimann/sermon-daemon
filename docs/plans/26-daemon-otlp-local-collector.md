@@ -87,12 +87,13 @@ receiver runs on its own `std.Thread`, spawned at startup only when
 
 ```
 main collection loop (existing)        receiver thread (new, opt-in)
-  collect /proc + journald               listen 127.0.0.1:receiver_port
+  collect /proc + journald               listen 127.0.0.1 + ::1 :receiver_port
   append to staging -> roll to parquet   accept ONE connection
   push sampled copy to /api/ingest       read request, parse OTLP/JSON logs
                                          map -> logs.LogEntry
                                          forward sampled copy -> /v1/logs
-                                         respond 200, close, accept next
+                                         respond 200 (or 503 if forward failed),
+                                           close, accept next
 ```
 
 The receiver loop is **single-threaded and synchronous**: accept one
@@ -179,10 +180,14 @@ receiver (plan 23):
   can start with "forward all" and add a sample knob alongside the existing
   `log_rules` mechanism.
 
-A missing or empty `otlp_token` with `receiver_enabled = true` is a startup
-warning and disables forwarding (receive-and-drop, or receive-and-store-only
-once persistence lands), mirroring how `--server` without `--key` warns and
-disables push in `main.zig`.
+A missing or empty `otlp_token` (or `server_url`) with `receiver_enabled = true`
+is a startup warning and disables forwarding, mirroring how `--server` without
+`--key` warns and disables push in `main.zig`. Because phase 2 has NO on-host
+persistence, a receiver that cannot forward also cannot keep the record, so in
+that state the receiver answers `503 Service Unavailable` to every `POST` rather
+than silently accepting-and-dropping: the SDK then holds the batch and retries.
+Once persistence lands (phase 3) an accepted record survives a forward failure,
+and the unconfigured case becomes "receive-and-store-only" with a `200`.
 
 ## Config
 
@@ -201,8 +206,12 @@ existing optional-with-default convention (parsed with
 - `receiver_enabled` (`?bool`, default `false`) - master switch. When false the
   receiver thread is never spawned and no socket is opened.
 - `receiver_port` (`?u16`, default `4318`) - localhost port for the OTLP/HTTP
-  listener. Binds `127.0.0.1` only (per the project rule: dev/daemon listeners
-  bind localhost/Tailscale, not all interfaces, unless explicitly asked).
+  listener. Binds the two loopback addresses `127.0.0.1` AND `::1` (so an SDK
+  pointed at `localhost`, which often resolves to `::1` first, still connects),
+  and NOTHING else - not a dual-stack `::` bind, which would be all-interfaces
+  (per the project rule: dev/daemon listeners bind localhost/Tailscale, not all
+  interfaces, unless explicitly asked). A host with IPv6 disabled fails the `::1`
+  bind and runs `127.0.0.1`-only.
 - `otlp_token` (`?[]const u8`, default `null`) - the hosted `otlp_write` Bearer
   token. Distinct from `api_key`.
 
@@ -219,18 +228,25 @@ etc.) but config-only is fine for v1.
    loop is a documented TODO stub gated behind `receiver_enabled = false`. Build
    and `zig build test` stay green; no behavior change for existing installs.
 2. **Listen + forward (logs). (LANDED)** Stand up the single-connection
-   synchronous `std.http.Server` on `127.0.0.1:receiver_port` on its own
-   thread, accept `POST /v1/logs`, parse OTLP/JSON, map via `mapLogRecord`,
-   forward to `/v1/logs` with the `otlp_write` Bearer token. Wire into
-   `main.zig` startup (spawn thread only when enabled; join on shutdown via the
-   existing `running` flag, now atomic since two threads read it). As built:
-   1 MiB body cap, 10 s read deadline per connection, one request per
-   connection, per-request arena, a `Forwarder` seam so tests fake the hosted
-   side, and real-socket tests for the round trip, shutdown join, and the
-   400/404/405/413/415 reject paths. Forward failures log a warning but still
-   200 the local producer (at-most-once upward; phase 3 persistence is what
-   makes a dropped forward recoverable). Missing `server_url`/`otlp_token`
-   means receive-and-drop with a startup warning.
+   synchronous `std.http.Server` on `127.0.0.1` AND `::1` `:receiver_port` on
+   its own thread (two loopback listeners multiplexed with `poll()` so an SDK
+   that resolves `localhost` to `::1` first still connects; NOT a dual-stack
+   `::` bind, which would be all-interfaces), accept `POST /v1/logs`, parse
+   OTLP/JSON, map via `mapLogRecord`, forward to `/v1/logs` with the
+   `otlp_write` Bearer token. Wire into `main.zig` startup (spawn thread only
+   when enabled; join on shutdown via the existing `running` flag, now atomic
+   since two threads read it). As built: 1 MiB body cap, 10 s read deadline per
+   connection, one request per connection, per-request arena, a 10 s send/recv
+   deadline on the inline forward socket so a hung hosted call cannot wedge the
+   accept loop, non-string log bodies rendered to text (or a marked placeholder
+   for binary/structured bodies) rather than silently emptied, a `Forwarder`
+   seam so tests fake the hosted side, and real-socket tests for the round trip
+   (v4 and v6), shutdown join, the 400/404/405/413/415 reject paths, and the
+   forward-failure/unconfigured 503 paths. Because phase 2 has no persistence, a
+   forward that FAILS (hosted rejected/unreachable, or forwarding unconfigured)
+   answers `503` so the SDK retries instead of dropping what we accepted; only a
+   forward that SUCCEEDS answers `200`. Phase 3 persistence is what turns the
+   failure path back into an unconditional `200`.
 3. **On-host persistence (logs).** Hand mapped records to the collection loop
    (queue) so the existing single staging writer appends them to the `logs`
    table; received logs become locally queryable exactly like journald logs.
@@ -273,9 +289,16 @@ etc.) but config-only is fine for v1.
 - **Two credentials to manage.** `api_key` (ingest) and `otlp_token` (OTLP
   forward) are distinct and independently revocable. Operator confusion is a
   real risk; docs and startup warnings must make the distinction explicit.
-- **Forwarding inline could stall accept.** If the receiver forwards
-  synchronously inside the accept loop, a slow hosted endpoint stalls local
-  producers. Mitigation: decouple forward from accept (queue), per Architecture.
+- **Forwarding inline could stall accept.** The v1 receiver forwards
+  synchronously inside the accept loop, so a slow hosted endpoint stalls local
+  producers. Bounded for now by a 10 s `SO_SNDTIMEO`/`SO_RCVTIMEO` on the
+  forward socket (`std.http.Client.fetch` exposes no timeout knob, so the
+  forwarder pre-connects via `client.connect`, sets the deadline on the
+  connection fd, then drives `client.request` over it). That deadline bounds the
+  request write and response read but NOT the initial DNS + TCP + TLS connect,
+  which falls back to the kernel connect timeout - acceptable for v1, removed
+  entirely by the real mitigation: decouple forward from accept (queue), per
+  Architecture.
 
 ## Open questions
 
