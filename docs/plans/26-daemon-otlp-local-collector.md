@@ -238,11 +238,19 @@ etc.) but config-only is fine for v1.
    since two threads read it). As built: 1 MiB body cap, 10 s read deadline per
    connection, one request per connection, per-request arena, a 10 s send/recv
    deadline on the inline forward socket so a hung hosted call cannot wedge the
-   accept loop, non-string log bodies rendered to text (or a marked placeholder
-   for binary/structured bodies) rather than silently emptied, a `Forwarder`
-   seam so tests fake the hosted side, and real-socket tests for the round trip
-   (v4 and v6), shutdown join, the 400/404/405/413/415 reject paths, and the
-   forward-failure/unconfigured 503 paths. Because phase 2 has no persistence, a
+   accept loop, a `ConnWatchdog` thread that enforces a 30 s absolute per-request
+   deadline AND lets shutdown interrupt the one in-flight serve (the 10 s read
+   deadline is only an *inactivity* timeout, so a slow-drip client that sends a
+   byte every <10 s would otherwise hold the loop indefinitely and hang stop();
+   the watchdog `shutdown(.both)`s the active fd to unblock it - the forward's
+   own connect phase is the documented residual it cannot reach), a `timeUnixNano`
+   that is absent/empty/unparseable/negative/overflowing falling back to `now`
+   rather than poisoning the forward, non-string log bodies rendered to text (or a
+   marked placeholder for binary/structured bodies) rather than silently emptied,
+   a `Forwarder` seam so tests fake the hosted side, and real-socket tests for the
+   round trip (v4 and v6), shutdown join, watchdog deadline/stop interrupt, the
+   400/404/405/413/415 reject paths, and the forward-failure/unconfigured 503
+   paths. Because phase 2 has no persistence, a
    forward that FAILS (hosted rejected/unreachable, or forwarding unconfigured)
    answers `503` so the SDK retries instead of dropping what we accepted; only a
    forward that SUCCEEDS answers `200`. Phase 3 persistence is what turns the
@@ -272,7 +280,11 @@ etc.) but config-only is fine for v1.
   single synchronous accept loop serializes producers and a hung client blocks
   others. Acceptable for v1 (SDKs batch/retry; forwarding is decoupled from
   accept), but it is a real ceiling and the mitigation (threaded accept /
-  bounded queue) is explicitly deferred, not free.
+  bounded queue) is explicitly deferred, not free. A slow client can no longer
+  *wedge* the loop or hang shutdown unboundedly: the `ConnWatchdog` puts a hard
+  absolute deadline on each serve and lets stop() interrupt the in-flight one.
+  What it does not fix is throughput - one slow client still blocks others for up
+  to that deadline; only decoupling forwarding/accept removes that.
 - **DuckDB / hot tier under external load (later phases).** Today write volume
   is bounded by the daemon's own collection interval. An OTLP receiver makes
   write volume a function of *external* producers, which can burst far past the
@@ -294,11 +306,18 @@ etc.) but config-only is fine for v1.
   producers. Bounded for now by a 10 s `SO_SNDTIMEO`/`SO_RCVTIMEO` on the
   forward socket (`std.http.Client.fetch` exposes no timeout knob, so the
   forwarder pre-connects via `client.connect`, sets the deadline on the
-  connection fd, then drives `client.request` over it). That deadline bounds the
-  request write and response read but NOT the initial DNS + TCP + TLS connect,
-  which falls back to the kernel connect timeout - acceptable for v1, removed
-  entirely by the real mitigation: decouple forward from accept (queue), per
-  Architecture.
+  connection fd, then drives `client.request` over it) AND, once that connect
+  returns, by the `ConnWatchdog`: the forwarder hands its connected fd to the
+  watchdog, so the absolute request deadline and stop() can interrupt a peer that
+  completes the handshake then stalls mid send/recv. The one phase left
+  unbounded is the forward's `connect()` itself - DNS + TCP connect + TLS
+  handshake happen inside `std.http.Client.connect`, which creates the socket
+  internally and does not expose the fd until it returns, so neither the socket
+  deadline nor the watchdog can reach it; it falls back to the kernel connect
+  timeout. Reimplementing a non-blocking connect was rejected (it needs the
+  private `Connection.Plain`/`Tls.create` or a dependency). Acceptable for v1
+  against a trusted same-host hosted endpoint; removed entirely by the real
+  mitigation: decouple forward from accept (queue), per Architecture.
 
 ## Open questions
 
