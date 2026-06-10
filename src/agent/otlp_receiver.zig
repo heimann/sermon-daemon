@@ -68,11 +68,51 @@ pub const KeyValue = struct {
     value: ?AnyValue = null,
 };
 
-/// OTLP AnyValue. We only consume `stringValue` in v1; other variants parse and
-/// are ignored. `ignore_unknown_fields` keeps richer values from breaking parse.
+/// OTLP AnyValue. A log body is an AnyValue, and SDKs do emit non-string bodies
+/// (a numeric metric-ish event, a structured map). We capture every scalar
+/// variant so a non-string body renders to real text instead of being silently
+/// acked as an empty message. In OTLP/JSON, `intValue` is a STRING (int64 can
+/// exceed JS-safe integers) and `bytesValue` is base64; `arrayValue`/`kvlistValue`
+/// are nested - we don't decode their shape here (the nested structs are present
+/// only so they parse), we render a clearly-marked placeholder so a structured
+/// body is never mistaken for empty. See `renderAnyValue`.
 pub const AnyValue = struct {
     stringValue: ?[]const u8 = null,
+    intValue: ?[]const u8 = null,
+    doubleValue: ?f64 = null,
+    boolValue: ?bool = null,
+    bytesValue: ?[]const u8 = null,
+    arrayValue: ?ArrayValue = null,
+    kvlistValue: ?KeyValueList = null,
 };
+
+/// OTLP `arrayValue` payload. Parsed (so a body carrying one doesn't fail) but
+/// not structurally rendered - `renderAnyValue` emits a marked placeholder.
+pub const ArrayValue = struct {
+    values: []const AnyValue = &.{},
+};
+
+/// OTLP `kvlistValue` payload. Same treatment as `ArrayValue`.
+pub const KeyValueList = struct {
+    values: []const KeyValue = &.{},
+};
+
+/// Render an OTLP `AnyValue` body to an OWNED text log message (duped from
+/// `allocator`; caller frees). Scalars (string/int/double/bool) become their
+/// text form; `bytesValue` and the nested `arrayValue`/`kvlistValue` get a
+/// clearly-marked `[otlp <kind>]` placeholder so a structured or binary body is
+/// never silently acked as an empty message. Always returns owned memory so the
+/// caller has one free path regardless of variant.
+pub fn renderAnyValue(allocator: Allocator, value: AnyValue) ![]u8 {
+    if (value.stringValue) |s| return allocator.dupe(u8, s);
+    if (value.intValue) |s| return allocator.dupe(u8, s); // OTLP/JSON int64 is a string.
+    if (value.boolValue) |b| return allocator.dupe(u8, if (b) "true" else "false");
+    if (value.doubleValue) |d| return std.fmt.allocPrint(allocator, "{d}", .{d});
+    if (value.bytesValue != null) return allocator.dupe(u8, "[otlp bytesValue]");
+    if (value.arrayValue != null) return allocator.dupe(u8, "[otlp arrayValue]");
+    if (value.kvlistValue != null) return allocator.dupe(u8, "[otlp kvlistValue]");
+    return allocator.dupe(u8, ""); // genuinely empty body (no variant set).
+}
 
 /// Map an OTLP `severityNumber` (1-24) to a syslog priority (0=emerg..7=debug),
 /// matching `logs.LogEntry.priority`. This is the inverse-direction mapping the
@@ -121,15 +161,13 @@ pub fn mapLogRecord(
     service_name: ?[]const u8,
     now: i64,
 ) !logs_mod.LogEntry {
-    const message_src: []const u8 = blk: {
-        const body = record.body orelse break :blk "";
-        break :blk body.stringValue orelse "";
-    };
-
     const source = try allocator.dupe(u8, "otlp");
     errdefer allocator.free(source);
 
-    const message = try allocator.dupe(u8, message_src);
+    // renderAnyValue owns its result and maps every AnyValue variant - including
+    // non-string bodies - to real text (or a marked placeholder), so a numeric/
+    // bool/structured body is never silently acked as an empty message.
+    const message = if (record.body) |body| try renderAnyValue(allocator, body) else try allocator.dupe(u8, "");
     errdefer allocator.free(message);
 
     // identifier and systemd_unit both carry the service name (when present) so
@@ -221,20 +259,41 @@ pub const Forwarder = struct {
     }
 };
 
-/// Receive-and-drop forwarder, used when server_url or otlp_token is missing.
-/// The receiver still accepts and 200s so local SDKs don't error/retry; the
-/// data's on-host value lands with phase 3 persistence (until then a dropped
-/// record is gone, which the startup warning makes explicit).
+/// "Forwarding not configured" seam, wired in when server_url or otlp_token is
+/// missing. It FAILS every forward (error.OtlpForwardingNotConfigured) rather
+/// than silently succeeding: phase 2 has no on-host persistence (phase 3, gated)
+/// so this build can do nothing useful with a received record it cannot forward.
+/// Failing makes handleRequest answer 503, which tells the operator the receiver
+/// is enabled-but-unwired instead of silently accepting-and-dropping telemetry.
 pub const drop_forwarder = Forwarder{ .forwardFn = dropForward };
 
-fn dropForward(_: ?*anyopaque, _: Allocator, _: []const logs_mod.LogEntry) anyerror!void {}
+fn dropForward(_: ?*anyopaque, _: Allocator, _: []const logs_mod.LogEntry) anyerror!void {
+    return error.OtlpForwardingNotConfigured;
+}
+
+/// SO_SNDTIMEO/SO_RCVTIMEO on the forward socket. The forward runs INLINE on the
+/// single-threaded accept loop before the local 200/503, so a hung hosted call
+/// (slow TLS handshake, a peer that accepts then never replies) would otherwise
+/// wedge the loop - and stop()'s join - indefinitely. With the deadline a stuck
+/// send/recv errors out, the forward fails (-> 503, the SDK retries), and the
+/// loop returns to accept. CONSTRAINT: std.http.Client.fetch exposes no timeout
+/// knob (verified against std/http/Client.zig in zig 0.15.2: FetchOptions has no
+/// timeout field, and fetch connects + sends + receives internally). So we
+/// pre-connect via client.connect, set the socket deadline on that connection's
+/// fd, then drive client.request over it. This bounds the request write and the
+/// response read; the connect() itself (DNS + TCP + TLS handshake) is bounded
+/// only by the kernel's connect timeout, not this value - acceptable for a v1
+/// inline forward, and removed entirely once forwarding is decoupled from accept.
+pub const forward_timeout_s: isize = 10;
 
 /// Forwards mapped records to the hosted OTLP receiver (sermon-web plan 23):
-/// POST <server_url>/v1/logs with `Authorization: Bearer <otlp_token>`. Same
-/// client.fetch shape as push.zig::pushMetrics, different URL + auth header.
-/// The body is a RE-SERIALIZED minimal OTLP/JSON envelope built from the
-/// MAPPED records - not the raw received bytes - so the future sampling/
-/// redaction gate applies on the way out (per the plan; v1 forwards all).
+/// POST <server_url>/v1/logs with `Authorization: Bearer <otlp_token>`. The body
+/// is a RE-SERIALIZED minimal OTLP/JSON envelope built from the MAPPED records -
+/// not the raw received bytes - so the future sampling/redaction gate applies on
+/// the way out (per the plan; v1 forwards all). Unlike push.zig::pushMetrics this
+/// does NOT use client.fetch: it pre-connects so it can put a send/recv deadline
+/// on the socket (see forward_timeout_s) before driving the request, because the
+/// forward is inline on the accept loop.
 pub const HostedForwarder = struct {
     server_url: []const u8,
     otlp_token: []const u8,
@@ -258,17 +317,55 @@ pub const HostedForwarder = struct {
         var client = std.http.Client{ .allocator = arena };
         defer client.deinit();
 
-        const result = try client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
+        const uri = try std.Uri.parse(url);
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
+        var host_buf: [std.Uri.host_name_max]u8 = undefined;
+        const host = try uri.getHost(&host_buf);
+        // Client.Protocol.port is private; the default port per scheme is fixed.
+        const port = uri.port orelse switch (protocol) {
+            .plain => @as(u16, 80),
+            .tls => @as(u16, 443),
+        };
+
+        // Pre-connect so we can set the deadline on the socket BEFORE any
+        // request byte moves. keep_alive=false on the request below tears this
+        // connection down after the one POST (no pooling across requests).
+        const connection = try client.connect(host, port, protocol);
+        const deadline = std.posix.timeval{ .sec = forward_timeout_s, .usec = 0 };
+        const fd = connection.stream_reader.getStream().handle;
+        inline for (.{ std.posix.SO.SNDTIMEO, std.posix.SO.RCVTIMEO }) |opt| {
+            std.posix.setsockopt(fd, std.posix.SOL.SOCKET, opt, std.mem.asBytes(&deadline)) catch |err| {
+                // Without the deadline a hung forward could wedge the accept
+                // loop; refuse to forward rather than risk that. The caller
+                // turns this into a 503 so the SDK retries.
+                std.log.warn("otlp receiver: set forward deadline failed: {}", .{err});
+                return error.OtlpForwardDeadlineUnset;
+            };
+        }
+
+        var req = try client.request(.POST, uri, .{
+            .keep_alive = false,
+            .connection = connection,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "authorization", .value = auth },
             },
         });
+        defer req.deinit();
 
-        if (result.status.class() != .success) {
+        req.transfer_encoding = .{ .content_length = body.len };
+        var body_writer = try req.sendBodyUnflushed(&.{});
+        try body_writer.writer.writeAll(body);
+        try body_writer.end();
+        try req.connection.?.flush();
+
+        var redirect_buffer: [1024]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buffer);
+        // Drain the response body so the deadline also bounds a peer that sends
+        // headers then stalls mid-body.
+        _ = response.reader(&.{}).discardRemaining() catch {};
+
+        if (response.head.status.class() != .success) {
             return error.OtlpForwardRejected;
         }
     }
@@ -360,7 +457,16 @@ fn buildForwardBody(arena: Allocator, entries: []const logs_mod.LogEntry) ![]u8 
 /// only closed after the thread has joined.
 pub const Receiver = struct {
     allocator: Allocator,
+    // Two loopback listeners: 127.0.0.1 AND ::1. An SDK pointed at
+    // "localhost:4318" resolves localhost via getaddrinfo, which commonly yields
+    // ::1 BEFORE 127.0.0.1; a v4-only listener would then refuse those clients.
+    // We bind BOTH loopback addresses on the same port. We do NOT bind a
+    // dual-stack `::` (that is all-interfaces, violating the loopback-only
+    // project rule) - separate v4 + v6 loopback sockets keep the receiver
+    // strictly on-host. The v6 listener is optional: a host with IPv6 disabled
+    // fails that bind, and we run v4-only rather than refuse to start.
     listener: std.net.Server,
+    listener6: ?std.net.Server,
     running: *std.atomic.Value(bool),
     forwarder: Forwarder,
     thread: ?std.Thread = null,
@@ -371,23 +477,44 @@ pub const Receiver = struct {
         running: *std.atomic.Value(bool),
         forwarder: Forwarder,
     ) !Receiver {
-        // 127.0.0.1 ONLY - the receiver trusts localhost and must never be
-        // reachable from off-host (project rule: daemon listeners bind
-        // localhost unless explicitly asked otherwise).
+        // 127.0.0.1 first - the primary loopback listener, and the one whose
+        // bound port we report. reuse_address so a daemon restart doesn't fail
+        // the bind on a lingering TIME_WAIT socket from the previous run.
         const address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-        // reuse_address so a daemon restart doesn't fail the bind on a
-        // lingering TIME_WAIT socket from the previous run.
         const listener = try address.listen(.{ .reuse_address = true });
+        errdefer {
+            var l = listener;
+            l.deinit();
+        }
+
+        // ::1 on the SAME bound port (resolve the v4 port first so a port-0 bind
+        // gives both listeners one shared ephemeral port; v4 and v6 are distinct
+        // address families so the port never collides between them). A v6 bind
+        // failure (IPv6 disabled) is non-fatal: log and run v4-only.
+        const bound_port = listener.listen_address.getPort();
+        const address6 = std.net.Address.initIp6(
+            .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+            bound_port,
+            0,
+            0,
+        );
+        const listener6: ?std.net.Server = address6.listen(.{ .reuse_address = true }) catch |err| blk: {
+            std.log.warn("otlp receiver: ::1 bind failed ({}); serving on 127.0.0.1 only", .{err});
+            break :blk null;
+        };
+
         return .{
             .allocator = allocator,
             .listener = listener,
+            .listener6 = listener6,
             .running = running,
             .forwarder = forwarder,
         };
     }
 
     /// The actual bound port - differs from the requested one when binding
-    /// port 0 (tests use this to avoid fixed-port collisions).
+    /// port 0 (tests use this to avoid fixed-port collisions). Both loopback
+    /// listeners share this port.
     pub fn boundPort(self: *const Receiver) u16 {
         return self.listener.listen_address.getPort();
     }
@@ -399,36 +526,86 @@ pub const Receiver = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Unblock the accept loop, join the thread, close the listener. Safe to
+    /// Unblock the accept loop, join the thread, close both listeners. Safe to
     /// call whether or not `start` succeeded. An in-flight request finishes
     /// first (bounded by `read_timeout_s` against a hung client), so join can
-    /// take up to that long in the worst case.
+    /// take up to that long in the worst case. shutdown() on each listener wakes
+    /// a blocked accept/poll; the fds are only closed after the thread joins.
     pub fn stop(self: *Receiver) void {
         std.posix.shutdown(self.listener.stream.handle, .both) catch {};
+        if (self.listener6) |l6| std.posix.shutdown(l6.stream.handle, .both) catch {};
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
         self.listener.deinit();
+        if (self.listener6) |*l6| l6.deinit();
     }
 
     fn run(self: *Receiver) void {
+        // poll() both loopback listeners so one synchronous loop services
+        // whichever family a client connected on. With only the v4 listener this
+        // degenerates to a single-fd poll. stop()'s shutdown() makes poll report
+        // the fd readable, the subsequent accept() returns SocketNotListening,
+        // and the loop exits - same wake path as the prior bare-accept loop.
         while (self.running.load(.seq_cst)) {
-            const conn = self.listener.accept() catch |err| switch (err) {
-                // stop()'s shutdown() surfaces here; exit unconditionally (not
-                // via the running flag) so stop() always joins promptly.
-                error.SocketNotListening => return,
-                else => {
-                    std.log.warn("otlp receiver: accept failed: {}", .{err});
-                    // Back off so a persistent accept failure (fd exhaustion)
-                    // doesn't spin the loop hot.
-                    std.Thread.sleep(100 * std.time.ns_per_ms);
-                    continue;
-                },
+            var fds: [2]std.posix.pollfd = undefined;
+            var n: usize = 0;
+            fds[n] = .{ .fd = self.listener.stream.handle, .events = std.posix.POLL.IN, .revents = 0 };
+            const v4_idx = n;
+            n += 1;
+            const v6_idx: ?usize = if (self.listener6) |l6| blk: {
+                fds[n] = .{ .fd = l6.stream.handle, .events = std.posix.POLL.IN, .revents = 0 };
+                const idx = n;
+                n += 1;
+                break :blk idx;
+            } else null;
+
+            _ = std.posix.poll(fds[0..n], -1) catch |err| {
+                std.log.warn("otlp receiver: poll failed: {}", .{err});
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                continue;
             };
-            defer conn.stream.close();
-            self.serveConnection(conn.stream);
+
+            // Accept from each ready listener. POLL.IN covers a pending
+            // connection; POLL.HUP/POLL.ERR/POLL.NVAL fire on stop()'s shutdown,
+            // and the accept() below then returns SocketNotListening to exit.
+            const ready_mask = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
+            if ((fds[v4_idx].revents & ready_mask) != 0) {
+                if (!self.acceptOne(&self.listener)) return;
+            }
+            if (v6_idx) |idx| {
+                if ((fds[idx].revents & ready_mask) != 0) {
+                    if (self.listener6) |*l6| {
+                        if (!self.acceptOne(l6)) return;
+                    }
+                }
+            }
         }
+    }
+
+    /// Accept and serve ONE connection from `listener`. Returns false when the
+    /// loop must EXIT (stop()'s shutdown surfaced as SocketNotListening), true
+    /// to keep looping. A transient accept error backs off and keeps looping.
+    fn acceptOne(self: *Receiver, listener: *std.net.Server) bool {
+        const conn = listener.accept() catch |err| switch (err) {
+            // stop()'s shutdown() surfaces here; signal the loop to exit
+            // unconditionally so stop() always joins promptly.
+            error.SocketNotListening => return false,
+            // poll said readable but accept couldn't complete (e.g. the peer
+            // reset between poll and accept) - skip this one, keep looping.
+            error.WouldBlock, error.ConnectionAborted, error.ConnectionResetByPeer => return true,
+            else => {
+                std.log.warn("otlp receiver: accept failed: {}", .{err});
+                // Back off so a persistent accept failure (fd exhaustion)
+                // doesn't spin the loop hot.
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                return true;
+            },
+        };
+        defer conn.stream.close();
+        self.serveConnection(conn.stream);
+        return true;
     }
 
     /// Service ONE request on the accepted connection, then close it. One
@@ -528,14 +705,19 @@ pub const Receiver = struct {
             }
         }
 
-        // v1 forwards ALL records (the sampling knob is a later phase). A
-        // forward failure is logged but still 200s to the local producer: we
-        // accepted the bytes, and the producer's SDK must not re-send what we
-        // accepted. That is an at-most-once tradeoff upward (mirroring the
-        // plan's framing); phase 3 on-host persistence is what makes a dropped
-        // forward recoverable.
+        // v1 forwards ALL records (the sampling knob is a later phase) and the
+        // forward runs INLINE before the local response. Phase 2 has NO on-host
+        // persistence (phase 3, deliberately gated), so a forward we cannot
+        // complete is data we cannot keep: answering 200 would tell the SDK we
+        // own bytes we just dropped, and the SDK would never retry. So a forward
+        // failure - whether the hosted POST was rejected/unreachable or
+        // forwarding isn't configured at all (drop_forwarder) - surfaces as 503,
+        // the OTLP-spec retryable status, so the SDK holds and re-sends instead.
+        // Phase 3 persistence is what will let an accepted record survive a
+        // forward failure and turn this back into an unconditional 200.
         self.forwarder.forward(arena, entries.items) catch |err| {
-            std.log.warn("otlp receiver: forward to hosted /v1/logs failed: {}", .{err});
+            std.log.warn("otlp receiver: forward to hosted /v1/logs failed: {} - 503 so the SDK retries", .{err});
+            return request.respond("", .{ .status = .service_unavailable, .keep_alive = false });
         };
 
         // OTLP/HTTP success: 200 with the encoded empty ExportLogsServiceResponse.
@@ -604,6 +786,27 @@ test "mapLogRecord tolerates missing body and missing service name" {
     try std.testing.expect(entry.identifier == null);
     try std.testing.expect(entry.systemd_unit == null);
     try std.testing.expect(entry.unit == null);
+}
+
+test "mapLogRecord renders non-string AnyValue bodies instead of emptying them" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct { body: AnyValue, want: []const u8 };
+    const cases = [_]Case{
+        .{ .body = .{ .intValue = "42" }, .want = "42" }, // OTLP/JSON int is a string
+        .{ .body = .{ .doubleValue = 1.5 }, .want = "1.5" },
+        .{ .body = .{ .boolValue = true }, .want = "true" },
+        .{ .body = .{ .boolValue = false }, .want = "false" },
+        // Complex/binary bodies must not silently empty: a marked placeholder.
+        .{ .body = .{ .bytesValue = "aGk=" }, .want = "[otlp bytesValue]" },
+        .{ .body = .{ .arrayValue = .{} }, .want = "[otlp arrayValue]" },
+        .{ .body = .{ .kvlistValue = .{} }, .want = "[otlp kvlistValue]" },
+    };
+    for (cases) |c| {
+        var entry = try mapLogRecord(allocator, .{ .body = c.body }, null, 0);
+        defer entry.deinit(allocator);
+        try std.testing.expectEqualStrings(c.want, entry.message);
+    }
 }
 
 test "parse a full OTLP/JSON logs envelope and map each record" {
@@ -836,7 +1039,59 @@ test "receiver round-trips a real OTLP/JSON POST to the forward seam" {
     try std.testing.expectEqualStrings("checkout-api", fake.identifiers.items[1].?);
 }
 
-test "receiver still 200s the producer when the forward fails" {
+test "receiver also serves the request over the ::1 loopback" {
+    const allocator = std.testing.allocator;
+
+    var fake = TestForwarder{ .allocator = allocator };
+    defer fake.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    var receiver = try Receiver.init(allocator, 0, &running, fake.forwarder());
+    try receiver.start();
+    defer {
+        running.store(false, .seq_cst);
+        receiver.stop();
+    }
+
+    // Skip on a host with IPv6 loopback disabled (the v6 bind is non-fatal and
+    // left null in that case) - there is nothing to round-trip.
+    const listener6 = receiver.listener6 orelse return error.SkipZigTest;
+
+    // Raw TCP to the ::1 listen address: std.http.Client's URI path does not
+    // accept a bracketed IPv6 literal on this stdlib, and a raw request proves
+    // the v6 socket accepts and serves directly. One request per connection, so
+    // a hand-written HTTP/1.1 head + body and a single status-line read suffice.
+    const stream = try std.net.tcpConnectToAddress(listener6.listen_address);
+    defer stream.close();
+
+    const body =
+        \\{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"v6 hi"}}]}]}]}
+    ;
+    const request = try std.fmt.allocPrint(
+        allocator,
+        "POST /v1/logs HTTP/1.1\r\nhost: ::1\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer allocator.free(request);
+    try stream.writeAll(request);
+
+    var response: std.ArrayList(u8) = .empty;
+    defer response.deinit(allocator);
+    var read_buffer: [1024]u8 = undefined;
+    while (true) {
+        const n = stream.read(&read_buffer) catch break;
+        if (n == 0) break;
+        try response.appendSlice(allocator, read_buffer[0..n]);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, response.items, "HTTP/1.1 200"));
+
+    fake.mutex.lock();
+    defer fake.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), fake.messages.items.len);
+    try std.testing.expectEqualStrings("v6 hi", fake.messages.items[0]);
+}
+
+test "receiver 503s the producer when the forward fails" {
     const allocator = std.testing.allocator;
 
     var fake = TestForwarder{ .allocator = allocator, .fail = true };
@@ -854,8 +1109,30 @@ test "receiver still 200s the producer when the forward fails" {
         \\{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"hi"}}]}]}]}
     ;
     const status = try testFetch(allocator, receiver.boundPort(), .POST, "/v1/logs", body, "application/json");
-    // At-most-once upward: the producer's SDK must not retry what we accepted.
-    try std.testing.expectEqual(std.http.Status.ok, status);
+    // No persistence in phase 2: a record we accepted but could not forward is
+    // gone. 503 (retryable) keeps it in the SDK's buffer instead of dropping it.
+    try std.testing.expectEqual(std.http.Status.service_unavailable, status);
+}
+
+test "receiver 503s when forwarding is not configured (drop_forwarder)" {
+    const allocator = std.testing.allocator;
+
+    var running = std.atomic.Value(bool).init(true);
+    var receiver = try Receiver.init(allocator, 0, &running, drop_forwarder);
+    try receiver.start();
+    defer {
+        running.store(false, .seq_cst);
+        receiver.stop();
+    }
+
+    const body =
+        \\{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"hi"}}]}]}]}
+    ;
+    // receiver_enabled without forwarding wired up can do nothing useful with a
+    // log in phase 2; 503 tells the operator the receiver is unwired rather than
+    // silently accepting-and-dropping.
+    const status = try testFetch(allocator, receiver.boundPort(), .POST, "/v1/logs", body, "application/json");
+    try std.testing.expectEqual(std.http.Status.service_unavailable, status);
 }
 
 test "receiver survives an oversize timeUnixNano on the receive path" {
