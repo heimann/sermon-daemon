@@ -95,11 +95,14 @@ pub fn syslogPriorityFromSeverity(severity_number: ?i64) u8 {
 /// Convert an OTLP `timeUnixNano` string (nanoseconds since epoch) to the
 /// daemon's Unix *seconds* timestamp. A missing/empty/unparseable value falls
 /// back to `now` so a record is never dropped purely for a bad timestamp.
+/// The same goes for a value that parses but whose seconds overflow i64: this
+/// field is producer-controlled, and an unchecked cast here would panic - and
+/// a panic aborts the whole daemon, not just this request.
 pub fn unixSecondsFromNano(time_unix_nano: ?[]const u8, now: i64) i64 {
     const s = time_unix_nano orelse return now;
     if (s.len == 0) return now;
     const nanos = std.fmt.parseInt(i128, s, 10) catch return now;
-    return @intCast(@divTrunc(nanos, std.time.ns_per_s));
+    return std.math.cast(i64, @divTrunc(nanos, std.time.ns_per_s)) orelse now;
 }
 
 /// PURE mapping: one decoded OTLP/JSON `LogRecord` -> an owned `logs.LogEntry`.
@@ -559,6 +562,9 @@ test "unixSecondsFromNano converts nanos to seconds and falls back to now" {
     try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano(null, 42));
     try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("", 42));
     try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("not-a-number", 42));
+    // Fits in i128 but the seconds overflow i64: must fall back, not panic.
+    try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("10000000000000000000000000000", 42));
+    try std.testing.expectEqual(@as(i64, 42), unixSecondsFromNano("-10000000000000000000000000000", 42));
 }
 
 test "mapLogRecord maps an OTLP log record to an owned LogEntry" {
@@ -850,6 +856,39 @@ test "receiver still 200s the producer when the forward fails" {
     const status = try testFetch(allocator, receiver.boundPort(), .POST, "/v1/logs", body, "application/json");
     // At-most-once upward: the producer's SDK must not retry what we accepted.
     try std.testing.expectEqual(std.http.Status.ok, status);
+}
+
+test "receiver survives an oversize timeUnixNano on the receive path" {
+    const allocator = std.testing.allocator;
+
+    var fake = TestForwarder{ .allocator = allocator };
+    defer fake.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    var receiver = try Receiver.init(allocator, 0, &running, fake.forwarder());
+    try receiver.start();
+    defer {
+        running.store(false, .seq_cst);
+        receiver.stop();
+    }
+
+    // Seconds beyond i64 range, but parseable as i128 - the case the cast in
+    // unixSecondsFromNano must degrade on. A regression panics the receiver
+    // thread (aborting this test binary), so the assertions below double as
+    // proof the request completed.
+    const body =
+        \\{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+        \\  {"timeUnixNano":"10000000000000000000000000000",
+        \\   "body":{"stringValue":"bad clock"}}]}]}]}
+    ;
+    const status = try testFetch(allocator, receiver.boundPort(), .POST, "/v1/logs", body, "application/json");
+    try std.testing.expectEqual(std.http.Status.ok, status);
+
+    // The record still flows to the forward seam with its fallback timestamp.
+    fake.mutex.lock();
+    defer fake.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), fake.messages.items.len);
+    try std.testing.expectEqualStrings("bad clock", fake.messages.items[0]);
 }
 
 test "receiver rejects bad method, path, body, and content type" {
