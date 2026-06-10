@@ -20,7 +20,7 @@ jobs:
           version: 0.15.2
 
       - name: Check formatting
-        run: zig fmt --check src/ build.zig
+        run: git ls-files '*.zig' | xargs zig fmt --check
 
       - name: Bootstrap DuckDB
         run: ./scripts/bootstrap-duckdb.sh
