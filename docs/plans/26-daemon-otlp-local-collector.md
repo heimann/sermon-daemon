@@ -2,11 +2,12 @@
 
 ## Status
 
-Proposed. Scaffold landed (config fields + log-record mapping with tests, see
-"Phases"); the `std.http.Server` accept loop is a documented stub gated behind
-`receiver_enabled = false`. The hosted receiver this forwards to is sermon-web
-plan 23 (`POST /v1/{logs,metrics,traces}`, Bearer token with scope
-`otlp_write`).
+In progress. Phases 1-2 landed (config fields + log-record mapping, then the
+localhost listen/parse/map/forward loop with socket tests, see "Phases");
+everything stays gated behind `receiver_enabled = false`. The hosted receiver
+this forwards to is sermon-web plan 23 (`POST /v1/{logs,metrics,traces}`,
+Bearer token with scope `otlp_write`). Next is phase 3 (on-host persistence),
+which must re-validate roll sizing first (see Risks).
 
 ## Decision
 
@@ -217,12 +218,19 @@ etc.) but config-only is fine for v1.
    log record -> `logs.LogEntry`) and a unit test. The `std.http.Server` listen
    loop is a documented TODO stub gated behind `receiver_enabled = false`. Build
    and `zig build test` stay green; no behavior change for existing installs.
-2. **Listen + forward (logs).** Stand up the single-connection synchronous
-   `std.http.Server` on `127.0.0.1:receiver_port` on its own thread, accept
-   `POST /v1/logs`, parse OTLP/JSON, map via `mapLogRecord`, forward to
-   `/v1/logs` with the `otlp_write` Bearer token. Wire into `main.zig` startup
-   (spawn thread only when enabled; join on shutdown via the existing `running`
-   flag).
+2. **Listen + forward (logs). (LANDED)** Stand up the single-connection
+   synchronous `std.http.Server` on `127.0.0.1:receiver_port` on its own
+   thread, accept `POST /v1/logs`, parse OTLP/JSON, map via `mapLogRecord`,
+   forward to `/v1/logs` with the `otlp_write` Bearer token. Wire into
+   `main.zig` startup (spawn thread only when enabled; join on shutdown via the
+   existing `running` flag, now atomic since two threads read it). As built:
+   1 MiB body cap, 10 s read deadline per connection, one request per
+   connection, per-request arena, a `Forwarder` seam so tests fake the hosted
+   side, and real-socket tests for the round trip, shutdown join, and the
+   400/404/405/413/415 reject paths. Forward failures log a warning but still
+   200 the local producer (at-most-once upward; phase 3 persistence is what
+   makes a dropped forward recoverable). Missing `server_url`/`otlp_token`
+   means receive-and-drop with a startup warning.
 3. **On-host persistence (logs).** Hand mapped records to the collection loop
    (queue) so the existing single staging writer appends them to the `logs`
    table; received logs become locally queryable exactly like journald logs.
