@@ -5,6 +5,7 @@ const rules_mod = @import("rules");
 const proc_self_mod = @import("proc_self");
 const proxmox_mod = @import("proxmox");
 const push_mod = @import("push");
+const otlp_receiver_mod = @import("otlp_receiver");
 const storage_mod = @import("storage");
 // Parquet hot tier (plan 25 cutover). The daemon WRITE path is now a durable
 // append-log (staging) periodically rolled to parquet (roll); the resident
@@ -66,7 +67,24 @@ const Config = struct {
     // its last roll, so low-volume tables don't sit un-rolled. See
     // default_roll_interval_s.
     roll_interval_s: ?u64 = null,
+    // ── OTLP local collector (plan 26) ──
+    // Master switch for the localhost OTLP/HTTP receiver. Default false: opening
+    // a listening socket is new attack surface for a daemon that is otherwise
+    // outbound-only, so an operator must opt in. When false the receiver thread
+    // is never spawned and no socket is opened (see src/agent/otlp_receiver.zig
+    // and docs/plans/26-daemon-otlp-local-collector.md).
+    receiver_enabled: ?bool = null,
+    // Localhost port for the OTLP/HTTP listener (OTLP/HTTP standard port 4318).
+    // Binds 127.0.0.1 only.
+    receiver_port: ?u16 = null,
+    // Hosted otlp_write Bearer token used when forwarding received OTLP to the
+    // hosted /v1/* endpoints. DISTINCT from api_key (x-sermon-ingestion-key),
+    // which gates /api/ingest; the two are not interchangeable.
+    otlp_token: ?[]const u8 = null,
 };
+
+const default_receiver_enabled = false;
+const default_receiver_port: u16 = otlp_receiver_mod.default_receiver_port;
 
 fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(Config) {
     const path = expandPath(allocator, config_path) catch return null;
@@ -117,10 +135,13 @@ fn loadRules(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Pa
     };
 }
 
-var running: bool = true;
+// Shutdown flag. Atomic because it is now read across threads: the collection
+// loop AND the OTLP receiver thread (plan 26) both poll it. The atomic store
+// stays async-signal-safe, so flipping it from sigHandler remains correct.
+var running: std.atomic.Value(bool) = .init(true);
 
 fn sigHandler(_: c_int) callconv(.c) void {
-    running = false;
+    running.store(false, .seq_cst);
 }
 
 fn readConfigPathArg(allocator: std.mem.Allocator) !?[]const u8 {
@@ -210,6 +231,18 @@ pub fn main() !void {
     else
         default_roll_interval_s;
 
+    // ── OTLP local collector config (plan 26) ──
+    // Default off; the receiver thread is spawned below only when enabled.
+    const receiver_enabled: bool = if (config) |c|
+        c.value.receiver_enabled orelse default_receiver_enabled
+    else
+        default_receiver_enabled;
+    const receiver_port: u16 = if (config) |c|
+        c.value.receiver_port orelse default_receiver_port
+    else
+        default_receiver_port;
+    const otlp_token: ?[]const u8 = if (config) |c| c.value.otlp_token else null;
+
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.skip(); // skip program name
@@ -267,6 +300,61 @@ pub fn main() !void {
     if (server_url == null and api_key != null) {
         std.debug.print("Warning: --key is set but --server is missing - remote push is disabled\n", .{});
     }
+
+    // ── OTLP receiver (plan 26 phase 2): localhost listen + forward ──
+    // Spawned on its own thread ONLY when receiver_enabled = true (default
+    // off: a listening socket is new attack surface for an otherwise
+    // outbound-only daemon). Binds 127.0.0.1 only. Forwarding needs BOTH
+    // server_url and otlp_token; with either missing the receiver runs in
+    // receive-and-drop mode (still accepts and 200s so local SDKs don't
+    // error/retry - the on-host value of dropped records lands with phase 3
+    // persistence) and the warning below makes the drop explicit, mirroring
+    // the --server/--key warnings above.
+    var hosted_forwarder: otlp_receiver_mod.HostedForwarder = undefined;
+    var otlp_receiver: ?otlp_receiver_mod.Receiver = null;
+    if (receiver_enabled) {
+        // Empty string == unset for forwarding: a blank otlp_token or server_url
+        // in config.json would otherwise pass the null check and drive a forward
+        // that is guaranteed to fail (bad URL / empty Bearer). Collapsing empty
+        // to "not configured" routes it to drop_forwarder, which the receiver
+        // turns into an honest 503 instead of an inevitable failed forward.
+        const url_set: ?[]const u8 = if (server_url) |u| (if (u.len > 0) u else null) else null;
+        const token_set: ?[]const u8 = if (otlp_token) |t| (if (t.len > 0) t else null) else null;
+        const forwarder: otlp_receiver_mod.Forwarder = blk: {
+            if (url_set) |url| {
+                if (token_set) |token| {
+                    hosted_forwarder = .{ .server_url = url, .otlp_token = token };
+                    break :blk hosted_forwarder.forwarder();
+                }
+            }
+            std.debug.print(
+                "Warning: receiver_enabled is set but {s} is missing or empty - received OTLP cannot be forwarded and the receiver answers 503 (no on-host persistence until plan 26 phase 3)\n",
+                .{if (url_set == null) "server_url" else "otlp_token"},
+            );
+            break :blk otlp_receiver_mod.drop_forwarder;
+        };
+        // A failed bind (port taken, no privileges) disables the receiver for
+        // this run but must not take the collection loop down with it.
+        if (otlp_receiver_mod.Receiver.init(allocator, receiver_port, &running, forwarder)) |receiver| {
+            otlp_receiver = receiver;
+        } else |err| {
+            std.debug.print("Warning: OTLP receiver failed to listen on 127.0.0.1:{d}: {} - receiver disabled this run\n", .{ receiver_port, err });
+        }
+        if (otlp_receiver) |*receiver| {
+            // start() runs on the receiver's final address (the optional's
+            // payload lives in main's frame for the daemon's lifetime).
+            if (receiver.start()) {
+                std.debug.print("OTLP receiver listening on 127.0.0.1:{d} (POST /v1/logs)\n", .{receiver.boundPort()});
+            } else |err| {
+                std.debug.print("Warning: OTLP receiver thread spawn failed: {} - receiver disabled this run\n", .{err});
+                receiver.stop(); // no thread yet; closes the listener
+                otlp_receiver = null;
+            }
+        }
+    }
+    // Shutdown: the signal flips `running`; stop() then wakes the blocked
+    // accept via shutdown() on the listener and joins the thread.
+    defer if (otlp_receiver) |*receiver| receiver.stop();
 
     // Expand ~ in db path
     const final_db_path = try expandPath(allocator, db_path);
@@ -442,7 +530,7 @@ pub fn main() !void {
     defer ct_metrics_state.deinit();
 
     // Main collection loop
-    while (running) {
+    while (running.load(.seq_cst)) {
         const now = std.time.timestamp();
 
         // Collect data (no DB lock held)
@@ -730,7 +818,7 @@ pub fn main() !void {
 
         // Sleep until next interval (interruptible)
         var remaining: u64 = interval;
-        while (remaining > 0 and running) {
+        while (remaining > 0 and running.load(.seq_cst)) {
             std.Thread.sleep(1 * std.time.ns_per_s);
             remaining -= 1;
         }
@@ -778,4 +866,52 @@ fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, path[1..] });
     }
     return allocator.dupe(u8, path);
+}
+
+// Parse a config JSON body into Config with the SAME options loadConfig uses,
+// so these tests exercise the real parse path without touching the filesystem.
+fn parseConfigForTest(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(Config) {
+    return std.json.parseFromSlice(Config, allocator, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
+
+test "Config parses OTLP receiver fields (plan 26)" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "db_path": "~/.local/share/sermon/metrics.db",
+        \\  "interval": 10,
+        \\  "receiver_enabled": true,
+        \\  "receiver_port": 4319,
+        \\  "otlp_token": "otlp_secret_abc"
+        \\}
+    ;
+    const parsed = try parseConfigForTest(allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(true, parsed.value.receiver_enabled.?);
+    try std.testing.expectEqual(@as(u16, 4319), parsed.value.receiver_port.?);
+    try std.testing.expectEqualStrings("otlp_secret_abc", parsed.value.otlp_token.?);
+}
+
+test "Config OTLP receiver fields default to off/absent when omitted" {
+    const allocator = std.testing.allocator;
+    // A pre-plan-26 config (no OTLP keys) must still parse, leaving the new
+    // fields null so the defaults (off, port 4318) apply at startup.
+    const body =
+        \\{ "db_path": "~/x", "interval": 10, "server_url": "https://sermon.fyi" }
+    ;
+    const parsed = try parseConfigForTest(allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.receiver_enabled == null);
+    try std.testing.expect(parsed.value.receiver_port == null);
+    try std.testing.expect(parsed.value.otlp_token == null);
+
+    const enabled = parsed.value.receiver_enabled orelse default_receiver_enabled;
+    const port = parsed.value.receiver_port orelse default_receiver_port;
+    try std.testing.expectEqual(false, enabled);
+    try std.testing.expectEqual(@as(u16, 4318), port);
 }
