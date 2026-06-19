@@ -217,10 +217,14 @@ fn scanIpv6(s: []const u8, start: usize) Probe {
     var groups: usize = 0;
     var colons: usize = 0;
     var saw_double: bool = false;
+    var saw_hex_letter: bool = false;
     while (i < s.len) {
         // Hex group (0-4 hex digits).
         var hx: usize = 0;
-        while (i < s.len and isHex(s[i]) and hx < 4) : (i += 1) hx += 1;
+        while (i < s.len and isHex(s[i]) and hx < 4) : (i += 1) {
+            if (!isDigit(s[i])) saw_hex_letter = true;
+            hx += 1;
+        }
         if (hx > 0) groups += 1;
         if (i < s.len and s[i] == ':') {
             colons += 1;
@@ -233,9 +237,13 @@ fn scanIpv6(s: []const u8, start: usize) Probe {
             }
         } else break;
     }
-    // Require enough structure to be confidently an IPv6 literal.
+    // Require enough structure to be confidently an IPv6 literal. A "::" elision
+    // is unambiguous. Without one, demand a hex LETTER (a-f) somewhere so a plain
+    // decimal "12:34:56" timestamp is not mistaken for an address (real IPv6
+    // almost always carries a hex letter or a "::"; the rare all-decimal literal
+    // is an acceptable miss vs. destroying every timestamp's signal).
     if (saw_double and groups >= 1 and colons >= 2) return i;
-    if (!saw_double and groups >= 3 and colons >= 2) return i;
+    if (!saw_double and groups >= 3 and colons >= 2 and saw_hex_letter) return i;
     return null;
 }
 
@@ -425,10 +433,17 @@ const sensitive_keys = [_][]const u8{
     "username", "user",   "login",  "holder",
 };
 
-/// If a sensitive key name ends exactly at `key_end` (scanning backward from a
-/// '=' or ':'), return the matched key length, else null. Anchored on a word
-/// boundary so "newuser" does not match "user".
-fn matchSensitiveKey(s: []const u8, key_end: usize) ?usize {
+/// If a sensitive key name precedes the separator at `sep` (a '=' or ':'),
+/// return the matched key length, else null. The key may be separated from the
+/// separator by whitespace and/or a closing quote, so `password = x`,
+/// `"password":"x"`, and `"token" : "x"` all anchor on the key. Anchored on a
+/// word boundary so "newuser" does not match "user".
+fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
+    // Walk back over spaces/tabs, then an optional single closing quote, to find
+    // where the key token actually ends.
+    var key_end = sep;
+    while (key_end > 0 and (s[key_end - 1] == ' ' or s[key_end - 1] == '\t')) key_end -= 1;
+    if (key_end > 0 and (s[key_end - 1] == '"' or s[key_end - 1] == '\'')) key_end -= 1;
     for (sensitive_keys) |key| {
         if (key.len > key_end) continue;
         const slice = s[key_end - key.len .. key_end];
@@ -968,6 +983,16 @@ test "mac vs short hex" {
     try expectRedact("pair ab:cd done", "pair ab:cd done");
 }
 
+test "ipv6 redacts real literals but not decimal timestamps" {
+    // A "::" elision is unambiguous IPv6.
+    try expectRedact("from fe80::1 ok", "from <REDACTED:IPV6> ok");
+    // Hex letters present -> confidently an address even without "::".
+    try expectRedact("addr 2001:db8:dead here", "addr <REDACTED:IPV6> here");
+    // Plain decimal "HH:MM:SS" timestamps must keep their signal (no hex letter,
+    // no "::") - previously mis-redacted as IPv6.
+    try expectRedact("at 12:34:56 done", "at 12:34:56 done");
+}
+
 test "ssn exact" {
     try expectRedact("ssn 123-45-6789.", "ssn <REDACTED:SSN>.");
     try expectRedact("not 1234-45-6789", "not 1234-45-6789");
@@ -1009,6 +1034,16 @@ test "key=value structural" {
     try expectRedact("token=\"abc.def\" end", "token=\"<REDACTED:VALUE>\" end");
     // A non-sensitive key is left alone.
     try expectRedact("color=blue", "color=blue");
+}
+
+test "key=value tolerates spaces and quotes before the separator" {
+    // JSON-shaped logs: closing quote sits between key and ':'.
+    try expectRedact("{\"password\":\"hunter2\"}", "{\"password\":\"<REDACTED:VALUE>\"}");
+    try expectRedact("\"token\": \"abc\" end", "\"token\": \"<REDACTED:VALUE>\" end");
+    // Spaced config style: whitespace around '='.
+    try expectRedact("password = hunter2 ok", "password = <REDACTED:VALUE> ok");
+    // Boundary still holds: a longer word ending in a key name does not match.
+    try expectRedact("mypassword = keep", "mypassword = keep");
 }
 
 test "no match returns owned copy" {
