@@ -109,6 +109,18 @@ pub fn build(b: *std.Build) void {
     parquet_query_mod.addLibraryPath(b.path("lib"));
     parquet_query_mod.linkSystemLibrary("duckdb", .{});
 
+    // ── redact (edge PII redaction) ──
+    // Pure byte-scanner module; depends only on the struct definitions it
+    // redacts (collector + logs). Wired into the daemon AND given its own test
+    // target below.
+    const redact_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/redact.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    redact_mod.addImport("collector", collector_mod);
+    redact_mod.addImport("logs", logs_mod);
+
     // ── sermon-agent (daemon) ──
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/main.zig"),
@@ -116,6 +128,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    agent_mod.addImport("redact", redact_mod);
     agent_mod.addImport("collector", collector_mod);
     agent_mod.addImport("logs", logs_mod);
     agent_mod.addImport("rules", rules_mod);
@@ -233,6 +246,10 @@ pub fn build(b: *std.Build) void {
         .root_module = push_test_mod,
     });
 
+    const redact_tests = b.addTest(.{
+        .root_module = redact_mod,
+    });
+
     const proc_self_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/agent/proc_self.zig"),
@@ -265,6 +282,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(collector_tests).step);
     test_step.dependOn(&b.addRunArtifact(logs_tests).step);
     test_step.dependOn(&b.addRunArtifact(rules_tests).step);
+    test_step.dependOn(&b.addRunArtifact(redact_tests).step);
     test_step.dependOn(&b.addRunArtifact(push_tests).step);
     test_step.dependOn(&b.addRunArtifact(proc_self_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxmox_tests).step);
