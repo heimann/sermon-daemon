@@ -34,5 +34,11 @@ jobs:
       - name: Unit tests
         run: LD_LIBRARY_PATH=lib zig build test
 
+      - name: Build/test matrix (store gating + ldd-clean minimal)
+        # Runs the -Dstore=true/false legs and asserts the minimal build links no
+        # native deps. The ner=true leg auto-skips here (lib/libpf.so absent;
+        # bootstrapped from source locally via scripts/bootstrap-ner.sh).
+        run: ZIG="zig" LD_LIBRARY_PATH=lib ./scripts/test-matrix.sh
+
       - name: Resource benchmark
         run: LD_LIBRARY_PATH=lib zig build bench

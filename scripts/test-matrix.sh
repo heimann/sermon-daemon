@@ -55,7 +55,19 @@ echo "Pure-test count (must match across variants): $(pure_count)"
 
 run_variant "store=true ner=false"  -Dner=false -Dstore=true
 run_variant "store=false ner=false" -Dner=false -Dstore=false
-run_variant "store=true ner=true"   -Dner=true  -Dstore=true
+
+# The ner=true leg needs lib/libpf.so (+ggml+model), bootstrapped from source via
+# scripts/bootstrap-ner.sh. Skip it (don't fail) when libpf is absent - e.g. CI,
+# which runs the cheap store-gating + ldd-clean legs without the heavy NER build.
+# Force-require it with NER=1 (a clean clone that forgot to bootstrap then fails).
+if [ -e lib/libpf.so ]; then
+  run_variant "store=true ner=true" -Dner=true -Dstore=true
+elif [ "${NER:-0}" = "1" ]; then
+  echo "FAIL: NER=1 but lib/libpf.so absent - run scripts/bootstrap-ner.sh first" >&2
+  exit 1
+else
+  echo "=== store=true ner=true: SKIPPED (lib/libpf.so absent; run scripts/bootstrap-ner.sh to include) ==="
+fi
 
 # ── Minimal-build ldd cleanliness ──
 echo "=== minimal build ldd check (duckdb/libpf/libstdc++ must be ABSENT) ==="

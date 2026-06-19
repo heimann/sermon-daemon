@@ -211,10 +211,19 @@ zig build -Dner=false -Dstore=false  # minimal: links NEITHER - builds and runs 
                                      # lib/libduckdb.so AND lib/libpf.so absent (ldd-clean)
 ```
 
-The full build (`-Dner=true`) requires `lib/libpf.so` present at build time.
+The full build (`-Dner=true`) requires `lib/libpf.so` (+ ggml) and a GGUF model
+present. privacy-filter.cpp ships no prebuilt library, so bootstrap from source:
 
-`scripts/test-matrix.sh` builds + tests all three variants and asserts the
-minimal binaries are ldd-clean.
+```bash
+./scripts/bootstrap-ner.sh            # builds libpf+ggml (pinned) -> lib/, model -> models/
+zig build -Dner=true
+```
+
+(`bootstrap-ner.sh --pf-src DIR` reuses an existing checkout; `--skip-model` /
+`--skip-libs` fetch one half. Outputs are gitignored.)
+
+`scripts/test-matrix.sh` builds + tests all variants and asserts the minimal
+binaries are ldd-clean.
 
 #### `local_store` runtime knob
 
