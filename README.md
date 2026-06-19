@@ -192,6 +192,40 @@ zig build
 LD_LIBRARY_PATH=lib zig build test
 ```
 
+### Build options (native dependency footprint)
+
+Two `-D` flags gate the native (non-Zig) processing dependencies, so a node can
+be built with the smallest surface it needs:
+
+| Flag                | Default | Links            | Effect when off                                                              |
+| ------------------- | ------- | ---------------- | --------------------------------------------------------------------------- |
+| `-Dstore=<bool>`    | `true`  | `libduckdb`      | No local parquet hot tier. Daemon still collects + pushes to the cloud; CLI query commands exit `78` (EX_CONFIG) with a clear message. |
+| `-Dner=<bool>`      | `false` | `libpf` (+ ggml/libstdc++) | Model-backed NER preprocessor unavailable; the `"ner"` stage degrades to the deterministic redactor. |
+
+Build variants and their native footprint:
+
+```bash
+zig build                          # default: store=true, ner=false  (links libduckdb)
+zig build -Dner=true               # full:    store=true, ner=true   (links libduckdb + libpf)
+zig build -Dner=false -Dstore=false  # minimal: links NEITHER - builds and runs with
+                                     # lib/libduckdb.so AND lib/libpf.so absent (ldd-clean)
+```
+
+The full build (`-Dner=true`) requires `lib/libpf.so` present at build time.
+
+`scripts/test-matrix.sh` builds + tests all three variants and asserts the
+minimal binaries are ldd-clean.
+
+#### `local_store` runtime knob
+
+Independent of the build flag, `config.json` accepts a `local_store` boolean
+(default `true` when absent). Setting `local_store: false` on a store-capable
+build is a FORWARD-ONLY switch: the daemon stops appending new rows to the
+staging log and stops rolling, but previously written parquet stays on disk and
+the CLI can still query it. It is not a live on/off toggle for reads. On a
+`-Dstore=false` build the knob is parsed-but-ignored (a one-time startup warning
+is logged if it - or `roll_max_bytes` / `roll_interval_s` - is set).
+
 Run the daemon locally:
 
 ```bash

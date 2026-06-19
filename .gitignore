@@ -19,3 +19,8 @@ test_io
 
 # Local worktrees
 .worktrees/
+
+# NER backend libs (bootstrapped, like libduckdb.so) + the GGUF model
+lib/libpf.so*
+lib/libggml*.so*
+models/

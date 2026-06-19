@@ -1,7 +1,17 @@
 const std = @import("std");
 const commands = @import("commands.zig");
 const output = @import("output.zig");
-const parquet_query = @import("parquet_query");
+const build_options = @import("build_options");
+// parquet_query links duckdb and is ONLY built under -Dstore. Under -Dstore=false
+// it is a comptime stand-in exposing just the type names commands.zig aliases at
+// module scope (Storage / QueryResult); every method call on it lives in a
+// comptime-dead branch (the early EX_CONFIG exit elides the init + routing), so
+// the stand-in is never type-checked for an .init or accessor decl. Mirrors the
+// ner_pf_mod stand-in in src/agent/main.zig.
+const parquet_query = if (build_options.store_enabled) @import("parquet_query") else struct {
+    pub const ParquetQuery = struct {};
+    pub const QueryResult = struct {};
+};
 
 const Allocator = std.mem.Allocator;
 
@@ -36,6 +46,8 @@ const usage =
     \\  sermon processes --sort mem --filter nginx
     \\  sermon logs --unit nginx --since 1h --priority err
     \\  sermon query "SELECT * FROM metrics ORDER BY timestamp DESC LIMIT 10"
+    \\
+    \\Note: status/metrics/processes/logs/query require a build with -Dstore=true.
     \\
 ;
 
@@ -115,45 +127,59 @@ pub fn main() !void {
         return error.NoCommand;
     };
 
-    // Resolve database path
-    const final_db_path = db_path orelse try expandPath(allocator, default_db_path);
-    defer if (db_path == null) allocator.free(final_db_path);
+    // Store-disabled build: every CLI command reads from the local parquet hot
+    // tier (status/metrics/processes/logs/query). With -Dstore=false there is no
+    // local store and parquet_query is a stand-in, so degrade gracefully and exit
+    // 78 (EX_CONFIG): the node is configured without local storage, not a
+    // transient runtime error. The whole query path below is wrapped in
+    // `if (build_options.store_enabled)` so under -Dstore=false it is comptime-
+    // dead and the stand-in is never asked for initParquetQuery / accessors.
+    if (comptime !build_options.store_enabled) {
+        std.debug.print("Error: local storage is disabled (built with -Dstore=false); query commands are unavailable on this node.\n", .{});
+        std.process.exit(78);
+    }
 
-    // Parquet hot tier root (plan 25 cutover). The hot tier lives in the
-    // directory that used to hold metrics.db, so we derive the root from the
-    // configured db path's DIRECTORY exactly as the daemon does (see
-    // src/agent/main.zig) - this keeps the CLI reading the same tree the daemon
-    // writes. A path with no dir component falls back to the current directory.
-    const root = std.fs.path.dirname(final_db_path) orelse ".";
+    if (build_options.store_enabled) {
+        // Resolve database path
+        const final_db_path = db_path orelse try expandPath(allocator, default_db_path);
+        defer if (db_path == null) allocator.free(final_db_path);
 
-    // Open an on-demand query handle over the parquet tree. It brings DuckDB up
-    // transiently and freezes a parquet file-list + staging snapshot under a
-    // shared roll lock. Retry briefly if the daemon holds the lock mid-roll.
-    var storage = parquet_query.initParquetQuery(allocator, root) catch blk: {
-        for (0..3) |_| {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
-            break :blk parquet_query.initParquetQuery(allocator, root) catch continue;
+        // Parquet hot tier root (plan 25 cutover). The hot tier lives in the
+        // directory that used to hold metrics.db, so we derive the root from the
+        // configured db path's DIRECTORY exactly as the daemon does (see
+        // src/agent/main.zig) - this keeps the CLI reading the same tree the daemon
+        // writes. A path with no dir component falls back to the current directory.
+        const root = std.fs.path.dirname(final_db_path) orelse ".";
+
+        // Open an on-demand query handle over the parquet tree. It brings DuckDB up
+        // transiently and freezes a parquet file-list + staging snapshot under a
+        // shared roll lock. Retry briefly if the daemon holds the lock mid-roll.
+        var storage = parquet_query.initParquetQuery(allocator, root) catch blk: {
+            for (0..3) |_| {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                break :blk parquet_query.initParquetQuery(allocator, root) catch continue;
+            }
+            std.debug.print("Error: could not open data directory (agent may be writing). Try again.\n", .{});
+            return error.QueryInitFailed;
+        };
+        defer storage.deinit();
+
+        // Route to command handler
+        if (std.mem.eql(u8, command, "status")) {
+            try handleStatus(allocator, &storage, format);
+        } else if (std.mem.eql(u8, command, "metrics")) {
+            try handleMetrics(allocator, &storage, format, cmd_args.items);
+        } else if (std.mem.eql(u8, command, "processes")) {
+            try handleProcesses(allocator, &storage, format, cmd_args.items);
+        } else if (std.mem.eql(u8, command, "logs")) {
+            try handleLogs(allocator, &storage, format, cmd_args.items);
+        } else if (std.mem.eql(u8, command, "query")) {
+            try handleQuery(allocator, &storage, format, cmd_args.items);
+        } else {
+            std.debug.print("Error: unknown command '{s}'\n\n", .{command});
+            printUsage();
+            return error.UnknownCommand;
         }
-        std.debug.print("Error: could not open data directory (agent may be writing). Try again.\n", .{});
-        return error.QueryInitFailed;
-    };
-    defer storage.deinit();
-
-    // Route to command handler
-    if (std.mem.eql(u8, command, "status")) {
-        try handleStatus(allocator, &storage, format);
-    } else if (std.mem.eql(u8, command, "metrics")) {
-        try handleMetrics(allocator, &storage, format, cmd_args.items);
-    } else if (std.mem.eql(u8, command, "processes")) {
-        try handleProcesses(allocator, &storage, format, cmd_args.items);
-    } else if (std.mem.eql(u8, command, "logs")) {
-        try handleLogs(allocator, &storage, format, cmd_args.items);
-    } else if (std.mem.eql(u8, command, "query")) {
-        try handleQuery(allocator, &storage, format, cmd_args.items);
-    } else {
-        std.debug.print("Error: unknown command '{s}'\n\n", .{command});
-        printUsage();
-        return error.UnknownCommand;
     }
 }
 

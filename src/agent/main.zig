@@ -5,14 +5,31 @@ const rules_mod = @import("rules");
 const proc_self_mod = @import("proc_self");
 const proxmox_mod = @import("proxmox");
 const push_mod = @import("push");
-const storage_mod = @import("storage");
-// Parquet hot tier (plan 25 cutover). The daemon WRITE path is now a durable
-// append-log (staging) periodically rolled to parquet (roll); the resident
-// DuckDB write path (storage_mod) is retired here. storage_mod is still imported
-// only for its back-compat constants (default_memory_limit_mb) - see below.
+// Parquet hot tier (plan 25 cutover). The daemon WRITE path is a durable
+// append-log (staging, PURE - always imported) periodically rolled to parquet
+// (roll, links duckdb). The local hot tier is GATED behind -Dstore: under
+// store=false roll is never built, so the import is a comptime stand-in (mirrors
+// ner_pf_mod) and every roll_mod.* call sits behind a comptime-true branch.
+// storage.zig is fully dropped from the daemon post-cutover: its only remaining
+// use was the back-compat default_memory_limit_mb constant, now a local below.
 const staging_mod = @import("staging");
-const roll_mod = @import("roll");
-const redact_mod = @import("redact");
+const roll_mod = if (build_options.store_enabled) @import("roll") else struct {};
+// Redaction now runs through the preprocessor pipeline (preprocessor +
+// redact_adapter); main.zig no longer calls redact directly.
+// NER adapter: `ner` is the pure interface (links nothing); `ner_pf` is the
+// FFI-GGML backend that links libpf. main.zig is the ONLY place the concrete
+// backend is constructed - everything downstream takes the pure `ner.Ner`.
+const ner_mod = @import("ner");
+const build_options = @import("build_options");
+const preprocessor_mod = @import("preprocessor");
+const redact_adapter_mod = @import("redact_adapter");
+// ner_pf is the concrete FFI backend; it is ONLY built under -Dner. The import
+// is gated on the comptime-known build_options.ner_enabled so the base build
+// never analyzes @import("ner_pf") (the module does not exist in that graph).
+// The empty-struct stand-in keeps the name resolvable; loadNer only touches
+// ner_pf_mod.init inside a comptime-true branch, so the stand-in is never
+// type-checked for an .init decl.
+const ner_pf_mod = if (build_options.ner_enabled) @import("ner_pf") else struct {};
 
 const default_db_path = "~/.local/share/sermon/metrics.db";
 const default_config_path = "~/.config/sermon/config.json";
@@ -35,6 +52,12 @@ const default_roll_interval_s: u64 = 3600; // 1 hour
 // keeping the top-N by CPU and memory cuts that ~5-15x. Set max_processes to 0
 // to keep all (Collector.keep_all_processes).
 const default_max_processes: u32 = 20;
+// RETAINED FOR BACK-COMPAT: the resident-DuckDB write path this capped is retired
+// (plan 25), so this value is parsed + logged but otherwise unused. Defined as a
+// local (was storage_mod.Storage.default_memory_limit_mb) so the daemon does not
+// import storage.zig at all - which is what keeps duckdb unreferenced under
+// -Dstore=false.
+const default_memory_limit_mb: u32 = 512;
 // Rules live in their own file (not config.json) partly because the config
 // loader reads into a fixed 4 KiB buffer; a rule set can be much larger.
 const max_rules_file_bytes = 256 * 1024;
@@ -67,6 +90,32 @@ const Config = struct {
     // its last roll, so low-volume tables don't sit un-rolled. See
     // default_roll_interval_s.
     roll_interval_s: ?u64 = null,
+    // Model-backed NER redaction (free-form names / addresses the deterministic
+    // scanners can't characterize). Disabled by default: when false, or when the
+    // model file is absent / fails to load, the daemon redacts with the
+    // deterministic scanners ONLY - never raw, never crashing.
+    enable_ner: ?bool = null,
+    // Path to the GGUF model used by the NER backend. Tilde-expanded. Only read
+    // when enable_ner is true. Absent + enable_ner=true => degrade to scanners.
+    ner_model_path: ?[]const u8 = null,
+    // Ordered preprocessor chain run once per cycle before staging-append/push.
+    // null (field absent) => default ["redact"] (today's always-on deterministic
+    // redaction; backward compatible). [] => lightweight pure passthrough (NO
+    // redaction). ["redact"] => deterministic byte-scanners only. ["redact","ner"]
+    // => deterministic + model-backed (ner stage skipped with a warning if the
+    // daemon was built without -Dner or the model failed to load - never crashes,
+    // never emits raw PII). Mapping null -> ["redact"] (NOT []) is mandatory:
+    // mapping null to [] would silently disable redaction for every existing config.
+    preprocessors: ?[]const []const u8 = null,
+    // Runtime FORWARD-ONLY switch for the local parquet hot tier. null (absent) =>
+    // true, so every existing config.json is unchanged (storage active in a
+    // store-capable build). false => skip staging append + roll + retention/
+    // compaction at RUNTIME even though the modules are compiled in; previously
+    // written parquet stays on disk and the CLI can still query it. This is NOT a
+    // live on/off toggle for queries - it stops new local writes only. Ignored
+    // (parsed-but-dead) when the daemon was built with -Dstore=false. Follows the
+    // back-compat-field precedent (memory_limit_mb / storage_refresh_*).
+    local_store: ?bool = null,
 };
 
 fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(Config) {
@@ -194,9 +243,9 @@ pub fn main() !void {
     // RETAINED FOR BACK-COMPAT: still parsed so old config.json files load, but
     // the resident-DuckDB write path it capped is retired. Logged at startup.
     const memory_limit_mb: u32 = if (config) |c|
-        c.value.memory_limit_mb orelse storage_mod.Storage.default_memory_limit_mb
+        c.value.memory_limit_mb orelse default_memory_limit_mb
     else
-        storage_mod.Storage.default_memory_limit_mb;
+        default_memory_limit_mb;
     const max_processes: u32 = if (config) |c|
         c.value.max_processes orelse default_max_processes
     else
@@ -210,6 +259,17 @@ pub fn main() !void {
         c.value.roll_interval_s orelse default_roll_interval_s
     else
         default_roll_interval_s;
+
+    // Local hot tier gating. `local_store` is the RUNTIME knob (null => true).
+    // `store_active` composes the comptime build gate with the runtime knob: a
+    // store-capable build (build_options.store_enabled) with local_store=true
+    // writes locally; either off => no local write this cycle. BUILD-only gating
+    // (build_options.store_enabled alone) wraps startup-lifecycle / roll-replay /
+    // retention / shutdown, which reference roll_mod and so must vanish under
+    // -Dstore=false; RUNTIME gating (store_active) wraps the per-cycle append +
+    // roll-trigger, which exist in the graph but are skipped forward-only.
+    const local_store: bool = if (config) |c| c.value.local_store orelse true else true;
+    const store_active = build_options.store_enabled and local_store;
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -303,55 +363,63 @@ pub fn main() !void {
     const root = try allocator.dupe(u8, std.fs.path.dirname(final_db_path) orelse ".");
     defer allocator.free(root);
 
-    // STARTUP LIFECYCLE (must run BEFORE any append/roll/query):
-    //   1. recoverOrphanTemps: a crash BETWEEN a roll's staging-reset and its
-    //      rename leaves a durable `<seq>.parquet.tmp` whose rows are already
-    //      gone from staging. Rename such orphans to their final name so those
-    //      rows are not stranded. Idempotent; safe when there are none.
-    roll_mod.recoverOrphanTemps(allocator, root) catch |err| {
-        std.debug.print("Warning: orphan-temp recovery failed: {}\n", .{err});
-    };
+    // The durable staging append-log. Its TYPE is comptime-conditional: a real
+    // Staging only in a store-capable build (where the open + lifecycle below
+    // run), otherwise `void` so the daemon never opens it and roll_mod (a stand-in
+    // struct under -Dstore=false) is never referenced. Declared here so the
+    // per-cycle write path (gated on store_active) and shutdown flush can see it.
+    var stg: if (build_options.store_enabled) staging_mod.Staging else void = undefined;
 
-    //   1b. recoverCompactions: finish or roll back any day-compaction a crash
-    //       interrupted. A committed `<seq>.manifest` replays its named-input
-    //       deletes + publish exactly; an orphan `<seq>.building` (pre-commit
-    //       crash) is dropped with its inputs left intact. Must run AFTER orphan-
-    //       temp recovery (so a re-published roll temp is a candidate input next
-    //       tick) and BEFORE any roll/query. Idempotent; no-op when there's none.
-    //
-    //       FATAL on failure: a committed manifest mid-replay can leave rows
-    //       hidden in a `<seq>.building` that queries ignore (deleting inputs
-    //       precedes publishing the building). Proceeding would silently serve a
-    //       short count. Aborting lets a restart retry recovery from the durable
-    //       manifest instead, so no row is ever stranded in a half-published merge.
-    try roll_mod.recoverCompactions(allocator, root);
+    // STARTUP LIFECYCLE (must run BEFORE any append/roll/query). BUILD-time gated:
+    // every call here touches roll_mod, which does not exist under -Dstore=false.
+    if (build_options.store_enabled) {
+        //   1. recoverOrphanTemps: a crash BETWEEN a roll's staging-reset and its
+        //      rename leaves a durable `<seq>.parquet.tmp` whose rows are already
+        //      gone from staging. Rename such orphans to their final name so those
+        //      rows are not stranded. Idempotent; safe when there are none.
+        roll_mod.recoverOrphanTemps(allocator, root) catch |err| {
+            std.debug.print("Warning: orphan-temp recovery failed: {}\n", .{err});
+        };
 
-    // One-shot MIGRATION: if a legacy resident metrics.db still exists at the
-    // old path, COPY its rows into the parquet tree (best-effort) and rename it
-    // to metrics.db.migrated (kept for rollback). A failure is logged and the
-    // daemon continues - the cloud holds the long-term history.
-    if (roll_mod.migrateLegacyDb(allocator, root, final_db_path)) |migrated| {
-        if (migrated) std.debug.print("migrated legacy {s} into parquet hot tier\n", .{final_db_path});
-    } else |err| {
-        std.debug.print("Warning: legacy db migration failed: {}\n", .{err});
-    }
+        //   1b. recoverCompactions: finish or roll back any day-compaction a crash
+        //       interrupted. A committed `<seq>.manifest` replays its named-input
+        //       deletes + publish exactly; an orphan `<seq>.building` (pre-commit
+        //       crash) is dropped with its inputs left intact. Must run AFTER orphan-
+        //       temp recovery (so a re-published roll temp is a candidate input next
+        //       tick) and BEFORE any roll/query. Idempotent; no-op when there's none.
+        //
+        //       FATAL on failure: a committed manifest mid-replay can leave rows
+        //       hidden in a `<seq>.building` that queries ignore (deleting inputs
+        //       precedes publishing the building). Proceeding would silently serve a
+        //       short count. Aborting lets a restart retry recovery from the durable
+        //       manifest instead, so no row is ever stranded in a half-published merge.
+        try roll_mod.recoverCompactions(allocator, root);
 
-    // Open the durable staging append-log for the daemon's lifetime. This
-    // replaces the resident DuckDB write path entirely.
-    var stg = try staging_mod.Staging.open(allocator, root);
-    defer stg.deinit();
+        // One-shot MIGRATION: if a legacy resident metrics.db still exists at the
+        // old path, COPY its rows into the parquet tree (best-effort) and rename it
+        // to metrics.db.migrated (kept for rollback). A failure is logged and the
+        // daemon continues - the cloud holds the long-term history.
+        if (roll_mod.migrateLegacyDb(allocator, root, final_db_path)) |migrated| {
+            if (migrated) std.debug.print("migrated legacy {s} into parquet hot tier\n", .{final_db_path});
+        } else |err| {
+            std.debug.print("Warning: legacy db migration failed: {}\n", .{err});
+        }
 
-    // REPLAY: re-roll any staging segments left over from a prior run so a crash
-    // mid-run does not strand un-rolled rows in staging (and so the segment
-    // doesn't keep growing past its size trigger across restarts). rollAll is a
-    // no-op for empty segments.
-    {
+        // Open the durable staging append-log for the daemon's lifetime. This
+        // replaces the resident DuckDB write path entirely.
+        stg = try staging_mod.Staging.open(allocator, root);
+
+        // REPLAY: re-roll any staging segments left over from a prior run so a crash
+        // mid-run does not strand un-rolled rows in staging (and so the segment
+        // doesn't keep growing past its size trigger across restarts). rollAll is a
+        // no-op for empty segments.
         const replayed = roll_mod.rollAll(allocator, root, &stg) catch |err| blk: {
             std.debug.print("Warning: startup replay roll failed: {}\n", .{err});
             break :blk 0;
         };
         if (replayed > 0) std.debug.print("startup replay: rolled {d} leftover staging segment(s)\n", .{replayed});
     }
+    defer if (build_options.store_enabled) stg.deinit();
 
     // Obsolete-config visibility: the resident-DuckDB refresh knobs are parsed for
     // back-compat but do nothing post-cutover. If an operator still has either set,
@@ -362,7 +430,24 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("sermon-agent started (root={s}, interval={d}s, max_processes={d}, roll_max_bytes={d}, roll_interval_s={d}s) [memory_limit_mb={d} retained for back-compat, unused]\n", .{ root, interval, max_processes, roll_max_bytes, roll_interval_s, memory_limit_mb });
+    // Storage mode: on (store build + local_store=true), disabled-build (built
+    // with -Dstore=false), or disabled-runtime (store build but local_store=false,
+    // forward-only: no new local writes, prior parquet still queryable).
+    const store_mode: []const u8 = if (!build_options.store_enabled)
+        "disabled-build"
+    else if (!local_store)
+        "disabled-runtime (local_store=false)"
+    else
+        "on";
+    std.debug.print("sermon-agent started (root={s}, interval={d}s, max_processes={d}, roll_max_bytes={d}, roll_interval_s={d}s, local_store={s}) [memory_limit_mb={d} retained for back-compat, unused]\n", .{ root, interval, max_processes, roll_max_bytes, roll_interval_s, store_mode, memory_limit_mb });
+    // Warn once if store knobs are set on a build that can't honor them.
+    if (!build_options.store_enabled) {
+        if (config) |c| {
+            if (c.value.local_store != null or c.value.roll_max_bytes != null or c.value.roll_interval_s != null) {
+                std.log.warn("config: local_store / roll_max_bytes / roll_interval_s are ignored on a -Dstore=false build (no local hot tier)", .{});
+            }
+        }
+    }
     if (log_rules.len > 0) {
         std.debug.print("loaded {d} log rule(s)\n", .{log_rules.len});
     }
@@ -413,6 +498,19 @@ pub fn main() !void {
     }
     defer if (log_tailer) |*lt| lt.deinit();
 
+    // ── NER backend (model-backed PII redaction) ──
+    // Loaded ONCE here (the model is GBs resident; load-per-call is untenable).
+    // null = deterministic-scanners-only; loadNer never crashes and never runs
+    // raw. The handle is threaded into redactProcesses / redactLog below.
+    const ner_backend: ?ner_mod.Ner = loadNer(allocator, config);
+    // Build the preprocessor chain once. buildPipeline takes OWNERSHIP of
+    // ner_backend (frees it if no "ner" stage uses it, or via the stage's deinit
+    // otherwise), so there is NO separate ner_backend deinit here - that would
+    // double-free. Default chain (config preprocessors absent) is ["redact"].
+    const cfg_value: Config = if (config) |c| c.value else .{};
+    const pipeline = try buildPipeline(allocator, cfg_value, ner_backend);
+    defer pipeline.deinit(allocator);
+
     // First sample establishes baseline for CPU deltas, then sleep so first real data is meaningful
     _ = try coll.collectMetrics();
     {
@@ -429,8 +527,11 @@ pub fn main() !void {
     std.Thread.sleep(1 * std.time.ns_per_s);
 
     // Run retention once on startup to trim stale partitions before the loop
-    // begins. Non-fatal: best-effort, log once and continue.
-    {
+    // begins. Non-fatal: best-effort, log once and continue. BUILD-gated: touches
+    // roll_mod. Retention runs whenever the build is store-capable (independent of
+    // the runtime local_store knob) so a build that previously wrote parquet still
+    // trims it even when forward-only writes are paused.
+    if (build_options.store_enabled) {
         const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
         roll_mod.runRetention(allocator, root, retention) catch |err| {
             std.debug.print("Warning: startup retention failed: {}\n", .{err});
@@ -487,12 +588,8 @@ pub fn main() !void {
         // drained, below. A redaction failure is fatal-for-cycle: we must never
         // persist or push raw PII, so we skip this cycle rather than fall
         // through with unredacted data.
-        redact_mod.redactProcesses(allocator, procs) catch |err| {
-            std.debug.print("Warning: process redaction failed: {}\n", .{err});
-            continue;
-        };
-        redact_mod.redactDisks(allocator, disks) catch |err| {
-            std.debug.print("Warning: disk redaction failed: {}\n", .{err});
+        pipeline.runBatch(allocator, procs, disks) catch |err| {
+            std.debug.print("Warning: process/disk redaction failed: {}\n", .{err});
             continue;
         };
 
@@ -538,6 +635,14 @@ pub fn main() !void {
         // = one bracketed begin/end (takes the EX roll lock, appends each
         // non-empty table's record, fdatasyncs once, releases). The append guards
         // mirror today's storage.insert* guards (only write non-empty tables).
+        //
+        // GATING: the staging append is BUILD-gated (comptime build_options
+        // .store_enabled, so under -Dstore=false the `void` stg is never touched)
+        // AND RUNTIME-gated (store_active: a store-capable build with
+        // local_store=false skips the append forward-only). `store_active` already
+        // implies build_options.store_enabled. The log-drain loop MUST still run
+        // when storage is off because it feeds push_logs (remote push); only the
+        // per-entry stg.appendLogs call is gated.
         {
             // Firehose guard, preserved in spirit: on the FIRST append failure in
             // a cycle, skip the remaining appends so we log at most one warning
@@ -553,48 +658,51 @@ pub fn main() !void {
             // future cycle + any query/roll. So endCycle is gated on cycle_open,
             // NOT on staging_failed.
             var cycle_open = false;
-            stg.beginCycle() catch |err| {
-                std.debug.print("Warning: staging beginCycle failed: {}\n", .{err});
-                staging_failed = true;
-            };
-            if (!staging_failed) cycle_open = true;
+            if (build_options.store_enabled and store_active) {
+                stg.beginCycle() catch |err| {
+                    std.debug.print("Warning: staging beginCycle failed: {}\n", .{err});
+                    staging_failed = true;
+                };
+                if (!staging_failed) cycle_open = true;
 
-            if (!staging_failed) {
-                stg.appendMetrics(now, metrics) catch |err| {
-                    std.debug.print("Warning: metrics append failed: {}\n", .{err});
-                    staging_failed = true;
-                };
-            }
-            if (!staging_failed and procs.len > 0) {
-                stg.appendProcesses(now, procs) catch |err| {
-                    std.debug.print("Warning: process append failed: {}\n", .{err});
-                    staging_failed = true;
-                };
-            }
-            if (!staging_failed and disks.len > 0) {
-                stg.appendDisks(now, disks) catch |err| {
-                    std.debug.print("Warning: disk append failed: {}\n", .{err});
-                    staging_failed = true;
-                };
-            }
-            if (!staging_failed and containers.len > 0) {
-                stg.appendContainers(now, containers) catch |err| {
-                    std.debug.print("Warning: container append failed: {}\n", .{err});
-                    staging_failed = true;
-                };
-            }
-            if (!staging_failed and ct_metrics.len > 0) {
-                stg.appendContainerMetrics(now, ct_metrics) catch |err| {
-                    std.debug.print("Warning: container_metrics append failed: {}\n", .{err});
-                    staging_failed = true;
-                };
+                if (!staging_failed) {
+                    stg.appendMetrics(now, metrics) catch |err| {
+                        std.debug.print("Warning: metrics append failed: {}\n", .{err});
+                        staging_failed = true;
+                    };
+                }
+                if (!staging_failed and procs.len > 0) {
+                    stg.appendProcesses(now, procs) catch |err| {
+                        std.debug.print("Warning: process append failed: {}\n", .{err});
+                        staging_failed = true;
+                    };
+                }
+                if (!staging_failed and disks.len > 0) {
+                    stg.appendDisks(now, disks) catch |err| {
+                        std.debug.print("Warning: disk append failed: {}\n", .{err});
+                        staging_failed = true;
+                    };
+                }
+                if (!staging_failed and containers.len > 0) {
+                    stg.appendContainers(now, containers) catch |err| {
+                        std.debug.print("Warning: container append failed: {}\n", .{err});
+                        staging_failed = true;
+                    };
+                }
+                if (!staging_failed and ct_metrics.len > 0) {
+                    stg.appendContainerMetrics(now, ct_metrics) catch |err| {
+                        std.debug.print("Warning: container_metrics append failed: {}\n", .{err});
+                        staging_failed = true;
+                    };
+                }
             }
 
             // Drain available log entries. The push path is independent of
-            // staging health; only skip the staging append when staging failed
-            // this cycle. Each entry is appended individually here (one record
-            // per log entry mirrors the old per-entry insertLog), but they all
-            // sit inside this one begin/end bracket and share one fdatasync.
+            // staging health AND of the store gate; only skip the staging append
+            // when staging failed this cycle or local storage is off. Each entry
+            // is appended individually here (one record per log entry mirrors the
+            // old per-entry insertLog), but they all sit inside this one begin/end
+            // bracket and share one fdatasync.
             if (log_tailer) |*lt| {
                 var log_count: u32 = 0;
                 while (log_count < 1000) : (log_count += 1) {
@@ -606,12 +714,12 @@ pub fn main() !void {
                     // failure, drop the entry (free it, skip it) rather than
                     // persist/push raw PII - one dropped log line is acceptable;
                     // leaking a credential is not.
-                    redact_mod.redactLog(allocator, &entry) catch |err| {
+                    pipeline.runLog(allocator, &entry) catch |err| {
                         std.debug.print("Warning: log redaction failed, dropping entry: {}\n", .{err});
                         entry.deinit(allocator);
                         continue;
                     };
-                    if (!staging_failed) {
+                    if (build_options.store_enabled and store_active and !staging_failed) {
                         // appendLogs takes a slice; pass this single entry.
                         stg.appendLogs(&[_]logs_mod.LogEntry{entry}) catch |err| {
                             std.debug.print("Warning: log append failed: {}\n", .{err});
@@ -630,7 +738,7 @@ pub fn main() !void {
             // EX lock (endCycle does both, the unlock via defer even if the sync
             // errors). Gated on cycle_open so the lock is ALWAYS released once
             // begin took it - a mid-cycle append failure must not strand it.
-            if (cycle_open) {
+            if (build_options.store_enabled and cycle_open) {
                 stg.endCycle() catch |err| {
                     std.debug.print("Warning: staging endCycle failed: {}\n", .{err});
                 };
@@ -644,19 +752,23 @@ pub fn main() !void {
         // sit un-rolled indefinitely). rollTable resets the segment on success
         // and is a no-op for an empty segment. Failures are per-table, logged,
         // and non-fatal (the rows stay durably in staging for the next attempt).
-        for (staging_mod.Table.all) |table| {
-            const idx = @intFromEnum(table);
-            const size = stg.byteLen(table) catch 0;
-            const size_trigger = size > roll_max_bytes;
-            const time_trigger = (now - last_roll[idx]) >= @as(i64, @intCast(roll_interval_s));
-            if (!size_trigger and !time_trigger) continue;
-            if (roll_mod.rollTable(allocator, root, &stg, table)) |maybe_res| {
-                if (maybe_res) |res| allocator.free(res.parquet_path);
-                // Reset the time trigger even when there was nothing to roll, so
-                // an idle table doesn't re-evaluate the (cheap) trigger every cycle.
-                last_roll[idx] = now;
-            } else |err| {
-                std.debug.print("Warning: roll of {s} failed: {}\n", .{ table.name(), err });
+        // RUNTIME-gated on store_active (references stg + roll_mod): a store build
+        // with local_store=false stops rolling new segments forward-only.
+        if (build_options.store_enabled and store_active) {
+            for (staging_mod.Table.all) |table| {
+                const idx = @intFromEnum(table);
+                const size = stg.byteLen(table) catch 0;
+                const size_trigger = size > roll_max_bytes;
+                const time_trigger = (now - last_roll[idx]) >= @as(i64, @intCast(roll_interval_s));
+                if (!size_trigger and !time_trigger) continue;
+                if (roll_mod.rollTable(allocator, root, &stg, table)) |maybe_res| {
+                    if (maybe_res) |res| allocator.free(res.parquet_path);
+                    // Reset the time trigger even when there was nothing to roll, so
+                    // an idle table doesn't re-evaluate the (cheap) trigger every cycle.
+                    last_roll[idx] = now;
+                } else |err| {
+                    std.debug.print("Warning: roll of {s} failed: {}\n", .{ table.name(), err });
+                }
             }
         }
 
@@ -668,8 +780,11 @@ pub fn main() !void {
         // discipline (taken internally), so they're mutually exclusive with rolls
         // and query snapshots. Compaction runs AFTER retention so it never merges
         // a day retention is about to drop.
+        // BUILD-gated (touches roll_mod): retention/compaction maintain previously
+        // written parquet, so they run on any store-capable build regardless of the
+        // runtime local_store knob.
         retention_counter += interval;
-        if (retention_counter >= 3600) {
+        if (build_options.store_enabled and retention_counter >= 3600) {
             const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
             roll_mod.runRetention(allocator, root, retention) catch |err| {
                 std.debug.print("Warning: retention cleanup failed: {}\n", .{err});
@@ -771,8 +886,10 @@ pub fn main() !void {
     // a crash is handled by the startup replay roll above - so it's best-effort
     // (catch + log, non-fatal). It just bounds segment size and makes the
     // shutdown intent (drain staging to parquet) explicit. Runs BEFORE deinit so
-    // the roll reuses the still-open staging fd.
-    {
+    // the roll reuses the still-open staging fd. BUILD-gated (touches roll_mod +
+    // the void stg under -Dstore=false). rollAll is a no-op for empty segments, so
+    // it is safe to flush even when local_store=false paused new appends.
+    if (build_options.store_enabled) {
         const flushed = roll_mod.rollAll(allocator, root, &stg) catch |err| blk: {
             std.debug.print("Warning: shutdown flush roll failed: {}\n", .{err});
             break :blk 0;
@@ -808,4 +925,91 @@ fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, path[1..] });
     }
     return allocator.dupe(u8, path);
+}
+
+/// Load the model-backed NER redaction backend ONCE at daemon start, with full
+/// degrade-to-deterministic semantics: returns null (scanners-only) when NER is
+/// disabled, no model path is configured, the path can't be expanded, the file
+/// is absent, or pf_load fails. NEVER crashes and NEVER runs raw - a null here
+/// just means the deterministic scanners do all the work. The returned Ner owns
+/// the loaded model for the daemon lifetime; the caller must `deinit` it.
+///
+/// Thread-safety: the returned handle is NOT safe for concurrent classify (the
+/// pf_ctx gallocr buffer is reused without locks). The daemon redacts single-
+/// threaded at one chokepoint, so holding one handle is correct today.
+/// Build the preprocessor chain from config. Takes FULL OWNERSHIP of
+/// `ner_backend`: if an "ner" stage is created it owns the backend (freed via
+/// the stage's deinit in Pipeline.deinit); if no "ner" stage is created but a
+/// backend was loaded, this fn frees it before returning. The caller therefore
+/// must NOT separately deinit ner_backend (avoids the double-free risk).
+///
+/// names == null (config field absent) => default ["redact"]. names == [] =>
+/// pure passthrough. Unknown names and an "ner" stage with no usable backend are
+/// warned-and-skipped: degrade to whatever stages remain, never crash, never
+/// emit raw PII.
+fn buildPipeline(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    ner_backend: ?ner_mod.Ner,
+) ner_mod.Error!preprocessor_mod.Pipeline {
+    const default_chain = [_][]const u8{"redact"};
+    const names: []const []const u8 = cfg.preprocessors orelse &default_chain;
+
+    var stages = std.ArrayList(preprocessor_mod.Preprocessor){};
+    errdefer stages.deinit(allocator);
+
+    var ner_consumed = false;
+    for (names) |name| {
+        if (std.mem.eql(u8, name, "redact")) {
+            try stages.append(allocator, redact_adapter_mod.DeterministicRedact.asPreprocessor());
+        } else if (std.mem.eql(u8, name, "ner")) {
+            if (!build_options.ner_enabled or ner_backend == null) {
+                std.debug.print("config: preprocessor \"ner\" requested but unavailable (built without -Dner or model not loaded) - skipping, deterministic stages only\n", .{});
+                continue;
+            }
+            const nr = try allocator.create(redact_adapter_mod.NerRedact);
+            nr.* = .{ .ner_backend = ner_backend.? };
+            try stages.append(allocator, nr.asPreprocessor());
+            ner_consumed = true;
+        } else {
+            std.debug.print("config: unknown preprocessor \"{s}\" - skipping\n", .{name});
+        }
+    }
+
+    // We own ner_backend. If no ner stage consumed it, free it now.
+    if (!ner_consumed) {
+        if (ner_backend) |n| n.deinit();
+    }
+
+    return .{ .stages = try stages.toOwnedSlice(allocator) };
+}
+
+fn loadNer(allocator: std.mem.Allocator, config: ?std.json.Parsed(Config)) ?ner_mod.Ner {
+    // Comptime gate: in the base build (no -Dner) ner_pf_mod is an empty struct,
+    // so the rest of this fn (ner_pf_mod.init) must be dead code Zig never
+    // analyzes. ner_enabled is comptime-known, so the early return elides it.
+    if (!build_options.ner_enabled) return null;
+    const cfg = (config orelse return null).value;
+    if (!(cfg.enable_ner orelse false)) return null;
+    const raw_path = cfg.ner_model_path orelse {
+        std.debug.print("config: enable_ner=true but no ner_model_path set - NER disabled, deterministic scanners only\n", .{});
+        return null;
+    };
+    const expanded = expandPath(allocator, raw_path) catch return null;
+    defer allocator.free(expanded);
+    // pf_load needs a NUL-terminated C string.
+    const path_z = allocator.dupeZ(u8, expanded) catch return null;
+    defer allocator.free(path_z);
+    // Fast pre-check so a missing model logs a clear message instead of relying
+    // on pf_load's internal error path.
+    std.fs.cwd().access(path_z, .{}) catch {
+        std.debug.print("config: ner_model_path {s} not found - NER disabled, deterministic scanners only\n", .{path_z});
+        return null;
+    };
+    const n = ner_pf_mod.init(allocator, path_z) catch |err| {
+        std.debug.print("Warning: NER model load failed ({}) - deterministic scanners only\n", .{err});
+        return null;
+    };
+    std.debug.print("NER model loaded from {s} (model-backed PII redaction active)\n", .{path_z});
+    return n;
 }

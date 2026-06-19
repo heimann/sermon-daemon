@@ -35,10 +35,19 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const collector = @import("collector");
 const logs = @import("logs");
+const ner = @import("ner");
 
 const ProcessInfo = collector.ProcessInfo;
 const DiskInfo = collector.DiskInfo;
 const LogEntry = logs.LogEntry;
+
+/// Optional NER backend. The interface is pure (ner.zig links nothing); the
+/// concrete model-backed backend lives in ner_pf.zig and is constructed in
+/// main.zig. A null `Ner` means deterministic-scanners-only - the daemon
+/// degrades to that whenever NER is disabled or the model is absent, and never
+/// emits raw PII as a result.
+const Ner = ner.Ner;
+const Kind = ner.Kind;
 
 // ============================================================================
 // Placeholder tags
@@ -57,6 +66,16 @@ const Tag = enum {
     jwt,
     token,
     value, // generic key=value structural redaction
+    // NER-derived tags. These come ONLY from the model backend (ner.Kind),
+    // never from a byte scanner, so the deterministic recall guarantee is
+    // unaffected. They are merged into the same emit pass as the scanner tags.
+    person,
+    address,
+    phone,
+    url,
+    date,
+    account_number,
+    secret,
 
     fn text(self: Tag) []const u8 {
         return switch (self) {
@@ -72,9 +91,32 @@ const Tag = enum {
             .jwt => "<REDACTED:JWT>",
             .token => "<REDACTED:TOKEN>",
             .value => "<REDACTED:VALUE>",
+            .person => "<REDACTED:PERSON>",
+            .address => "<REDACTED:ADDRESS>",
+            .phone => "<REDACTED:PHONE>",
+            .url => "<REDACTED:URL>",
+            .date => "<REDACTED:DATE>",
+            .account_number => "<REDACTED:ACCOUNT>",
+            .secret => "<REDACTED:SECRET>",
         };
     }
 };
+
+/// Map a model entity Kind onto the placeholder Tag emitted in its place. This
+/// is the only crossing from the NER taxonomy to the redaction taxonomy.
+fn tagForKind(kind: Kind) Tag {
+    return switch (kind) {
+        .person => .person,
+        .address => .address,
+        .email => .email,
+        .phone => .phone,
+        .url => .url,
+        .date => .date,
+        .account_number => .account_number,
+        .secret => .secret,
+        .other => .value, // unknown class -> generic redaction (never raw)
+    };
+}
 
 // ============================================================================
 // Tiny character-class helpers (ASCII-only by design; PII patterns are ASCII).
@@ -506,17 +548,260 @@ pub fn redactText(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
 }
 
 // ============================================================================
+// Merged NER + deterministic redaction.
+//
+// The deterministic scanners (above) are the recall floor: measured 100% on
+// structured secrets, and the daemon must NEVER regress that. The optional NER
+// model adds free-form PII the scanners can't characterize (human names, street
+// addresses). To compose them in ONE pass we:
+//   1. collect every deterministic match as a span (origin = .deterministic),
+//   2. collect every NER span as a span (origin = .ner),
+//   3. merge into a sorted, non-overlapping list with a fixed tie-break:
+//        - on overlap, the DETERMINISTIC span wins (protects structured-secret
+//          recall: e.g. a loose NER address span that swallows the start of an
+//          AKIA key must not suppress the deterministic AWS_KEY redaction),
+//        - among same-origin overlaps, the LONGEST span wins, then earliest
+//          start, so coverage is maximal and deterministic.
+//   4. emit: copy unmatched bytes verbatim, replace each merged span with its
+//      tag placeholder.
+// A null ner reduces this to exactly the deterministic-only output, byte for
+// byte, so degradation is provably lossless.
+// ============================================================================
+
+const Origin = enum { deterministic, ner };
+
+/// A span tagged with where it came from, used only inside the merge. Carries
+/// the same [start,end) + Tag as the emitter needs, plus origin/score for the
+/// tie-break.
+const TaggedSpan = struct {
+    start: usize,
+    end: usize,
+    tag: Tag,
+    origin: Origin,
+    score: f32,
+};
+
+/// Walk `src` exactly like redactText does, but instead of emitting, append a
+/// TaggedSpan for each deterministic match (standalone scanner OR key=value
+/// value-portion). The spans are produced left-to-right and non-overlapping by
+/// construction (the walk advances past each match), matching redactText's
+/// emit order precisely.
+fn collectDeterministic(
+    allocator: Allocator,
+    src: []const u8,
+    list: *std.ArrayList(TaggedSpan),
+) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < src.len) {
+        // 1. key=value structural rule (same condition as redactText).
+        if ((src[i] == '=' or src[i] == ':') and i > 0) {
+            if (matchSensitiveKey(src, i)) |_| {
+                var j = i + 1;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
+                if (scanValueToken(src, j)) |vend| {
+                    // The placeholder replaces only the value token (after the
+                    // separator, spaces, and an optional opening quote), exactly
+                    // mirroring redactText. So the span starts past the quote.
+                    var v_start = j;
+                    if (j < src.len and (src[j] == '"' or src[j] == '\'')) v_start = j + 1;
+                    try list.append(allocator, .{
+                        .start = v_start,
+                        .end = vend,
+                        .tag = .value,
+                        .origin = .deterministic,
+                        .score = 1.0,
+                    });
+                    i = vend;
+                    continue;
+                }
+            }
+        }
+
+        // 2. standalone scanners.
+        if (scanFirst(src, i)) |m| {
+            try list.append(allocator, .{
+                .start = m.start,
+                .end = m.end,
+                .tag = m.tag,
+                .origin = .deterministic,
+                .score = 1.0,
+            });
+            i = m.end;
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Two half-open ranges overlap iff each starts before the other ends.
+inline fn overlaps(a_start: usize, a_end: usize, b_start: usize, b_end: usize) bool {
+    return a_start < b_end and b_start < a_end;
+}
+
+/// Order spans for the final emit / NER-NER tie-break: earliest start first;
+/// on equal start the LONGEST wins (maximal coverage), then by tag so the order
+/// is fully deterministic.
+fn lessThanSpan(_: void, a: TaggedSpan, b: TaggedSpan) bool {
+    if (a.start != b.start) return a.start < b.start;
+    const a_len = a.end - a.start;
+    const b_len = b.end - b.start;
+    if (a_len != b_len) return a_len > b_len; // longer first
+    return @intFromEnum(a.tag) < @intFromEnum(b.tag);
+}
+
+/// Append the sub-ranges of `cand` NOT already covered by a span in `accepted`,
+/// tagged as `cand`. This CLIPS a (possibly over-extended) NER span around the
+/// deterministic recall floor (and already-accepted NER spans) instead of
+/// dropping it whole. Dropping a colliding NER span leaks the PII it covers
+/// OUTSIDE the overlap - e.g. a real-model address span that over-extends to
+/// swallow the start of an AKIA key would, if dropped, leave the street address
+/// in cleartext while only the key got redacted. Clipping keeps both.
+fn clipAndAppend(
+    allocator: Allocator,
+    cand: TaggedSpan,
+    accepted: *std.ArrayList(TaggedSpan),
+) Allocator.Error!void {
+    // Snapshot the spans overlapping `cand`, sorted by start, so the appends
+    // below (which grow `accepted`) don't disturb this walk.
+    var blockers = std.ArrayList(TaggedSpan){};
+    defer blockers.deinit(allocator);
+    for (accepted.items) |a| {
+        if (overlaps(cand.start, cand.end, a.start, a.end)) try blockers.append(allocator, a);
+    }
+    std.mem.sort(TaggedSpan, blockers.items, {}, lessThanSpan);
+
+    var cursor = cand.start;
+    for (blockers.items) |b| {
+        if (b.start > cursor) {
+            const seg_end = @min(b.start, cand.end);
+            if (seg_end > cursor) try accepted.append(allocator, .{
+                .start = cursor,
+                .end = seg_end,
+                .tag = cand.tag,
+                .origin = cand.origin,
+                .score = cand.score,
+            });
+        }
+        if (b.end > cursor) cursor = b.end;
+        if (cursor >= cand.end) return;
+    }
+    if (cursor < cand.end) try accepted.append(allocator, .{
+        .start = cursor,
+        .end = cand.end,
+        .tag = cand.tag,
+        .origin = cand.origin,
+        .score = cand.score,
+    });
+}
+
+/// Redact `src` into a fresh owned buffer using the deterministic scanners AND,
+/// when `maybe_ner` is non-null, the NER model's spans, merged in one pass.
+/// `threshold` gates model spans by confidence. When `maybe_ner` is null this
+/// is byte-identical to redactText(src).
+///
+/// Merge rule (DETERMINISTIC-WINS, structural - not sort-order-dependent):
+///   1. Every deterministic span is kept. They are non-overlapping among
+///      themselves by construction (collectDeterministic walks left-to-right
+///      and advances past each match), and they are the 100%-recall floor the
+///      daemon must never regress. A loose NER span that overlaps a structured
+///      secret (e.g. an over-extended address span swallowing the start of an
+///      AKIA key) must NOT suppress that secret's redaction.
+///   2. Each NER span is CLIPPED around the deterministic spans (and
+///      already-accepted NER spans); its non-overlapping residual sub-ranges are
+///      kept (clipAndAppend). The deterministic span keeps its exact range + tag
+///      over the overlap; the rest of a loose NER span is STILL redacted - so an
+///      over-extended address span that bleeds into an AKIA key redacts BOTH the
+///      address part AND (deterministically) the key, with no leak. Among
+///      mutually-overlapping NER spans the longest is processed first.
+/// This makes "deterministic wins the overlap, NER fills the gaps" a structural
+/// property of the merge rather than a fragile consequence of sort order.
+pub fn redactTextMerged(
+    allocator: Allocator,
+    src: []const u8,
+    maybe_ner: ?Ner,
+    threshold: f32,
+) ner.Error![]u8 {
+    // Deterministic spans: the recall floor, kept unconditionally.
+    var det = std.ArrayList(TaggedSpan){};
+    defer det.deinit(allocator);
+    try collectDeterministic(allocator, src, &det);
+
+    // Final accepted span list starts as a copy of the deterministic spans.
+    var accepted = std.ArrayList(TaggedSpan){};
+    defer accepted.deinit(allocator);
+    try accepted.appendSlice(allocator, det.items);
+
+    if (maybe_ner) |n| {
+        // A model inference failure must NOT lose the deterministic spans:
+        // degrade to deterministic-only for this field rather than dropping it.
+        if (n.classifySpans(allocator, src, threshold)) |ner_spans| {
+            defer allocator.free(ner_spans);
+
+            // Sort NER spans longest-first-at-start so the longest of a set of
+            // mutually-overlapping NER spans is the one we get to accept.
+            var ner_list = std.ArrayList(TaggedSpan){};
+            defer ner_list.deinit(allocator);
+            for (ner_spans) |s| {
+                if (s.end <= s.start or s.end > src.len) continue;
+                try ner_list.append(allocator, .{
+                    .start = s.start,
+                    .end = s.end,
+                    .tag = tagForKind(s.kind),
+                    .origin = .ner,
+                    .score = s.score,
+                });
+            }
+            std.mem.sort(TaggedSpan, ner_list.items, {}, lessThanSpan);
+
+            // Clip each NER candidate around the already-accepted spans
+            // (deterministic floor + accepted NER) and keep the residual
+            // sub-ranges, rather than dropping a colliding span whole (which
+            // would leak the PII the span covers OUTSIDE the overlap).
+            for (ner_list.items) |cand| {
+                try clipAndAppend(allocator, cand, &accepted);
+            }
+        } else |_| {
+            // fall through with deterministic spans only.
+        }
+    }
+
+    // Emit in left-to-right order. accepted is now fully non-overlapping.
+    std.mem.sort(TaggedSpan, accepted.items, {}, lessThanSpan);
+
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    for (accepted.items) |s| {
+        if (s.start < cursor) continue; // defensive: never re-emit overlapped bytes
+        if (s.start > cursor) try out.appendSlice(allocator, src[cursor..s.start]);
+        try out.appendSlice(allocator, s.tag.text());
+        cursor = s.end;
+    }
+    if (cursor < src.len) try out.appendSlice(allocator, src[cursor..]);
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
 // Field-level helpers. Each frees the OLD owned slice and stores a fresh one.
 // On allocation failure the OLD slice is left intact and the error propagates;
 // the caller (main.zig) treats a redact error as fatal-for-cycle so raw PII is
 // never persisted/pushed.
 // ============================================================================
 
-/// Replace `*field` (an owned heap slice) with its redacted form. The new slice
-/// is built first; only on success is the old slice freed and the pointer
-/// swapped, so a failure leaves the field unchanged.
-fn replaceField(allocator: Allocator, field: *[]const u8) Allocator.Error!void {
-    const redacted = try redactText(allocator, field.*);
+/// Default model confidence threshold for free-text fields. Below this, NER
+/// spans are dropped. Conservative enough to keep precision but low enough to
+/// catch the names/addresses the deterministic scanners miss.
+const default_ner_threshold: f32 = 0.5;
+
+/// Replace `*field` (an owned heap slice) with its redacted form, running the
+/// deterministic scanners and (when `maybe_ner` is non-null) the NER model,
+/// merged in one pass. The new slice is built first; only on success is the old
+/// slice freed and the pointer swapped, so a failure leaves the field
+/// unchanged. A null `maybe_ner` is byte-identical to the deterministic-only
+/// path, so this is the single helper for every free-text field.
+fn replaceField(allocator: Allocator, field: *[]const u8, maybe_ner: ?Ner) ner.Error!void {
+    const redacted = try redactTextMerged(allocator, field.*, maybe_ner, default_ner_threshold);
     allocator.free(field.*);
     field.* = redacted;
 }
@@ -609,32 +894,34 @@ fn redactMountPoint(allocator: Allocator, field: *[]const u8) Allocator.Error!vo
 // Public entry points - operate on the in-memory slices in place.
 // ============================================================================
 
-/// Redact a single LogEntry: message (full scan, shape-preserving) and source
-/// (basename only). identifier / systemd_unit / unit / numerics are preserved.
-pub fn redactLog(allocator: Allocator, entry: *LogEntry) Allocator.Error!void {
-    try replaceField(allocator, &entry.message);
+/// Redact a single LogEntry: message (full scan + optional NER, shape-
+/// preserving) and source (basename only). identifier / systemd_unit / unit /
+/// numerics are preserved. `maybe_ner` null => deterministic-only (never raw).
+pub fn redactLog(allocator: Allocator, entry: *LogEntry, maybe_ner: ?Ner) ner.Error!void {
+    try replaceField(allocator, &entry.message, maybe_ner);
     try redactSource(allocator, &entry.source);
 }
 
 /// Redact a slice of LogEntry in place. Stops and returns the first error; the
 /// caller must treat that as fatal-for-cycle (don't persist/push raw PII).
-pub fn redactLogs(allocator: Allocator, entries: []LogEntry) Allocator.Error!void {
-    for (entries) |*e| try redactLog(allocator, e);
+pub fn redactLogs(allocator: Allocator, entries: []LogEntry, maybe_ner: ?Ner) ner.Error!void {
+    for (entries) |*e| try redactLog(allocator, e, maybe_ner);
 }
 
 /// Redact a single ProcessInfo: cgroup (path redaction, keep unit suffix) and
-/// cmdline (full PII/secret scrub). name / unit / username / numerics are
-/// preserved (see field policy) - the process NAME is the anomaly signal.
-/// cmdline is omitted from the remote push (push.zig) but is still written to
-/// local parquet staging, so we scrub it here too: on-disk history never holds
-/// a raw token/password even though it never leaves the box.
-pub fn redactProcess(allocator: Allocator, proc: *ProcessInfo) Allocator.Error!void {
+/// cmdline (full PII/secret scrub + optional NER). name / unit / username /
+/// numerics are preserved (see field policy) - the process NAME is the anomaly
+/// signal. cmdline is omitted from the remote push (push.zig) but is still
+/// written to local parquet staging, so we scrub it here too: on-disk history
+/// never holds a raw token/password even though it never leaves the box.
+/// `maybe_ner` null => deterministic-only.
+pub fn redactProcess(allocator: Allocator, proc: *ProcessInfo, maybe_ner: ?Ner) ner.Error!void {
     try redactCgroup(allocator, &proc.cgroup);
-    try replaceField(allocator, &proc.cmdline);
+    try replaceField(allocator, &proc.cmdline, maybe_ner);
 }
 
-pub fn redactProcesses(allocator: Allocator, procs: []ProcessInfo) Allocator.Error!void {
-    for (procs) |*p| try redactProcess(allocator, p);
+pub fn redactProcesses(allocator: Allocator, procs: []ProcessInfo, maybe_ner: ?Ner) ner.Error!void {
+    for (procs) |*p| try redactProcess(allocator, p, maybe_ner);
 }
 
 /// Redact a single DiskInfo: mount_point (component redaction, keep depth).
@@ -763,7 +1050,7 @@ test "redactProcess scrubs secrets from cmdline (local parquet path)" {
         .cgroup = try a.dupe(u8, ""),
         .unit = "postgresql.service",
     };
-    try redactProcess(a, &proc);
+    try redactProcess(a, &proc, null);
     defer a.free(proc.cmdline);
     defer a.free(proc.cgroup);
     // secrets scrubbed from the locally-persisted cmdline ...
@@ -816,7 +1103,7 @@ test "record count and structure invariant: in-place replace preserves slice" {
     };
     defer for (&entries) |*e| e.deinit(testing.allocator);
 
-    try redactLogs(testing.allocator, &entries);
+    try redactLogs(testing.allocator, &entries, null);
     try testing.expectEqual(@as(usize, 2), entries.len);
     try testing.expectEqualStrings("login from <REDACTED:IP>", entries[0].message);
     try testing.expectEqualStrings("auth.log", entries[0].source);
@@ -849,7 +1136,7 @@ test "process named xmrig is not redacted (name/username/numerics preserved)" {
         testing.allocator.free(proc.unit);
     }
 
-    try redactProcess(testing.allocator, &proc);
+    try redactProcess(testing.allocator, &proc, null);
 
     // name / username / unit / cmdline are operational signal: untouched.
     try testing.expectEqualStrings("xmrig", proc.name);
@@ -883,7 +1170,7 @@ test "redaction never touches numeric fields (process + disk invariant)" {
         testing.allocator.free(proc.unit);
     }
 
-    try redactProcess(testing.allocator, &proc);
+    try redactProcess(testing.allocator, &proc, null);
     try testing.expectEqual(@as(u32, 1337), proc.pid);
     try testing.expectEqual(@as(f32, 12.5), proc.cpu_percent);
     try testing.expectEqual(@as(u64, 98765), proc.mem_rss);
@@ -910,4 +1197,187 @@ test "redaction never touches numeric fields (process + disk invariant)" {
     try testing.expectEqualStrings("ext4", disk.filesystem);
     // mount_point got redacted (proving the call ran) but numerics are intact.
     try testing.expectEqualStrings("/home/<REDACTED:DIR>/data", disk.mount_point);
+}
+
+// ============================================================================
+// NER merge tests. These use a STUB backend implementing the same ner.Ner
+// vtable (no model, no .so), so they run in CI unconditionally and lock the
+// tie-break rules that protect deterministic-secret recall. The model-backed
+// end-to-end path is exercised separately in ner_pf.zig (gated on the model).
+// ============================================================================
+
+/// Test-only NER backend returning a fixed span set. Mirrors the production
+/// backend's contract: caller-owned []Span, offsets clamped to text bounds.
+const StubNer = struct {
+    spans: []const ner.Span,
+
+    fn classifySpans(
+        ctx: *anyopaque,
+        allocator: Allocator,
+        text: []const u8,
+        threshold: f32,
+    ) ner.Error![]ner.Span {
+        const self: *StubNer = @ptrCast(@alignCast(ctx));
+        var list = std.ArrayList(ner.Span){};
+        errdefer list.deinit(allocator);
+        for (self.spans) |s| {
+            if (s.score < threshold) continue;
+            const start = @min(s.start, text.len);
+            const end = @min(s.end, text.len);
+            if (end <= start) continue;
+            try list.append(allocator, .{ .start = start, .end = end, .kind = s.kind, .score = s.score });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable = Ner.VTable{ .classifySpans = classifySpans, .deinit = deinitFn };
+
+    fn asNer(self: *StubNer) Ner {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+/// A backend whose classifySpans always fails, to prove a model-inference error
+/// degrades to deterministic-only (does NOT drop the field).
+const FailingNer = struct {
+    fn classifySpans(_: *anyopaque, _: Allocator, _: []const u8, _: f32) ner.Error![]ner.Span {
+        return ner.Error.Inference;
+    }
+    fn deinitFn(_: *anyopaque) void {}
+    const vtable = Ner.VTable{ .classifySpans = classifySpans, .deinit = deinitFn };
+    var instance: u8 = 0;
+    fn asNer() Ner {
+        return .{ .ctx = @ptrCast(&instance), .vtable = &vtable };
+    }
+};
+
+fn expectMerged(src: []const u8, maybe_ner: ?Ner, want: []const u8) !void {
+    const got = try redactTextMerged(testing.allocator, src, maybe_ner, 0.5);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+test "merged: null ner is byte-identical to deterministic-only" {
+    // Every existing deterministic case must pass unchanged through the merged
+    // path when no model is present (the degradation guarantee).
+    try expectMerged("login from 10.0.0.1", null, "login from <REDACTED:IP>");
+    try expectMerged("password=hunter2 ok", null, "password=<REDACTED:VALUE> ok");
+    try expectMerged("plain text no pii", null, "plain text no pii");
+    try expectMerged("token=\"abc.def\" end", null, "token=\"<REDACTED:VALUE>\" end");
+}
+
+test "merged END-TO-END: NER (person+address) AND scanners (email+AKIA) compose" {
+    // The canonical regression: the model contributes person + address spans,
+    // the deterministic scanners contribute the email + AWS key, all in ONE
+    // merged pass. This runs in CI always (stub backend, no model).
+    const text = "Contact John Doe at jdoe@example.com, 742 Evergreen Terrace, key AKIAIOSFODNN7EXAMPLE";
+    var stub = StubNer{ .spans = &[_]ner.Span{
+        .{ .start = 8, .end = 16, .kind = .person, .score = 1.0 }, // "John Doe"
+        .{ .start = 38, .end = 59, .kind = .address, .score = 0.9 }, // "742 Evergreen Terrace"
+    } };
+    try expectMerged(
+        text,
+        stub.asNer(),
+        "Contact <REDACTED:PERSON> at <REDACTED:EMAIL>, <REDACTED:ADDRESS>, key <REDACTED:AWS_KEY>",
+    );
+}
+
+test "merged: deterministic EMAIL beats an overlapping NER span on the same range" {
+    // A model span covering the same bytes as the email must NOT replace the
+    // deterministic EMAIL tag - deterministic wins the overlap.
+    const text = "mail bob@corp.com end";
+    var stub = StubNer{ .spans = &[_]ner.Span{
+        .{ .start = 5, .end = 17, .kind = .person, .score = 0.99 }, // overlaps the email
+    } };
+    try expectMerged(text, stub.asNer(), "mail <REDACTED:EMAIL> end");
+}
+
+test "merged: a loose NER address overlapping a deterministic AWS_KEY redacts BOTH (no leak)" {
+    // Mirrors the real model behavior observed in the lib smoke test: the
+    // address span over-extends to swallow the START of the AKIA key. The merge
+    // must (1) keep the deterministic AWS_KEY redaction (recall floor), AND
+    // (2) still redact the address part - by CLIPPING the loose NER span around
+    // the key, not dropping it whole. Dropping it leaks "742 Evergreen Terrace".
+    const text = "742 Evergreen Terrace, key AKIAIOSFODNN7EXAMPLE";
+    // NER address [0,40) over-extends into the key (which starts at 27).
+    var stub = StubNer{ .spans = &[_]ner.Span{
+        .{ .start = 0, .end = 40, .kind = .address, .score = 0.7 },
+    } };
+    const got = try redactTextMerged(testing.allocator, text, stub.asNer(), 0.5);
+    defer testing.allocator.free(got);
+    // (1) the AKIA key is redacted deterministically ...
+    try testing.expect(std.mem.indexOf(u8, got, "AKIAIOSFODNN7EXAMPLE") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "<REDACTED:AWS_KEY>") != null);
+    // (2) ... and the address no longer leaks (the residual is still redacted).
+    try testing.expect(std.mem.indexOf(u8, got, "Evergreen") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "742") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "<REDACTED:ADDRESS>") != null);
+}
+
+test "merged: overlapping NER spans both redact - the residual is clipped, not dropped" {
+    // Two NER spans partially overlap. The longer is emitted; the shorter's
+    // NON-overlapping residual is STILL redacted (clip, don't drop). The model
+    // claimed those bytes are PII, so dropping the residual would leak them -
+    // the same bug class as the deterministic-overlap case.
+    const text = "aaaaaaaaaa"; // 10 bytes, no deterministic matches
+    var stub = StubNer{ .spans = &[_]ner.Span{
+        .{ .start = 0, .end = 8, .kind = .person, .score = 0.9 }, // person [0,8)
+        .{ .start = 4, .end = 10, .kind = .address, .score = 0.9 }, // overlaps, extends to 10
+    } };
+    // person [0,8) -> PERSON; the address residual [8,10) -> ADDRESS. Nothing leaks.
+    try expectMerged(text, stub.asNer(), "<REDACTED:PERSON><REDACTED:ADDRESS>");
+}
+
+test "merged: adjacent (touching, non-overlapping) NER spans both emit" {
+    const text = "aaaabbbb"; // 8 bytes
+    var stub = StubNer{ .spans = &[_]ner.Span{
+        .{ .start = 0, .end = 4, .kind = .person, .score = 0.9 },
+        .{ .start = 4, .end = 8, .kind = .address, .score = 0.9 }, // touches at 4
+    } };
+    try expectMerged(text, stub.asNer(), "<REDACTED:PERSON><REDACTED:ADDRESS>");
+}
+
+test "merged: pure-NER person span with no deterministic match emits PERSON" {
+    const text = "hello John Doe goodbye";
+    var stub = StubNer{ .spans = &[_]ner.Span{
+        .{ .start = 6, .end = 14, .kind = .person, .score = 0.95 },
+    } };
+    try expectMerged(text, stub.asNer(), "hello <REDACTED:PERSON> goodbye");
+}
+
+test "merged: failing NER backend degrades to deterministic-only (field not dropped)" {
+    // A model inference error must fall back to the deterministic spans for that
+    // field, NOT drop the whole field or return raw.
+    const text = "login from 10.0.0.1 password=hunter2";
+    try expectMerged(text, FailingNer.asNer(), "login from <REDACTED:IP> password=<REDACTED:VALUE>");
+}
+
+test "merged: redactProcess with a stub NER scrubs cmdline person + secret" {
+    const a = testing.allocator;
+    var stub = StubNer{ .spans = &[_]ner.Span{
+        .{ .start = 12, .end = 20, .kind = .person, .score = 0.95 }, // "John Doe"
+    } };
+    var proc = ProcessInfo{
+        .pid = 7,
+        .name = "svc",
+        .cmdline = try a.dupe(u8, "--operator John Doe --password=hunter2"),
+        .state = 'R',
+        .cpu_percent = 0.0,
+        .mem_rss = 0,
+        .threads = 1,
+        .username = "root",
+        .io_read_bytes = 0,
+        .io_write_bytes = 0,
+        .cgroup = try a.dupe(u8, ""),
+        .unit = "svc.service",
+    };
+    try redactProcess(a, &proc, stub.asNer());
+    defer a.free(proc.cmdline);
+    defer a.free(proc.cgroup);
+    try testing.expect(std.mem.indexOf(u8, proc.cmdline, "John Doe") == null);
+    try testing.expect(std.mem.indexOf(u8, proc.cmdline, "hunter2") == null);
+    try testing.expect(std.mem.indexOf(u8, proc.cmdline, "<REDACTED:PERSON>") != null);
+    try testing.expect(std.mem.indexOf(u8, proc.cmdline, "<REDACTED:VALUE>") != null);
 }
