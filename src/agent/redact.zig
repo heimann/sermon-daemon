@@ -1308,10 +1308,12 @@ test "merged END-TO-END: NER (person+address) AND scanners (email+AKIA) compose"
     // the deterministic scanners contribute the email + AWS key, all in ONE
     // merged pass. This runs in CI always (stub backend, no model).
     const text = "Contact John Doe at jdoe@example.com, 742 Evergreen Terrace, key AKIAIOSFODNN7EXAMPLE";
-    var stub = StubNer{ .spans = &[_]ner.Span{
-        .{ .start = 8, .end = 16, .kind = .person, .score = 1.0 }, // "John Doe"
-        .{ .start = 38, .end = 59, .kind = .address, .score = 0.9 }, // "742 Evergreen Terrace"
-    } };
+    var stub = StubNer{
+        .spans = &[_]ner.Span{
+            .{ .start = 8, .end = 16, .kind = .person, .score = 1.0 }, // "John Doe"
+            .{ .start = 38, .end = 59, .kind = .address, .score = 0.9 }, // "742 Evergreen Terrace"
+        },
+    };
     try expectMerged(
         text,
         stub.asNer(),
@@ -1323,9 +1325,11 @@ test "merged: deterministic EMAIL beats an overlapping NER span on the same rang
     // A model span covering the same bytes as the email must NOT replace the
     // deterministic EMAIL tag - deterministic wins the overlap.
     const text = "mail bob@corp.com end";
-    var stub = StubNer{ .spans = &[_]ner.Span{
-        .{ .start = 5, .end = 17, .kind = .person, .score = 0.99 }, // overlaps the email
-    } };
+    var stub = StubNer{
+        .spans = &[_]ner.Span{
+            .{ .start = 5, .end = 17, .kind = .person, .score = 0.99 }, // overlaps the email
+        },
+    };
     try expectMerged(text, stub.asNer(), "mail <REDACTED:EMAIL> end");
 }
 
@@ -1357,20 +1361,24 @@ test "merged: overlapping NER spans both redact - the residual is clipped, not d
     // claimed those bytes are PII, so dropping the residual would leak them -
     // the same bug class as the deterministic-overlap case.
     const text = "aaaaaaaaaa"; // 10 bytes, no deterministic matches
-    var stub = StubNer{ .spans = &[_]ner.Span{
-        .{ .start = 0, .end = 8, .kind = .person, .score = 0.9 }, // person [0,8)
-        .{ .start = 4, .end = 10, .kind = .address, .score = 0.9 }, // overlaps, extends to 10
-    } };
+    var stub = StubNer{
+        .spans = &[_]ner.Span{
+            .{ .start = 0, .end = 8, .kind = .person, .score = 0.9 }, // person [0,8)
+            .{ .start = 4, .end = 10, .kind = .address, .score = 0.9 }, // overlaps, extends to 10
+        },
+    };
     // person [0,8) -> PERSON; the address residual [8,10) -> ADDRESS. Nothing leaks.
     try expectMerged(text, stub.asNer(), "<REDACTED:PERSON><REDACTED:ADDRESS>");
 }
 
 test "merged: adjacent (touching, non-overlapping) NER spans both emit" {
     const text = "aaaabbbb"; // 8 bytes
-    var stub = StubNer{ .spans = &[_]ner.Span{
-        .{ .start = 0, .end = 4, .kind = .person, .score = 0.9 },
-        .{ .start = 4, .end = 8, .kind = .address, .score = 0.9 }, // touches at 4
-    } };
+    var stub = StubNer{
+        .spans = &[_]ner.Span{
+            .{ .start = 0, .end = 4, .kind = .person, .score = 0.9 },
+            .{ .start = 4, .end = 8, .kind = .address, .score = 0.9 }, // touches at 4
+        },
+    };
     try expectMerged(text, stub.asNer(), "<REDACTED:PERSON><REDACTED:ADDRESS>");
 }
 
@@ -1391,9 +1399,11 @@ test "merged: failing NER backend degrades to deterministic-only (field not drop
 
 test "merged: redactProcess with a stub NER scrubs cmdline person + secret" {
     const a = testing.allocator;
-    var stub = StubNer{ .spans = &[_]ner.Span{
-        .{ .start = 12, .end = 20, .kind = .person, .score = 0.95 }, // "John Doe"
-    } };
+    var stub = StubNer{
+        .spans = &[_]ner.Span{
+            .{ .start = 12, .end = 20, .kind = .person, .score = 0.95 }, // "John Doe"
+        },
+    };
     var proc = ProcessInfo{
         .pid = 7,
         .name = "svc",

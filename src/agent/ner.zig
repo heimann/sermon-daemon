@@ -134,10 +134,12 @@ const StubNer = struct {
 };
 
 test "stub backend implements the vtable and clamps offsets" {
-    var stub = StubNer{ .spans = &[_]Span{
-        .{ .start = 8, .end = 16, .kind = .person, .score = 1.0 },
-        .{ .start = 100, .end = 200, .kind = .address, .score = 0.9 }, // out of bounds -> clamped/dropped
-    } };
+    var stub = StubNer{
+        .spans = &[_]Span{
+            .{ .start = 8, .end = 16, .kind = .person, .score = 1.0 },
+            .{ .start = 100, .end = 200, .kind = .address, .score = 0.9 }, // out of bounds -> clamped/dropped
+        },
+    };
     const n = stub.ner();
     const text = "Contact John Doe";
     const spans = try n.classifySpans(testing.allocator, text, 0.5);
