@@ -74,6 +74,10 @@ pub const DeterministicRedact = struct {
 // ============================================================================
 
 pub const NerRedact = struct {
+    /// Allocator that created this heap struct (buildPipeline). Held so deinitFn
+    /// can destroy `self` - the Preprocessor.VTable.deinit signature has no
+    /// allocator param, so the wrapper must carry its own to avoid leaking.
+    allocator: Allocator,
     ner_backend: ner.Ner,
 
     fn runBatch(
@@ -99,6 +103,7 @@ pub const NerRedact = struct {
     fn deinitFn(ctx: *anyopaque) void {
         const self: *NerRedact = @ptrCast(@alignCast(ctx));
         self.ner_backend.deinit();
+        self.allocator.destroy(self);
     }
 
     const vtable = Preprocessor.VTable{
@@ -213,7 +218,7 @@ test "ner stage merges a PERSON the deterministic scanners miss" {
     const backend = ner.Ner{ .ctx = &stub, .vtable = &Stub.vt };
 
     const nr = try a.create(NerRedact);
-    nr.* = .{ .ner_backend = backend };
+    nr.* = .{ .allocator = a, .ner_backend = backend };
 
     var entry = LogEntry{
         .timestamp = 1,
@@ -230,9 +235,9 @@ test "ner stage merges a PERSON the deterministic scanners miss" {
     var stages = [_]Preprocessor{nr.asPreprocessor()};
     const pipe = Pipeline{ .stages = &stages };
     // stages is a stack array, so we don't call pipe.deinit (it would free a
-    // non-heap slice). Tear down the one stage and free the heap struct directly.
-    defer a.destroy(nr);
-    defer nr.asPreprocessor().deinit(); // stub backend deinit is a no-op
+    // non-heap slice). deinit tears down the stub backend (no-op) AND destroys
+    // the heap NerRedact via its own allocator - so NO separate a.destroy(nr).
+    defer nr.asPreprocessor().deinit();
 
     try pipe.runLog(a, &entry);
 
