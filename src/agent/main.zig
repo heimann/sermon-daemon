@@ -511,6 +511,18 @@ pub fn main() !void {
     const pipeline = try buildPipeline(allocator, cfg_value, ner_backend);
     defer pipeline.deinit(allocator);
 
+    // SECURITY NET: if the effective pipeline has no redactor stage (operator set
+    // preprocessors: [] or only unknown names) refuse to push remotely - raw PII
+    // would otherwise egress silently. Local storage is the operator's explicit
+    // choice and keeps working; only off-box forwarding is disabled. Loud, not
+    // silent. (The "ner"-unavailable path already degrades to deterministic, so
+    // this only trips on a genuinely empty/garbage chain.)
+    if (!pipelineHasRedactor(pipeline) and server_url != null and api_key != null) {
+        std.debug.print("SECURITY: effective preprocessor pipeline has NO redactor stage - REFUSING remote push so raw data never leaves the box. Add a \"redact\" or \"ner\" stage to re-enable forwarding. Running local-only.\n", .{});
+        server_url = null;
+        api_key = null;
+    }
+
     // First sample establishes baseline for CPU deltas, then sleep so first real data is meaningful
     _ = try coll.collectMetrics();
     {
@@ -527,11 +539,11 @@ pub fn main() !void {
     std.Thread.sleep(1 * std.time.ns_per_s);
 
     // Run retention once on startup to trim stale partitions before the loop
-    // begins. Non-fatal: best-effort, log once and continue. BUILD-gated: touches
-    // roll_mod. Retention runs whenever the build is store-capable (independent of
-    // the runtime local_store knob) so a build that previously wrote parquet still
-    // trims it even when forward-only writes are paused.
-    if (build_options.store_enabled) {
+    // begins. Non-fatal: best-effort, log once and continue. RUNTIME-gated on
+    // store_active: retention DELETES on-disk partitions, so local_store=false
+    // must leave existing parquet untouched (matches the documented "leaves
+    // previous parquet on disk" contract). store_active implies store_enabled.
+    if (store_active) {
         const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
         roll_mod.runRetention(allocator, root, retention) catch |err| {
             std.debug.print("Warning: startup retention failed: {}\n", .{err});
@@ -780,11 +792,12 @@ pub fn main() !void {
         // discipline (taken internally), so they're mutually exclusive with rolls
         // and query snapshots. Compaction runs AFTER retention so it never merges
         // a day retention is about to drop.
-        // BUILD-gated (touches roll_mod): retention/compaction maintain previously
-        // written parquet, so they run on any store-capable build regardless of the
-        // runtime local_store knob.
+        // RUNTIME-gated on store_active: retention DELETES partitions and
+        // compaction REWRITES parquet, so local_store=false must not mutate
+        // existing on-disk data (the documented "leaves previous parquet on disk"
+        // contract). store_active implies store_enabled, so roll_mod is live.
         retention_counter += interval;
-        if (build_options.store_enabled and retention_counter >= 3600) {
+        if (store_active and retention_counter >= 3600) {
             const retention = if (config) |c| c.value.retention orelse default_retention else default_retention;
             roll_mod.runRetention(allocator, root, retention) catch |err| {
                 std.debug.print("Warning: retention cleanup failed: {}\n", .{err});
@@ -944,9 +957,22 @@ fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
 /// must NOT separately deinit ner_backend (avoids the double-free risk).
 ///
 /// names == null (config field absent) => default ["redact"]. names == [] =>
-/// pure passthrough. Unknown names and an "ner" stage with no usable backend are
-/// warned-and-skipped: degrade to whatever stages remain, never crash, never
-/// emit raw PII.
+/// pure passthrough. An "ner" stage with no usable backend DEGRADES to a
+/// deterministic redact stage (never raw); a duplicate "ner" is ignored (one
+/// shared backend handle); unknown names are warned-and-skipped. Never crashes,
+/// never emits raw PII. A chain that still ends up with no redactor (e.g. [] or
+/// only unknown names) is caught by the caller's egress gate, which refuses push.
+/// True if any stage in the built pipeline actually redacts (a "redact" or "ner"
+/// stage). Used as the egress safety gate: a pipeline with no redactor must not
+/// forward off-box. Stage identity is the vtable `name` the adapters set.
+fn pipelineHasRedactor(pipeline: preprocessor_mod.Pipeline) bool {
+    for (pipeline.stages) |stage| {
+        if (std.mem.eql(u8, stage.vtable.name, "redact")) return true;
+        if (std.mem.eql(u8, stage.vtable.name, "ner")) return true;
+    }
+    return false;
+}
+
 fn buildPipeline(
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -964,11 +990,23 @@ fn buildPipeline(
             try stages.append(allocator, redact_adapter_mod.DeterministicRedact.asPreprocessor());
         } else if (std.mem.eql(u8, name, "ner")) {
             if (!build_options.ner_enabled or ner_backend == null) {
-                std.debug.print("config: preprocessor \"ner\" requested but unavailable (built without -Dner or model not loaded) - skipping, deterministic stages only\n", .{});
+                // DEGRADE, don't drop: an unavailable "ner" becomes a deterministic
+                // redact stage so a chain of only ["ner"] still scrubs (never raw).
+                // The byte-scanners are idempotent, so a redundant pass when the
+                // chain already lists "redact" is harmless.
+                std.debug.print("config: preprocessor \"ner\" unavailable (built without -Dner or model not loaded) - degrading to deterministic redaction\n", .{});
+                try stages.append(allocator, redact_adapter_mod.DeterministicRedact.asPreprocessor());
+                continue;
+            }
+            if (ner_consumed) {
+                // One backend handle, one stage: a second "ner" would alias the
+                // same pf_ctx into two NerRedact wrappers and double-free it at
+                // Pipeline.deinit. Ignore the duplicate.
+                std.debug.print("config: duplicate preprocessor \"ner\" ignored (single shared backend handle)\n", .{});
                 continue;
             }
             const nr = try allocator.create(redact_adapter_mod.NerRedact);
-            nr.* = .{ .ner_backend = ner_backend.? };
+            nr.* = .{ .allocator = allocator, .ner_backend = ner_backend.? };
             try stages.append(allocator, nr.asPreprocessor());
             ner_consumed = true;
         } else {
