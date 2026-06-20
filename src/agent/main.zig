@@ -525,6 +525,14 @@ pub fn main() !void {
             &[_]proxmox_mod.ContainerMetrics{};
         defer if (ct_metrics.len > 0) allocator.free(ct_metrics);
 
+        // Redact container inventory (name + node) before it reaches staging or
+        // push - same chokepoint discipline as procs/disks. ct_metrics is all
+        // numeric, nothing to scrub. Fatal-for-cycle on error (never push raw).
+        redact_mod.redactContainers(allocator, containers) catch |err| {
+            std.debug.print("Warning: container redaction failed: {}\n", .{err});
+            continue;
+        };
+
         var push_logs = std.ArrayList(logs_mod.LogEntry){};
         defer {
             for (push_logs.items) |*entry| {

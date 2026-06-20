@@ -36,10 +36,12 @@ const Allocator = std.mem.Allocator;
 const collector = @import("collector");
 const logs = @import("logs");
 const ner = @import("ner");
+const proxmox = @import("proxmox");
 
 const ProcessInfo = collector.ProcessInfo;
 const DiskInfo = collector.DiskInfo;
 const LogEntry = logs.LogEntry;
+const ContainerEntry = proxmox.ContainerEntry;
 
 /// Optional NER backend. The interface is pure (ner.zig links nothing); the
 /// concrete model-backed backend lives in ner_pf.zig and is constructed in
@@ -949,6 +951,26 @@ pub fn redactDisks(allocator: Allocator, disks: []DiskInfo) Allocator.Error!void
     for (disks) |*d| try redactDisk(allocator, d);
 }
 
+/// Redact a ContainerEntry: name and node run through the deterministic scanners
+/// (same treatment as cmdline), so an operator-assigned container name or node
+/// hostname carrying an embedded secret / IP / email is scrubbed before it
+/// egresses to local parquet OR the hosted backend. Plain identifiers ("web-prod",
+/// "pve1") match nothing and pass through as signal. type / status are fixed enums
+/// and vmid is numeric - preserved.
+/// LIMITATION: a free-form human name embedded in a container name (e.g.
+/// "alice-dev") is NOT caught by deterministic redaction - that needs the NER
+/// model (the documented follow-on). Same accepted limitation as the preserved
+/// ProcessInfo.username field. Deterministic redaction closes the *structured*-PII
+/// gap on these fields; the free-form-name gap is universal and known.
+pub fn redactContainer(allocator: Allocator, c: *ContainerEntry) ner.Error!void {
+    try replaceField(allocator, &c.name, null);
+    try replaceField(allocator, &c.node, null);
+}
+
+pub fn redactContainers(allocator: Allocator, cs: []ContainerEntry) ner.Error!void {
+    for (cs) |*c| try redactContainer(allocator, c);
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1110,6 +1132,29 @@ test "mount point redacts home user, keeps structure" {
     try redactMountPoint(testing.allocator, &plain);
     defer testing.allocator.free(plain);
     try testing.expectEqualStrings("/var/lib/docker", plain);
+}
+
+test "container name/node: plain identifiers preserved, embedded structured PII scrubbed" {
+    const a = testing.allocator;
+    var cs = [_]ContainerEntry{
+        // Plain operator identifiers - must pass through untouched (signal).
+        .{ .vmid = 101, .name = try a.dupe(u8, "web-prod"), .node = try a.dupe(u8, "pve1"), .type = try a.dupe(u8, "lxc"), .status = try a.dupe(u8, "running"), .maxmem = 0, .maxcpu = 0, .uptime = 0 },
+        // A name carrying an embedded secret/IP - the structured PII must be
+        // scrubbed even though the surrounding identifier is free-form.
+        .{ .vmid = 102, .name = try a.dupe(u8, "db-AKIAIOSFODNN7EXAMPLE"), .node = try a.dupe(u8, "10.0.0.5"), .type = try a.dupe(u8, "qemu"), .status = try a.dupe(u8, "running"), .maxmem = 0, .maxcpu = 0, .uptime = 0 },
+    };
+    defer for (&cs) |*c| c.deinit(a);
+
+    try redactContainers(a, &cs);
+
+    // Plain identifiers untouched.
+    try testing.expectEqualStrings("web-prod", cs[0].name);
+    try testing.expectEqualStrings("pve1", cs[0].node);
+    // Structured PII scrubbed; type/status preserved.
+    try testing.expect(std.mem.indexOf(u8, cs[1].name, "AKIAIOSFODNN7EXAMPLE") == null);
+    try testing.expect(std.mem.indexOf(u8, cs[1].name, "<REDACTED:AWS_KEY>") != null);
+    try testing.expect(std.mem.indexOf(u8, cs[1].node, "10.0.0.5") == null);
+    try testing.expectEqualStrings("qemu", cs[1].type);
 }
 
 test "record count and structure invariant: in-place replace preserves slice" {
