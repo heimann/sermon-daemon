@@ -127,6 +127,7 @@ pub fn build(b: *std.Build) void {
     redact_mod.addImport("collector", collector_mod);
     redact_mod.addImport("logs", logs_mod);
     redact_mod.addImport("ner", ner_mod);
+    redact_mod.addImport("proxmox", proxmox_mod);
 
     // ── sermon-agent (daemon) ──
     const agent_mod = b.createModule(.{
