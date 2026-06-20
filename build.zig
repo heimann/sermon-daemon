@@ -109,6 +109,25 @@ pub fn build(b: *std.Build) void {
     parquet_query_mod.addLibraryPath(b.path("lib"));
     parquet_query_mod.linkSystemLibrary("duckdb", .{});
 
+    // ── Edge PII redaction ──
+    // ner.zig is the PURE backend-agnostic interface (Span/Kind types + vtable):
+    // no C, no link. redact.zig holds the deterministic byte-scanners and field
+    // policy; it imports ner only for those types and is always called with a
+    // null backend in this build (deterministic-only). No FFI, no model.
+    const ner_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/ner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const redact_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/redact.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    redact_mod.addImport("collector", collector_mod);
+    redact_mod.addImport("logs", logs_mod);
+    redact_mod.addImport("ner", ner_mod);
+
     // ── sermon-agent (daemon) ──
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/main.zig"),
@@ -125,6 +144,7 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("storage", storage_mod);
     agent_mod.addImport("staging", staging_mod);
     agent_mod.addImport("roll", roll_mod);
+    agent_mod.addImport("redact", redact_mod);
     agent_mod.addIncludePath(b.path("lib"));
     agent_mod.addLibraryPath(b.path("lib"));
     agent_mod.linkSystemLibrary("duckdb", .{});
@@ -260,7 +280,14 @@ pub fn build(b: *std.Build) void {
     const parquet_query_tests = b.addTest(.{ .root_module = parquet_query_mod });
     parquet_query_tests.addRPath(b.path("lib"));
 
+    // Edge redaction: pure-Zig, links nothing. ner_mod is the interface (its own
+    // small test); redact_mod carries the scanner + field-policy + merge tests.
+    const ner_tests = b.addTest(.{ .root_module = ner_mod });
+    const redact_tests = b.addTest(.{ .root_module = redact_mod });
+
     const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&b.addRunArtifact(ner_tests).step);
+    test_step.dependOn(&b.addRunArtifact(redact_tests).step);
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);
     test_step.dependOn(&b.addRunArtifact(collector_tests).step);
     test_step.dependOn(&b.addRunArtifact(logs_tests).step);

@@ -12,6 +12,10 @@ const storage_mod = @import("storage");
 // only for its back-compat constants (default_memory_limit_mb) - see below.
 const staging_mod = @import("staging");
 const roll_mod = @import("roll");
+// Edge PII redaction: deterministic byte-scanners run once per cycle at a single
+// chokepoint (after collect, before staging-append AND push) so local parquet
+// and remote upload see identical redacted bytes. Pure Zig, no model, no FFI.
+const redact_mod = @import("redact");
 
 const default_db_path = "~/.local/share/sermon/metrics.db";
 const default_config_path = "~/.config/sermon/config.json";
@@ -476,6 +480,22 @@ pub fn main() !void {
             allocator.free(disks);
         }
 
+        // ── EDGE PII REDACTION (process + disk fields) ──
+        // Scrub PII in the in-memory ProcessInfo / DiskInfo slices IN PLACE, here,
+        // AFTER collection and BEFORE both the staging append (local parquet) and
+        // buildPayload (remote upload), so both paths see identical redacted bytes.
+        // Deterministic byte-scanners only (no model). Fatal-for-cycle: we must
+        // never persist or push raw PII, so a redaction failure skips this cycle
+        // rather than fall through with unredacted data. (null = no NER backend.)
+        redact_mod.redactProcesses(allocator, procs, null) catch |err| {
+            std.debug.print("Warning: process redaction failed: {}\n", .{err});
+            continue;
+        };
+        redact_mod.redactDisks(allocator, disks) catch |err| {
+            std.debug.print("Warning: disk redaction failed: {}\n", .{err});
+            continue;
+        };
+
         // Container inventory: only on Proxmox hosts. Failures are non-fatal
         // and intentionally not warning-logged per cycle (would spam the
         // journal on a wedged Corosync ring); empty slice means "skip
@@ -580,7 +600,16 @@ pub fn main() !void {
                 while (log_count < 1000) : (log_count += 1) {
                     const maybe_entry = lt.next() catch break;
                     if (maybe_entry == null) break;
-                    const entry = maybe_entry.?;
+                    var entry = maybe_entry.?;
+                    // Redact this log line in place BEFORE it reaches the staging
+                    // append or the push buffer. On a (rare) redaction error we
+                    // DROP the entry rather than persist/push raw PII - one lost
+                    // log line is acceptable; a leaked secret is not.
+                    redact_mod.redactLog(allocator, &entry, null) catch |err| {
+                        std.debug.print("Warning: log redaction failed, dropping entry: {}\n", .{err});
+                        entry.deinit(allocator);
+                        continue;
+                    };
                     if (!staging_failed) {
                         // appendLogs takes a slice; pass this single entry.
                         stg.appendLogs(&[_]logs_mod.LogEntry{entry}) catch |err| {
