@@ -70,6 +70,16 @@ const Config = struct {
     // its last roll, so low-volume tables don't sit un-rolled. See
     // default_roll_interval_s.
     roll_interval_s: ?u64 = null,
+    // PII redaction scope. The remote push is ALWAYS redacted (raw PII never
+    // leaves the box). This knob only controls the LOCAL parquet store:
+    //   false (default): the local store keeps RAW data at full fidelity, so
+    //     on-box `sermon query` / diagnosis sees real IPs, cmdlines, names. The
+    //     raw is already on the box anyway (journald, /proc), so this is the
+    //     sensible default.
+    //   true: redact before the local store too, so on-disk parquet never holds
+    //     a raw secret/IP - for disk-theft / compliance threat models. Costs the
+    //     local-diagnosis fidelity above.
+    redact_local_store: ?bool = null,
 };
 
 fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) ?std.json.Parsed(Config) {
@@ -213,6 +223,12 @@ pub fn main() !void {
         c.value.roll_interval_s orelse default_roll_interval_s
     else
         default_roll_interval_s;
+    // Redaction scope. Default false: local store keeps raw, only the push is
+    // scrubbed (see Config.redact_local_store). The push is always redacted.
+    const redact_local_store: bool = if (config) |c|
+        c.value.redact_local_store orelse false
+    else
+        false;
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -480,22 +496,6 @@ pub fn main() !void {
             allocator.free(disks);
         }
 
-        // ── EDGE PII REDACTION (process + disk fields) ──
-        // Scrub PII in the in-memory ProcessInfo / DiskInfo slices IN PLACE, here,
-        // AFTER collection and BEFORE both the staging append (local parquet) and
-        // buildPayload (remote upload), so both paths see identical redacted bytes.
-        // Deterministic byte-scanners only (no model). Fatal-for-cycle: we must
-        // never persist or push raw PII, so a redaction failure skips this cycle
-        // rather than fall through with unredacted data. (null = no NER backend.)
-        redact_mod.redactProcesses(allocator, procs, null) catch |err| {
-            std.debug.print("Warning: process redaction failed: {}\n", .{err});
-            continue;
-        };
-        redact_mod.redactDisks(allocator, disks) catch |err| {
-            std.debug.print("Warning: disk redaction failed: {}\n", .{err});
-            continue;
-        };
-
         // Container inventory: only on Proxmox hosts. Failures are non-fatal
         // and intentionally not warning-logged per cycle (would spam the
         // journal on a wedged Corosync ring); empty slice means "skip
@@ -525,13 +525,29 @@ pub fn main() !void {
             &[_]proxmox_mod.ContainerMetrics{};
         defer if (ct_metrics.len > 0) allocator.free(ct_metrics);
 
-        // Redact container inventory (name + node) before it reaches staging or
-        // push - same chokepoint discipline as procs/disks. ct_metrics is all
-        // numeric, nothing to scrub. Fatal-for-cycle on error (never push raw).
-        redact_mod.redactContainers(allocator, containers) catch |err| {
-            std.debug.print("Warning: container redaction failed: {}\n", .{err});
-            continue;
-        };
+        // ── EDGE PII REDACTION (store side) ──
+        // When redact_local_store is set, scrub procs/disks/containers IN PLACE
+        // BEFORE the staging append, so the local parquet also holds no raw PII.
+        // Default (false) leaves the local store raw and redacts only on the push
+        // path below (after the append). Either way the remote push is redacted.
+        // Fatal-for-cycle here: if we mean to keep the store clean and can't, skip
+        // the whole cycle rather than persist raw. (null = no NER backend.)
+        if (redact_local_store) {
+            var store_redact_failed = false;
+            redact_mod.redactProcesses(allocator, procs, null) catch |err| {
+                std.debug.print("Warning: process redaction failed: {}\n", .{err});
+                store_redact_failed = true;
+            };
+            if (!store_redact_failed) redact_mod.redactDisks(allocator, disks) catch |err| {
+                std.debug.print("Warning: disk redaction failed: {}\n", .{err});
+                store_redact_failed = true;
+            };
+            if (!store_redact_failed) redact_mod.redactContainers(allocator, containers) catch |err| {
+                std.debug.print("Warning: container redaction failed: {}\n", .{err});
+                store_redact_failed = true;
+            };
+            if (store_redact_failed) continue;
+        }
 
         var push_logs = std.ArrayList(logs_mod.LogEntry){};
         defer {
@@ -609,15 +625,18 @@ pub fn main() !void {
                     const maybe_entry = lt.next() catch break;
                     if (maybe_entry == null) break;
                     var entry = maybe_entry.?;
-                    // Redact this log line in place BEFORE it reaches the staging
-                    // append or the push buffer. On a (rare) redaction error we
-                    // DROP the entry rather than persist/push raw PII - one lost
-                    // log line is acceptable; a leaked secret is not.
-                    redact_mod.redactLog(allocator, &entry, null) catch |err| {
-                        std.debug.print("Warning: log redaction failed, dropping entry: {}\n", .{err});
-                        entry.deinit(allocator);
-                        continue;
-                    };
+                    // STORE-side log redaction: only when redact_local_store, scrub
+                    // each line BEFORE the staging append so the local store holds
+                    // no raw PII. Default keeps the store raw and redacts push_logs
+                    // below (before push). On a (rare) redaction error here we DROP
+                    // the entry rather than persist raw - one lost line is OK.
+                    if (redact_local_store) {
+                        redact_mod.redactLog(allocator, &entry, null) catch |err| {
+                            std.debug.print("Warning: log redaction failed, dropping entry: {}\n", .{err});
+                            entry.deinit(allocator);
+                            continue;
+                        };
+                    }
                     if (!staging_failed) {
                         // appendLogs takes a slice; pass this single entry.
                         stg.appendLogs(&[_]logs_mod.LogEntry{entry}) catch |err| {
@@ -712,29 +731,56 @@ pub fn main() !void {
 
         if (server_url) |url| {
             if (api_key) |key| {
-                const maybe_payload = push_mod.buildPayload(
-                    allocator,
-                    hostname,
-                    now,
-                    metrics,
-                    procs,
-                    disks,
-                    push_logs.items,
-                    rule_set,
-                    self_sample,
-                    // No resident DuckDB after the cutover: there are no
-                    // consecutive insert failures to report, and "db size" is now
-                    // the on-disk hot tier rather than a single DB file. Report 0
-                    // for both (push.zig signature is unchanged by request); a
-                    // hot-tier size metric is a follow-up slice.
-                    0,
-                    0,
-                    runtime,
-                    containers,
-                    ct_metrics,
-                ) catch |err| blk: {
-                    std.debug.print("Warning: payload build failed: {}\n", .{err});
-                    break :blk null;
+                const maybe_payload = pblk: {
+                    // ── EDGE PII REDACTION (push side) ──
+                    // The push must NEVER carry raw PII. When the local store was
+                    // NOT pre-redacted (the default), scrub procs/disks/containers
+                    // /logs IN PLACE now - after they were stored raw - so only the
+                    // bytes leaving the box are redacted. On a (rare) failure, yield
+                    // null to SKIP the push this cycle: the data is safe in the
+                    // local store and the push retries next cycle; we never send raw.
+                    if (!redact_local_store) {
+                        redact_mod.redactProcesses(allocator, procs, null) catch {
+                            std.debug.print("Warning: push redaction (processes) failed - skipping push this cycle\n", .{});
+                            break :pblk null;
+                        };
+                        redact_mod.redactDisks(allocator, disks) catch {
+                            std.debug.print("Warning: push redaction (disks) failed - skipping push this cycle\n", .{});
+                            break :pblk null;
+                        };
+                        redact_mod.redactContainers(allocator, containers) catch {
+                            std.debug.print("Warning: push redaction (containers) failed - skipping push this cycle\n", .{});
+                            break :pblk null;
+                        };
+                        redact_mod.redactLogs(allocator, push_logs.items, null) catch {
+                            std.debug.print("Warning: push redaction (logs) failed - skipping push this cycle\n", .{});
+                            break :pblk null;
+                        };
+                    }
+                    break :pblk push_mod.buildPayload(
+                        allocator,
+                        hostname,
+                        now,
+                        metrics,
+                        procs,
+                        disks,
+                        push_logs.items,
+                        rule_set,
+                        self_sample,
+                        // No resident DuckDB after the cutover: there are no
+                        // consecutive insert failures to report, and "db size" is now
+                        // the on-disk hot tier rather than a single DB file. Report 0
+                        // for both (push.zig signature is unchanged by request); a
+                        // hot-tier size metric is a follow-up slice.
+                        0,
+                        0,
+                        runtime,
+                        containers,
+                        ct_metrics,
+                    ) catch |err| {
+                        std.debug.print("Warning: payload build failed: {}\n", .{err});
+                        break :pblk null;
+                    };
                 };
 
                 if (maybe_payload) |payload| {
