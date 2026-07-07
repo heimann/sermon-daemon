@@ -435,12 +435,16 @@ const sensitive_keys = [_][]const u8{
     "username", "user",   "login",  "holder",
 };
 
-// Benign env-style keys, matched case-SENSITIVELY before the sensitive-key
-// scan. All-uppercase PWD= and USER= are sudo/env conventions for the working
-// directory and the target user (e.g. sudo's "PWD=/root ; USER=root" audit
-// trail), not credentials; redacting them blinds auth-failure diagnostics.
-// The lowercase forms pwd=/user= remain sensitive, and structured PII in the
-// value (e.g. USER=alice@corp.com) is still caught by the value scanners.
+// Benign env-style keys, matched case-SENSITIVELY as WHOLE bare tokens with a
+// value-shape guard (see matchSensitiveKey / benignEnvValue). All-uppercase
+// PWD= and USER= are sudo/env conventions for the working directory and the
+// target user (e.g. sudo's "PWD=/root ; USER=root" audit trail), not
+// credentials; redacting them blinds auth-failure diagnostics. The allowlist is
+// deliberately far narrower than the sensitive match: composed keys (MYSQL_PWD,
+// DB_USER), quoted keys ({"USER":"bob"}), the ODBC "PWD" password keyword
+// (PWD=<non-path>), and secret-shaped USER values all fall through and are
+// redacted. The lowercase forms pwd=/user= remain sensitive, and structured PII
+// in the value (e.g. USER=alice@corp.com) is still caught by the value scanners.
 const benign_env_keys = [_][]const u8{ "PWD", "USER" };
 
 /// If a sensitive key name precedes the separator at `sep` (a '=' or ':'),
@@ -450,16 +454,37 @@ const benign_env_keys = [_][]const u8{ "PWD", "USER" };
 /// word boundary so "newuser" does not match "user".
 fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
     // Walk back over spaces/tabs, then an optional single closing quote, to find
-    // where the key token actually ends.
+    // where the key token actually ends. Remember whether a quote was consumed:
+    // a quoted key ({"USER":"bob"}) is JSON payload, not a bare env token, and
+    // must NOT be allowlisted.
     var key_end = sep;
     while (key_end > 0 and (s[key_end - 1] == ' ' or s[key_end - 1] == '\t')) key_end -= 1;
-    if (key_end > 0 and (s[key_end - 1] == '"' or s[key_end - 1] == '\'')) key_end -= 1;
-    for (benign_env_keys) |key| {
-        if (key.len > key_end) continue;
-        if (!std.mem.eql(u8, s[key_end - key.len .. key_end], key)) continue;
-        const before = key_end - key.len;
-        if (before > 0 and isAlnum(s[before - 1])) continue; // boundary
-        return null; // exact uppercase env-style key: structure, not a secret
+    var key_quoted = false;
+    if (key_end > 0 and (s[key_end - 1] == '"' or s[key_end - 1] == '\'')) {
+        key_end -= 1;
+        key_quoted = true;
+    }
+    // Benign uppercase env keys (bare PWD=/USER=) are sudo/audit-trail structure,
+    // not credentials. This allowlist MUST be strictly narrower than the
+    // sensitive match below, or it leaks secrets that merely share the suffix
+    // (MYSQL_PWD, DB_USER), reuse the keyword (ODBC "PWD=secret"), or hide behind
+    // a quote ({"USER":"bob"}). Three guards keep it narrow:
+    //   1. whole-token left boundary: reject when the preceding byte is alnum OR
+    //      '_' (asymmetric with the sensitive boundary, which allows '_'),
+    //   2. no quoted key,
+    //   3. a value-shape check (benignEnvValue) -- the same token has a secret
+    //      meaning depending on the value.
+    // When the token matches but any guard fails we do NOT allowlist: we fall
+    // through to the case-insensitive sensitive scan, which redacts the value.
+    if (!key_quoted) {
+        for (benign_env_keys) |key| {
+            if (key.len > key_end) continue;
+            if (!std.mem.eql(u8, s[key_end - key.len .. key_end], key)) continue;
+            const before = key_end - key.len;
+            if (before > 0 and (isAlnum(s[before - 1]) or s[before - 1] == '_')) continue;
+            if (benignEnvValue(s, sep, key)) return null; // benign: preserve
+            break; // token matched but value looks secret: fall through
+        }
     }
     for (sensitive_keys) |key| {
         if (key.len > key_end) continue;
@@ -470,6 +495,59 @@ fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
         return key.len;
     }
     return null;
+}
+
+/// Value-shape guard for the benign env-key allowlist. `key` is "PWD" or "USER".
+/// Returns true only when the value looks benign, so the allowlist stays far
+/// narrower than the sensitive match. Locates the value token (past the
+/// separator, spaces, and one optional opening quote) exactly like the emitters.
+fn benignEnvValue(s: []const u8, sep: usize, key: []const u8) bool {
+    var j = sep + 1;
+    while (j < s.len and (s[j] == ' ' or s[j] == '\t')) : (j += 1) {}
+    var quoted = false;
+    if (j < s.len and (s[j] == '"' or s[j] == '\'')) {
+        quoted = true;
+        j += 1;
+    }
+    const v_start = j;
+    while (j < s.len) : (j += 1) {
+        const c = s[j];
+        if (quoted) {
+            if (c == '"' or c == '\'') break;
+        } else if (c == ' ' or c == '\t' or c == ',' or c == ';' or c == '\n' or c == '\r') break;
+    }
+    const value = s[v_start..j];
+    if (value.len == 0) return false;
+
+    if (std.mem.eql(u8, key, "PWD")) {
+        // sudo's PWD is always an absolute path; ODBC's "PWD" keyword is the
+        // password. Allowlist only the path shape -> ODBC "PWD=S3cretPass" falls
+        // through to <REDACTED:VALUE>.
+        return value[0] == '/';
+    }
+    // USER: preserve when the value is a plausible unix username, OR when a
+    // standalone scanner will redact it anyway. Deferring to the scanners keeps
+    // USER=alice@corp.com -> EMAIL and USER=ghp_... -> TOKEN intact. Everything
+    // else (opaque uppercase/mixed token, symbols) falls through to VALUE.
+    // Residual: a purely-lowercase-alnum opaque token in a bare USER= passes the
+    // username shape and, if no scanner matches it, is preserved -- narrow, USER
+    // rarely holds secrets, and it is not a regression the corpus covers.
+    if (isUnixUsername(value)) return true;
+    if (scanFirst(s, v_start) != null) return true;
+    return false;
+}
+
+/// Conservative unix-username shape: first char [a-z_], remaining [a-z0-9_-],
+/// total length <= 32. "root", "postgres", "www-data" pass; "S3cretPass"
+/// (uppercase), symbols, and long/mixed tokens do not.
+fn isUnixUsername(v: []const u8) bool {
+    if (v.len == 0 or v.len > 32) return false;
+    const c0 = v[0];
+    if (!((c0 >= 'a' and c0 <= 'z') or c0 == '_')) return false;
+    for (v[1..]) |c| {
+        if (!((c >= 'a' and c <= 'z') or isDigit(c) or c == '_' or c == '-')) return false;
+    }
+    return true;
 }
 
 fn eqIgnoreCaseSlice(a: []const u8, b: []const u8) bool {
@@ -1098,6 +1176,38 @@ test "uppercase PWD=/USER= are benign env keys (sudo audit trail stays readable)
     // The allowlist is an exact-token match: composed keys keep matching on
     // their sensitive suffix.
     try expectRedact("MYSQL_PASSWORD=x", "MYSQL_PASSWORD=<REDACTED:VALUE>");
+}
+
+test "benign env allowlist does not leak secrets (adversarial review, PR #36)" {
+    // Adversarial review found the PWD/USER allowlist leaked passwords. Each
+    // line below MUST redact the secret; the fix is a whole-token boundary plus
+    // a value-shape guard.
+
+    // 1. Composed keys share the sensitive suffix but the '_' boundary let the
+    //    old allowlist swallow them. Whole-token boundary rejects '_'.
+    try expectRedact("MYSQL_PWD=hunter2", "MYSQL_PWD=<REDACTED:VALUE>");
+    try expectRedact("SERVICE_PWD=letmein", "SERVICE_PWD=<REDACTED:VALUE>");
+    try expectRedact("DB_USER=alice", "DB_USER=<REDACTED:VALUE>");
+    // USERNAME is a different (fully sensitive) key, not the USER token.
+    try expectRedact("USERNAME=bob", "USERNAME=<REDACTED:VALUE>");
+
+    // 2. "PWD" is also the ODBC connection-string password keyword. sudo's PWD
+    //    is always an absolute path, so allowlist only path-shaped values.
+    try expectRedact("PWD=S3cretPass", "PWD=<REDACTED:VALUE>");
+    try expectRedact(
+        "Driver={ODBC};UID=sa;PWD=S3cret",
+        "Driver={ODBC};UID=sa;PWD=<REDACTED:VALUE>",
+    );
+
+    // 3. A quoted key is JSON payload, not a bare env token: {"USER":"bob"} must
+    //    still redact (the old code walked back over the closing quote first).
+    try expectRedact("{\"USER\":\"bob\"}", "{\"USER\":\"<REDACTED:VALUE>\"}");
+
+    // 4. Standalone value scanners stay intact for benign-key values (the value
+    //    shape is not a username, but a scanner still redacts it).
+    try expectRedact("USER=ghp_0123456789ABCDEFxyz", "USER=<REDACTED:TOKEN>");
+    // Case-sensitivity: uppercase-only is benign; any other case is sensitive.
+    try expectRedact("Pwd=secret", "Pwd=<REDACTED:VALUE>");
 }
 
 test "no match returns owned copy" {
