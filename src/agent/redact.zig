@@ -435,6 +435,14 @@ const sensitive_keys = [_][]const u8{
     "username", "user",   "login",  "holder",
 };
 
+// Benign env-style keys, matched case-SENSITIVELY before the sensitive-key
+// scan. All-uppercase PWD= and USER= are sudo/env conventions for the working
+// directory and the target user (e.g. sudo's "PWD=/root ; USER=root" audit
+// trail), not credentials; redacting them blinds auth-failure diagnostics.
+// The lowercase forms pwd=/user= remain sensitive, and structured PII in the
+// value (e.g. USER=alice@corp.com) is still caught by the value scanners.
+const benign_env_keys = [_][]const u8{ "PWD", "USER" };
+
 /// If a sensitive key name precedes the separator at `sep` (a '=' or ':'),
 /// return the matched key length, else null. The key may be separated from the
 /// separator by whitespace and/or a closing quote, so `password = x`,
@@ -446,6 +454,13 @@ fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
     var key_end = sep;
     while (key_end > 0 and (s[key_end - 1] == ' ' or s[key_end - 1] == '\t')) key_end -= 1;
     if (key_end > 0 and (s[key_end - 1] == '"' or s[key_end - 1] == '\'')) key_end -= 1;
+    for (benign_env_keys) |key| {
+        if (key.len > key_end) continue;
+        if (!std.mem.eql(u8, s[key_end - key.len .. key_end], key)) continue;
+        const before = key_end - key.len;
+        if (before > 0 and isAlnum(s[before - 1])) continue; // boundary
+        return null; // exact uppercase env-style key: structure, not a secret
+    }
     for (sensitive_keys) |key| {
         if (key.len > key_end) continue;
         const slice = s[key_end - key.len .. key_end];
@@ -1066,6 +1081,23 @@ test "key=value tolerates spaces and quotes before the separator" {
     try expectRedact("password = hunter2 ok", "password = <REDACTED:VALUE> ok");
     // Boundary still holds: a longer word ending in a key name does not match.
     try expectRedact("mypassword = keep", "mypassword = keep");
+}
+
+test "uppercase PWD=/USER= are benign env keys (sudo audit trail stays readable)" {
+    // Verbatim sudo failure line (contabo evidence): PWD is a working
+    // directory and USER is the target user, not credentials.
+    try expectRedact(
+        "    dmeh : a password is required ; TTY=pts/0 ; PWD=/home/dmeh ; USER=root ; COMMAND=/usr/bin/apt update",
+        "    dmeh : a password is required ; TTY=pts/0 ; PWD=/home/dmeh ; USER=root ; COMMAND=/usr/bin/apt update",
+    );
+    // Structured PII in the value is still caught by the value scanners.
+    try expectRedact("USER=alice@corp.com", "USER=<REDACTED:EMAIL>");
+    // The lowercase forms remain sensitive keys.
+    try expectRedact("pwd=hunter2", "pwd=<REDACTED:VALUE>");
+    try expectRedact("user=bob", "user=<REDACTED:VALUE>");
+    // The allowlist is an exact-token match: composed keys keep matching on
+    // their sensitive suffix.
+    try expectRedact("MYSQL_PASSWORD=x", "MYSQL_PASSWORD=<REDACTED:VALUE>");
 }
 
 test "no match returns owned copy" {
