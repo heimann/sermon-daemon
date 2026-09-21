@@ -8,7 +8,7 @@ const proxmox_mod = @import("proxmox");
 
 const Allocator = std.mem.Allocator;
 
-const max_logs_per_payload = 20;
+const max_logs_per_payload = 100;
 const max_log_message_bytes = 4_096;
 
 /// Log entries at or below this syslog priority (err/crit/alert/emerg) are
@@ -129,6 +129,7 @@ const LogPayload = struct {
     priority: u8,
     pid: ?u32,
     message: []const u8,
+    trace_id: ?[]const u8,
 };
 
 pub fn buildPayload(
@@ -307,8 +308,8 @@ fn selectLogsForUpload(
 /// Whether an entry may be uploaded. Errors (priority <= always_push_priority)
 /// always pass; everything else is decided by the rule set, which may keep,
 /// drop, or sample (keep every Nth match).
-fn pushEligible(entry: logs_mod.LogEntry, rule_set: rules_mod.RuleSet) bool {
-    if (entry.priority <= always_push_priority) return true;
+pub fn pushEligible(entry: logs_mod.LogEntry, rule_set: rules_mod.RuleSet) bool {
+    if (entry.priority <= always_push_priority or entry.trace_id != null) return true;
     return rule_set.eligible(entry);
 }
 
@@ -322,10 +323,11 @@ fn logPayload(src: logs_mod.LogEntry) LogPayload {
         .priority = src.priority,
         .pid = src.pid,
         .message = truncateUtf8(src.message, max_log_message_bytes),
+        .trace_id = src.trace_id,
     };
 }
 
-fn truncateUtf8(value: []const u8, max_bytes: usize) []const u8 {
+pub fn truncateUtf8(value: []const u8, max_bytes: usize) []const u8 {
     if (value.len <= max_bytes) return value;
 
     var end = max_bytes;
@@ -369,6 +371,7 @@ pub fn pushMetrics(
         .location = .{ .url = ingest_url },
         .method = .POST,
         .payload = payload,
+        .redirect_behavior = .not_allowed,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "x-sermon-ingestion-key", .value = api_key },
@@ -562,15 +565,15 @@ test "buildPayload includes capped truncated logs" {
     const root = parsed.value.object;
     const log_values = root.get("logs").?.array;
 
-    try std.testing.expectEqual(@as(usize, 20), log_values.items.len);
+    try std.testing.expectEqual(@as(usize, 100), log_values.items.len);
     try std.testing.expectEqual(@as(i64, 1_739_443_100), log_values.items[0].object.get("timestamp").?.integer);
     try std.testing.expectEqualStrings("sshd", log_values.items[0].object.get("unit").?.string);
     try std.testing.expectEqualStrings("sshd", log_values.items[0].object.get("identifier").?.string);
     try std.testing.expectEqualStrings("ssh.service", log_values.items[0].object.get("systemd_unit").?.string);
     try std.testing.expectEqual(@as(usize, 4_096), log_values.items[0].object.get("message").?.string.len);
     try std.testing.expectEqual(@as(i64, 101), root.get("log_stats").?.object.get("seen").?.integer);
-    try std.testing.expectEqual(@as(i64, 20), root.get("log_stats").?.object.get("uploaded").?.integer);
-    try std.testing.expectEqual(@as(i64, 81), root.get("log_stats").?.object.get("dropped").?.integer);
+    try std.testing.expectEqual(@as(i64, 100), root.get("log_stats").?.object.get("uploaded").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), root.get("log_stats").?.object.get("dropped").?.integer);
 }
 
 test "buildPayload emits proxmox_host runtime block + containers array" {
@@ -789,4 +792,21 @@ test "IngestResponse treats a missing log_rules key as empty (old web)" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), parsed.value.log_rules.len);
+}
+
+test "protected eligibility survives drop and sample pressure beyond a batch" {
+    var rules = [_]rules_mod.LogRule{.{ .match = &.{.{ .field = .identifier, .op = .eq, .value = "nginx" }}, .action = .drop }};
+    var counts = [_]u64{0};
+    const set = rules_mod.RuleSet{ .rules = &rules, .sample_counts = &counts };
+    for (0..201) |i| {
+        var e = testLog(@intCast(i), if (i % 2 == 0) 3 else 6, "exception");
+        if (i % 2 == 1) e.trace_id = "1234567890abcdef1234567890abcdef";
+        try std.testing.expect(pushEligible(e, set));
+        rules[0].action = .sample;
+        rules[0].keep_one_in = 1000;
+        try std.testing.expect(pushEligible(e, set));
+        rules[0].action = .drop;
+    }
+    try std.testing.expect(!pushEligible(testLog(202, 4, "ordinary warning"), set));
+    try std.testing.expectEqual(@as(u64, 0), counts[0]);
 }

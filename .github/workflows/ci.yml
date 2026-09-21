@@ -36,3 +36,9 @@ jobs:
 
       - name: Resource benchmark
         run: LD_LIBRARY_PATH=lib zig build bench
+
+      - name: Local retained-log protocol fixture
+        run: |
+          zig build -Dversion=0.0.2
+          LD_LIBRARY_PATH=lib python3 scripts/test-host-log-protocol.py
+          LD_LIBRARY_PATH=lib python3 scripts/test-https-transport.py

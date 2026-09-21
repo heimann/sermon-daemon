@@ -271,6 +271,7 @@ pub fn runRetention(allocator: Allocator, root: []const u8, retention_seconds: i
                 std.log.warn("retention: failed to remove stale partition {s}: {}", .{ part_path, err });
                 continue;
             };
+            if (table == .logs) std.log.warn("log retention eviction: removed {s}; historical collection coverage unknown", .{entry.name});
         }
     }
 }
@@ -1275,7 +1276,7 @@ fn createTable(conn: c.duckdb_connection, table: Table) !void {
         \\CREATE TABLE logs (
         \\  timestamp TIMESTAMP NOT NULL, source VARCHAR, unit VARCHAR,
         \\  identifier VARCHAR, systemd_unit VARCHAR, priority INTEGER,
-        \\  message TEXT, pid INTEGER
+        \\  message TEXT, pid INTEGER, trace_id VARCHAR
         \\)
         ,
         .container_metrics =>
@@ -1445,6 +1446,9 @@ fn appendLogRow(appender: c.duckdb_appender, e: logs.LogEntry) !void {
     _ = c.duckdb_append_varchar_length(appender, e.message.ptr, e.message.len);
     if (e.pid) |pid| {
         _ = c.duckdb_append_uint32(appender, pid);
+    } else _ = c.duckdb_append_null(appender);
+    if (e.trace_id) |trace| {
+        _ = c.duckdb_append_varchar_length(appender, trace.ptr, trace.len);
     } else _ = c.duckdb_append_null(appender);
     try endRow(appender);
 }

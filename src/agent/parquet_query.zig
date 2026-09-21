@@ -77,6 +77,7 @@ const roll = @import("roll");
 const collector = @import("collector");
 const logs = @import("logs");
 const proxmox = @import("proxmox");
+const protocol = @import("host_log_protocol");
 
 const Table = staging.Table;
 
@@ -121,10 +122,61 @@ pub const ParquetQuery = struct {
     allocator: Allocator,
     db: c.duckdb_database,
     conn: c.duckdb_connection,
+    snapshot_lock: ?fs.File = null,
 
     pub fn deinit(self: *ParquetQuery) void {
         c.duckdb_disconnect(&self.conn);
         c.duckdb_close(&self.db);
+        if (self.snapshot_lock) |f| f.close();
+    }
+
+    /// The only remote accessor. Every remotely supplied value is bound data.
+    /// Fetch one extra row to distinguish exact-cap results from truncation.
+    pub fn retainedLogs(self: *ParquetQuery, f: protocol.Filters) ![]logs.LogEntry {
+        try f.validate();
+        const sql = "SELECT * FROM logs WHERE timestamp >= $1 AND timestamp < $2 " ++
+            "AND ($3 IS NULL OR unit = $3) AND ($4 IS NULL OR identifier = $4) " ++
+            "AND ($5 IS NULL OR systemd_unit = $5) " ++
+            "AND ($6 IS NULL OR unit = $6 OR identifier = $6 OR systemd_unit = $6) " ++
+            "AND ($7 IS NULL OR priority <= $7) AND ($8 IS NULL OR trace_id = $8) " ++
+            "ORDER BY timestamp DESC, source, unit, identifier, systemd_unit, priority, message, trace_id LIMIT $9";
+        var stmt: c.duckdb_prepared_statement = undefined;
+        if (c.duckdb_prepare(self.conn, sql, &stmt) == c.DuckDBError) return error.QueryError;
+        defer c.duckdb_destroy_prepare(&stmt);
+        if (c.duckdb_bind_timestamp(stmt, 1, .{ .micros = try protocol.timestamp(f.since) }) == c.DuckDBError) return error.QueryError;
+        if (c.duckdb_bind_timestamp(stmt, 2, .{ .micros = try protocol.timestamp(f.until) }) == c.DuckDBError) return error.QueryError;
+        for ([_]?[]const u8{ f.unit, f.identifier, f.systemd_unit, f.service }, 3..) |s, idx| {
+            const state = if (s) |v| c.duckdb_bind_varchar_length(stmt, idx, v.ptr, v.len) else c.duckdb_bind_null(stmt, idx);
+            if (state == c.DuckDBError) return error.QueryError;
+        }
+        if ((if (f.max_priority) |p| c.duckdb_bind_uint8(stmt, 7, p) else c.duckdb_bind_null(stmt, 7)) == c.DuckDBError) return error.QueryError;
+        if ((if (f.trace_id) |t| c.duckdb_bind_varchar_length(stmt, 8, t.ptr, t.len) else c.duckdb_bind_null(stmt, 8)) == c.DuckDBError) return error.QueryError;
+        if (c.duckdb_bind_uint16(stmt, 9, f.max_rows + 1) == c.DuckDBError) return error.QueryError;
+        var result: c.duckdb_result = undefined;
+        const state = c.duckdb_execute_prepared(stmt, &result);
+        defer c.duckdb_destroy_result(&result);
+        if (state == c.DuckDBError) return error.QueryError;
+        const out = try self.allocator.alloc(logs.LogEntry, c.duckdb_row_count(&result));
+        errdefer self.allocator.free(out);
+        var filled: usize = 0;
+        errdefer for (out[0..filled]) |*row| row.deinit(self.allocator);
+        for (out, 0..) |*row, i| {
+            row.* = try readLogRow(self.allocator, &result, i);
+            filled += 1;
+        }
+        return out;
+    }
+
+    pub fn logBounds(self: *ParquetQuery) ![2]?i64 {
+        var r: c.duckdb_result = undefined;
+        const state = c.duckdb_query(self.conn, "SELECT min(timestamp), max(timestamp) FROM logs", &r);
+        defer c.duckdb_destroy_result(&r);
+        if (state == c.DuckDBError) return error.QueryError;
+        var bounds: [2]?i64 = .{ null, null };
+        for (&bounds, 0..) |*v, i| {
+            if (!c.duckdb_value_is_null(&r, i, 0)) v.* = @divTrunc(c.duckdb_value_timestamp(&r, i, 0).micros, 1000000);
+        }
+        return bounds;
     }
 
     pub fn rawQuery(self: *ParquetQuery, sql: []const u8) !QueryResult {
@@ -328,8 +380,22 @@ pub const ParquetQuery = struct {
 /// FRESHNESS CONTRACT: this snapshots staging once, here. See ParquetQuery's
 /// doc-comment - the returned handle is single-query / open-and-exit.
 pub fn initParquetQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuery {
+    return initQuery(allocator, root_dir, false);
+}
+
+pub fn initRetainedLogQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuery {
+    return initQuery(allocator, root_dir, true);
+}
+
+fn initQuery(allocator: Allocator, root_dir: []const u8, logs_only: bool) !ParquetQuery {
     var db: c.duckdb_database = undefined;
-    if (c.duckdb_open(":memory:", &db) == c.DuckDBError) return QueryError.DatabaseError;
+    var config: c.duckdb_config = undefined;
+    if (c.duckdb_create_config(&config) == c.DuckDBError) return QueryError.DatabaseError;
+    defer c.duckdb_destroy_config(&config);
+    if (logs_only and (c.duckdb_set_config(config, "memory_limit", "128MiB") == c.DuckDBError or
+        c.duckdb_set_config(config, "threads", "1") == c.DuckDBError or
+        c.duckdb_set_config(config, "max_temp_directory_size", "0B") == c.DuckDBError)) return QueryError.DatabaseError;
+    if (c.duckdb_open_ext(":memory:", &db, config, null) == c.DuckDBError) return QueryError.DatabaseError;
     errdefer c.duckdb_close(&db);
 
     var conn: c.duckdb_connection = undefined;
@@ -346,11 +412,12 @@ pub fn initParquetQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuer
     // level comment. The enumerate-before-snapshot ordering below stays as defense
     // in depth.
     var lock_file = try staging.openRollLock(root_dir, allocator);
-    defer lock_file.close();
+    errdefer lock_file.close();
     try std.posix.flock(lock_file.handle, std.posix.LOCK.SH);
-    defer std.posix.flock(lock_file.handle, std.posix.LOCK.UN) catch {};
+    pq.snapshot_lock = lock_file;
 
     for (Table.all) |table| {
+        if (logs_only and table != .logs) continue;
         // ORDER MATTERS: MATERIALIZE the parquet file-set first (a frozen,
         // explicit list of file paths), THEN snapshot staging - both under the
         // SH lock. Freezing the list (rather than a lazy glob the view re-
@@ -368,6 +435,10 @@ pub fn initParquetQuery(allocator: Allocator, root_dir: []const u8) !ParquetQuer
         try createView(allocator, &pq, table, files.items);
     }
 
+    if (!logs_only) {
+        lock_file.close();
+        pq.snapshot_lock = null;
+    }
     return pq;
 }
 
@@ -452,7 +523,7 @@ fn columnList(table: Table) []const u8 {
         .processes => "timestamp, pid, name, cmdline, state, cpu_percent, mem_rss, threads, username, io_read_bytes, io_write_bytes, cgroup, unit",
         .disks => "timestamp, mount_point, filesystem, total_bytes, used_bytes, percent",
         .containers => "timestamp, vmid, name, node, type, status, maxmem, maxcpu, uptime",
-        .logs => "timestamp, source, unit, identifier, systemd_unit, priority, message, pid",
+        .logs => "timestamp, source, unit, identifier, systemd_unit, priority, message, pid, trace_id",
         .container_metrics => "timestamp, vmid, cpu_pct, mem_current, mem_max",
     };
 }
@@ -465,7 +536,7 @@ fn stagingTempDdl(allocator: Allocator, table: Table) ![:0]u8 {
         .processes => "timestamp TIMESTAMP, pid INTEGER, name VARCHAR, cmdline VARCHAR, state CHAR(1), cpu_percent REAL, mem_rss BIGINT, threads INTEGER, username VARCHAR, io_read_bytes BIGINT, io_write_bytes BIGINT, cgroup VARCHAR, unit VARCHAR",
         .disks => "timestamp TIMESTAMP, mount_point VARCHAR, filesystem VARCHAR, total_bytes BIGINT, used_bytes BIGINT, percent REAL",
         .containers => "timestamp TIMESTAMP, vmid INTEGER, name VARCHAR, node VARCHAR, type VARCHAR, status VARCHAR, maxmem BIGINT, maxcpu DOUBLE, uptime BIGINT",
-        .logs => "timestamp TIMESTAMP, source VARCHAR, unit VARCHAR, identifier VARCHAR, systemd_unit VARCHAR, priority INTEGER, message TEXT, pid INTEGER",
+        .logs => "timestamp TIMESTAMP, source VARCHAR, unit VARCHAR, identifier VARCHAR, systemd_unit VARCHAR, priority INTEGER, message TEXT, pid INTEGER, trace_id VARCHAR",
         .container_metrics => "timestamp TIMESTAMP, vmid INTEGER, cpu_pct DOUBLE, mem_current BIGINT, mem_max BIGINT",
     };
     return std.fmt.allocPrintSentinel(allocator, "CREATE TEMP TABLE {s}_staging ({s})", .{ table.name(), cols }, 0);
@@ -504,6 +575,7 @@ fn createView(allocator: Allocator, pq: *ParquetQuery, table: Table, files: []co
     const sql = if (files.len > 0) blk: {
         const file_list = try buildFileListLiteral(allocator, files);
         defer allocator.free(file_list);
+        if (table == .logs) break :blk try std.fmt.allocPrintSentinel(allocator, "CREATE VIEW logs AS SELECT {s} FROM (SELECT * FROM read_parquet([{s}], hive_partitioning=false, union_by_name=true) UNION ALL BY NAME SELECT * FROM logs_staging WHERE false) UNION ALL SELECT {s} FROM logs_staging", .{ cols, file_list, cols }, 0);
         break :blk try std.fmt.allocPrintSentinel(
             allocator,
             "CREATE VIEW {s} AS SELECT {s} FROM read_parquet([{s}], hive_partitioning=false, union_by_name=true) UNION ALL SELECT {s} FROM {s}_staging",
@@ -655,6 +727,7 @@ fn readLogRow(a: Allocator, result: *c.duckdb_result, i: usize) !logs.LogEntry {
         .priority = priority,
         .message = message,
         .pid = pid,
+        .trace_id = if (c.duckdb_column_count(result) < 9 or c.duckdb_value_is_null(result, 8, i)) null else try dupeVarchar(a, c.duckdb_value_varchar(result, 8, i)),
     };
 }
 
@@ -1087,4 +1160,61 @@ fn makeDirsForTest(path: []const u8) !void {
         error.PathAlreadyExists => {},
         else => return e,
     };
+}
+
+test "retained typed query spans parquet and staging with exact AND OR and priority bounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(a, &tmp);
+    var stg = try staging.Staging.open(a, root);
+    defer stg.deinit();
+    var entry = logs.LogEntry{ .timestamp = 100, .source = "systemd", .unit = "api' OR 1=1 --", .identifier = "api", .systemd_unit = "api.service", .priority = 2, .message = "first", .pid = null, .trace_id = "1234567890abcdef1234567890abcdef" };
+    try stg.appendLogs(&.{entry});
+    try stg.sync();
+    const rolled = (try roll.rollTable(a, root, &stg, .logs)).?;
+    {
+        // Rewrite as the old eight-column Parquet schema, then query it mixed
+        // with new trace-aware staging. Missing trace must become SQL NULL.
+        var legacy = try initParquetQuery(a, root);
+        defer legacy.deinit();
+        const copy = try std.fmt.allocPrint(a, "COPY (SELECT timestamp, source, unit, identifier, systemd_unit, priority, message, pid FROM logs) TO '{s}/logs/legacy.parquet' (FORMAT PARQUET)", .{root});
+        var copied = try legacy.rawQuery(copy);
+        copied.deinit();
+    }
+    try fs.deleteFileAbsolute(rolled.parquet_path);
+    entry.timestamp = 101;
+    entry.priority = 3;
+    entry.message = "second";
+    try stg.appendLogs(&.{entry});
+    entry.timestamp = 102; // Exclusive upper bound must omit this row.
+    entry.priority = 0;
+    try stg.appendLogs(&.{entry});
+    entry.timestamp = 101;
+    entry.priority = 4; // Threshold must omit this row, despite same service.
+    try stg.appendLogs(&.{entry});
+    try stg.sync();
+    var query = try initRetainedLogQuery(a, root);
+    defer query.deinit();
+    var f = protocol.Filters{ .since = "1970-01-01T00:01:40Z", .until = "1970-01-01T00:01:42Z", .service = "api.service", .unit = "api' OR 1=1 --", .max_priority = 3 };
+    const rows = try query.retainedLogs(f);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("second", rows[0].message);
+    try testing.expectEqualStrings("first", rows[1].message);
+    try testing.expectEqualStrings(entry.trace_id.?, rows[0].trace_id.?);
+    try testing.expect(rows[1].trace_id == null);
+    try testing.expectEqual([2]?i64{ 100, 102 }, try query.logBounds());
+    f.identifier = "other";
+    try testing.expectEqual(@as(usize, 0), (try query.retainedLogs(f)).len);
+    f.identifier = null;
+    f.trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try testing.expectEqual(@as(usize, 0), (try query.retainedLogs(f)).len);
+    f.trace_id = null;
+    f.max_priority = 0;
+    try testing.expectEqual(@as(usize, 0), (try query.retainedLogs(f)).len);
+    f.max_priority = null;
+    f.max_rows = 1;
+    try testing.expectEqual(@as(usize, 2), (try query.retainedLogs(f)).len); // cap + lookahead
 }

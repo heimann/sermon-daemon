@@ -400,7 +400,10 @@ pub const Staging = struct {
         self.scratch.clearRetainingCapacity();
         const a = self.allocator;
         const buf = &self.scratch;
-        try putU32(buf, a, @intCast(entries.len));
+        // High count bit marks trace-aware frames. Old v1 frames remain readable
+        // in the same segment; counts this large never fit the bounded segment.
+        if (entries.len >= 0x80000000) return StagingError.CorruptSegment;
+        try putU32(buf, a, @as(u32, @intCast(entries.len)) | 0x80000000);
         for (entries) |entry| try encodeLog(buf, a, entry);
         try self.writeRecord(.logs, buf.items);
     }
@@ -512,6 +515,7 @@ fn encodeLog(buf: *std.ArrayList(u8), a: Allocator, e: LogEntry) !void {
     try buf.append(a, e.priority);
     try putStr(buf, a, e.message);
     try putOptU32(buf, a, e.pid);
+    try putOptStr(buf, a, e.trace_id);
 }
 
 // ============================================================================
@@ -611,7 +615,7 @@ fn decodeContainerMetric(cur: *Cursor) !ContainerMetrics {
     };
 }
 
-fn decodeLog(cur: *Cursor, a: Allocator) !LogEntry {
+fn decodeLog(cur: *Cursor, a: Allocator, trace_aware: bool) !LogEntry {
     const timestamp = try cur.i64_();
     const source = try cur.str(a);
     errdefer a.free(source);
@@ -634,6 +638,7 @@ fn decodeLog(cur: *Cursor, a: Allocator) !LogEntry {
         .priority = priority,
         .message = message,
         .pid = pid,
+        .trace_id = if (trace_aware) try cur.optStr(a) else null,
     };
 }
 
@@ -864,14 +869,15 @@ fn decodeCycle(allocator: Allocator, table: Table, payload: []const u8) !Decoded
             return .{ .containers = .{ .timestamp = ts, .rows = rows } };
         },
         .logs => {
-            const n = try cur.u32_();
+            const count = try cur.u32_();
+            const n = count & 0x7fffffff;
             try checkRowCount(&cur, table, n);
             const rows = try allocator.alloc(LogEntry, n);
             errdefer allocator.free(rows);
             var filled: usize = 0;
             errdefer for (rows[0..filled]) |*e| e.deinit(allocator);
             for (rows) |*row| {
-                row.* = try decodeLog(&cur, allocator);
+                row.* = try decodeLog(&cur, allocator, count & 0x80000000 != 0);
                 filled += 1;
             }
             return .{ .logs = rows };
