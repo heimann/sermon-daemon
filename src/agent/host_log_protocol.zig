@@ -40,7 +40,9 @@ pub const Claim = struct {
         return timestamp(self.expires_at);
     }
 };
-pub const ClaimResponse = struct { protocol_version: u8, request: ?Claim, poll_after_seconds: u8 };
+pub const min_poll_seconds = 5;
+pub const max_poll_seconds = 300;
+pub const ClaimResponse = struct { protocol_version: u8, request: ?Claim, poll_after_seconds: u16 };
 pub const Row = struct {
     timestamp: []const u8,
     source: []const u8,
@@ -130,7 +132,9 @@ pub fn parseClaim(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Clai
     try strictTypes(v.value);
     const p = try std.json.parseFromSlice(ClaimResponse, a, bytes, .{ .allocate = .alloc_always });
     errdefer p.deinit();
-    if (p.value.protocol_version != version or p.value.poll_after_seconds != 10) return error.InvalidClaim;
+    // Hosted may tune the idle interval; bound it so a bad value can neither
+    // busy-poll the shared ingestion allowance nor silence the channel.
+    if (p.value.protocol_version != version or p.value.poll_after_seconds < min_poll_seconds or p.value.poll_after_seconds > max_poll_seconds) return error.InvalidClaim;
     if (p.value.request) |r| _ = try r.deadline();
     return p;
 }
@@ -165,6 +169,11 @@ test "closed JSON rejects coercion and unknown fields" {
     const a = std.testing.allocator;
     const ok = try parseClaim(a, "{\"protocol_version\":1,\"request\":null,\"poll_after_seconds\":10}");
     defer ok.deinit();
+    const tuned = try parseClaim(a, "{\"protocol_version\":1,\"request\":null,\"poll_after_seconds\":300}");
+    defer tuned.deinit();
+    try std.testing.expectEqual(@as(u16, 300), tuned.value.poll_after_seconds);
+    try std.testing.expectError(error.InvalidClaim, parseClaim(a, "{\"protocol_version\":1,\"request\":null,\"poll_after_seconds\":4}"));
+    try std.testing.expectError(error.InvalidClaim, parseClaim(a, "{\"protocol_version\":1,\"request\":null,\"poll_after_seconds\":301}"));
     try std.testing.expectError(error.InvalidClaim, parseClaim(a, "{\"protocol_version\":\"1\",\"request\":null,\"poll_after_seconds\":10}"));
     try std.testing.expectError(error.UnknownField, parseClaim(a, "{\"protocol_version\":1,\"request\":null,\"poll_after_seconds\":10,\"sql\":\"SELECT 1\"}"));
 }
