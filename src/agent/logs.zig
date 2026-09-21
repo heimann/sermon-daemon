@@ -25,8 +25,10 @@ pub const LogEntry = struct {
     priority: u8, // syslog priority 0-7 (0=emerg, 7=debug)
     message: []const u8, // log message content
     pid: ?u32, // process ID if available
+    trace_id: ?[]const u8 = null,
 
     pub fn deinit(self: *LogEntry, allocator: Allocator) void {
+        if (self.trace_id) |trace| allocator.free(trace);
         allocator.free(self.source);
         if (self.unit) |unit| {
             allocator.free(unit);
@@ -270,6 +272,7 @@ const JournalTailer = struct {
             try self.allocator.dupe(u8, msg)
         else
             try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(message);
 
         // Extract PID
         const pid: ?u32 = if (jsonStr(obj.get("_PID"))) |pid_str|
@@ -278,6 +281,7 @@ const JournalTailer = struct {
             null;
 
         const source = try self.allocator.dupe(u8, "systemd");
+        errdefer self.allocator.free(source);
 
         return LogEntry{
             .timestamp = timestamp,
@@ -288,9 +292,24 @@ const JournalTailer = struct {
             .priority = priority,
             .message = message,
             .pid = pid,
+            .trace_id = try normalizeTrace(self.allocator, jsonStr(obj.get("TRACE_ID")) orelse jsonStr(obj.get("trace_id"))),
         };
     }
 };
+
+/// Only explicit structured fields qualify; message text is never a trace ID.
+pub fn normalizeTrace(a: Allocator, value: ?[]const u8) !?[]const u8 {
+    const s = value orelse return null;
+    if (s.len != 32) return null;
+    var buf: [32]u8 = undefined;
+    var nonzero = false;
+    for (s, 0..) |ch, i| {
+        if (!std.ascii.isHex(ch)) return null;
+        buf[i] = std.ascii.toLower(ch);
+        nonzero = nonzero or ch != '0';
+    }
+    return if (nonzero) try a.dupe(u8, &buf) else null;
+}
 
 /// File tailer with rotation detection
 const FileTailer = struct {
@@ -490,4 +509,14 @@ test "FileTailer reads appended lines" {
     try std.testing.expectEqualStrings(test_path, entry.source);
     try std.testing.expectEqual(@as(u8, 6), entry.priority);
     try std.testing.expect(entry.unit == null);
+}
+
+test "structured trace IDs normalize, absent invalid and zero IDs stay null" {
+    const a = std.testing.allocator;
+    const trace = (try normalizeTrace(a, "ABCDEF0123456789ABCDEF0123456789")).?;
+    defer a.free(trace);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", trace);
+    try std.testing.expect((try normalizeTrace(a, null)) == null);
+    try std.testing.expect((try normalizeTrace(a, "00000000000000000000000000000000")) == null);
+    try std.testing.expect((try normalizeTrace(a, "trace_id=abcdef0123456789abcdef0123456789")) == null);
 }

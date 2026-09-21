@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
+    const options_mod = options.createModule();
 
     // ── Shared modules for cross-imports ──
     const collector_mod = b.createModule(.{
@@ -50,7 +51,7 @@ pub fn build(b: *std.Build) void {
     push_mod.addImport("rules", rules_mod);
     push_mod.addImport("proc_self", proc_self_mod);
     push_mod.addImport("proxmox", proxmox_mod);
-    push_mod.addOptions("build_options", options);
+    push_mod.addImport("build_options", options_mod);
 
     // Parquet hot tier modules (staging + roll) are declared early so both the
     // daemon and the test step can import them. The on-demand query module is
@@ -129,6 +130,17 @@ pub fn build(b: *std.Build) void {
     redact_mod.addImport("ner", ner_mod);
     redact_mod.addImport("proxmox", proxmox_mod);
 
+    const protocol_mod = b.createModule(.{ .root_source_file = b.path("src/agent/host_log_protocol.zig"), .target = target, .optimize = optimize });
+    const outbox_mod = b.createModule(.{ .root_source_file = b.path("src/agent/durable_outbox.zig"), .target = target, .optimize = optimize });
+    parquet_query_mod.addImport("host_log_protocol", protocol_mod);
+    const worker_mod = b.createModule(.{ .root_source_file = b.path("src/agent/host_log_worker.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    worker_mod.addImport("host_log_protocol", protocol_mod);
+    worker_mod.addImport("durable_outbox", outbox_mod);
+    worker_mod.addImport("parquet_query", parquet_query_mod);
+    worker_mod.addImport("redact", redact_mod);
+    worker_mod.addImport("logs", logs_mod);
+    worker_mod.addImport("build_options", options_mod);
+
     // ── sermon-agent (daemon) ──
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/main.zig"),
@@ -146,6 +158,8 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("staging", staging_mod);
     agent_mod.addImport("roll", roll_mod);
     agent_mod.addImport("redact", redact_mod);
+    agent_mod.addImport("host_log_worker", worker_mod);
+    agent_mod.addImport("durable_outbox", outbox_mod);
     agent_mod.addIncludePath(b.path("lib"));
     agent_mod.addLibraryPath(b.path("lib"));
     agent_mod.linkSystemLibrary("duckdb", .{});
@@ -155,6 +169,7 @@ pub fn build(b: *std.Build) void {
         .name = "sermon-agent",
         .root_module = agent_mod,
     });
+    agent.each_lib_rpath = false;
     b.installArtifact(agent);
 
     // ── sermon (CLI) ──
@@ -182,6 +197,7 @@ pub fn build(b: *std.Build) void {
         .name = "sermon",
         .root_module = cli_mod,
     });
+    cli.each_lib_rpath = false;
     b.installArtifact(cli);
 
     // ── Named build steps ──
@@ -248,7 +264,7 @@ pub fn build(b: *std.Build) void {
     push_test_mod.addImport("rules", rules_mod);
     push_test_mod.addImport("proc_self", proc_self_mod);
     push_test_mod.addImport("proxmox", proxmox_mod);
-    push_test_mod.addOptions("build_options", options);
+    push_test_mod.addImport("build_options", options_mod);
 
     const push_tests = b.addTest(.{
         .root_module = push_test_mod,
@@ -276,10 +292,8 @@ pub fn build(b: *std.Build) void {
     const staging_tests = b.addTest(.{ .root_module = staging_mod });
 
     const roll_tests = b.addTest(.{ .root_module = roll_mod });
-    roll_tests.addRPath(b.path("lib"));
 
     const parquet_query_tests = b.addTest(.{ .root_module = parquet_query_mod });
-    parquet_query_tests.addRPath(b.path("lib"));
 
     // Edge redaction: pure-Zig, links nothing. ner_mod is the interface (its own
     // small test); redact_mod carries the scanner + field-policy + merge tests.
@@ -287,6 +301,10 @@ pub fn build(b: *std.Build) void {
     const redact_tests = b.addTest(.{ .root_module = redact_mod });
 
     const test_step = b.step("test", "Run all tests");
+    const worker_tests = b.addTest(.{ .root_module = worker_mod });
+    test_step.dependOn(&b.addRunArtifact(worker_tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = protocol_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = outbox_mod })).step);
     test_step.dependOn(&b.addRunArtifact(ner_tests).step);
     test_step.dependOn(&b.addRunArtifact(redact_tests).step);
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);

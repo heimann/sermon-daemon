@@ -15,7 +15,7 @@ The hosted Sermon control plane is optional. The daemon is useful on its own.
 - Local DuckDB storage with retention
 - Optional remote push to a Sermon-compatible ingest endpoint
 
-Remote push includes daemon version, host metrics, disks, top processes by CPU, and a capped batch of recent logs. It intentionally omits process command line arguments.
+Remote push includes daemon version, host metrics, disks, top processes by CPU, and durably queued log batches of at most 100 rows. It intentionally omits process command line arguments.
 
 ## Install
 
@@ -110,7 +110,7 @@ Remote push example:
 ## Log filtering rules
 
 By default every collected log line is eligible for hosted upload (subject
-to a per-cycle cap). Log rules let you cut the noise: drop a chatty unit,
+to bounded local storage and collection backpressure). Log rules let you cut the noise: drop a chatty unit,
 keep only the error lines from an app, or sample a high-volume source down
 to a fraction.
 
@@ -206,10 +206,122 @@ LD_LIBRARY_PATH=lib ./zig-out/bin/sermon --db ./metrics.db status
 
 ## Release artifacts
 
+### Retained host-log protocol v1 (unreleased; minimum version 0.0.2)
+
+The wire contract is [SERMON_HOST_LOG_QUERY_PROTOCOL.md](SERMON_HOST_LOG_QUERY_PROTOCOL.md).
+Build with `zig build -Dversion=0.0.2` to advertise protocol 1. Default `dev`
+builds and prerelease builds do not poll for work. No release is implied by this
+source change. The hosted endpoint must support v1 and exact ingest log-count
+acknowledgments before upgrading; older ingest acknowledgments intentionally
+leave uploads pending.
+
+One outbound worker polls every 10 seconds ±20%, independently of ordinary
+telemetry. HTTPS certificate/hostname verification remains enabled; redirects
+are forbidden. HTTP operations have five-second deadlines and bounded bodies.
+The worker honors rate-limit delays, backs off on disconnect/5xx, disables claims
+for five minutes on unsupported endpoints, and suspends after 401 until restart
+reloads credentials. Keep the host clock synchronized: a missing hosted HTTP
+Date or clock difference over five seconds fails closed.
+Execution and delivery reserve that five-second skew allowance before expiry;
+near-expiry work can be discarded early, but is never granted a longer deadline.
+
+Queries run in a fixed internal child mode, never a shell or arbitrary command.
+The five-second process timer covers lock acquisition, staging decoding, DuckDB
+setup, execution and redaction. The query engine has one thread, a 128 MiB buffer
+budget and no disk spill. A fresh logs-only snapshot holds the shared roll lock
+through the prepared query; collection/roll may briefly wait on this lock. The
+typed accessor enforces UTC [since, until), 24 hours, exact filters, severity
+thresholds, 200 rows, 128 KiB compact JSON and 4096-byte UTF-8 messages. Results
+always use outbound deterministic redaction, even with raw local retention.
+Coverage is conservatively incomplete with `unknown` gaps: available oldest/
+newest timestamps do not prove collection continuity, including for empty results.
+
+Claims and terminal results use fsynced 0600 files under the configured store's
+0700 `_outbox` directory. Completion retries reuse the saved bytes and never
+renew expiry. Raw eligible upload records are independently spooled before
+proceeding to the next collected record, then redacted at delivery. Priority
+0–3 and every valid structured trace-correlated row bypass drop/sample rules.
+Only an exact `log_count` and zero `log_rejected_count` acknowledgment removes
+an upload record. Lost acknowledgments can produce duplicates: delivery is
+at-least-once, not exactly-once. Logs-only batches carry the collection-time
+metrics from their first record; ordinary metric delivery continues separately.
+Ordinary telemetry uses one replaceable 2 MiB slot on the same outbound worker,
+so HTTPS cannot block the collector. Unlike protected logs, intermediate metric
+snapshots can be superseded under backpressure.
+
+The log-upload queue is bounded to 64 MiB/1024 records, with 128 KiB per raw record and
+100 rows/2 MiB of input per delivery attempt. A full outbox stops source draining
+rather than evicting queued protected records. Source buffers can still overflow;
+oversized records are retained locally when possible, and collection failures,
+upload truncation, queue pressure and retention eviction emit local diagnostics.
+No finite system guarantees unlimited delivery or retention. Disk/I/O failures
+and the source-read-to-fsync crash window remain collection risks; coverage does
+not hide them. `redact_local_store=true` also applies before writing upload spools.
+
+The ingestion binding is fingerprinted. Changing origin/key on restart holds old
+uploads as `.held` files and clears old claims, preventing evidence from being
+sent under a potentially different server binding. Held files count toward the
+disk cap. An operator must verify the new key belongs to the same server before
+recovering held uploads; otherwise retain/archive them privately. Do not remove
+the outbox to troubleshoot without considering the only remaining copies.
+
+Trace IDs are read only from explicit journal `TRACE_ID`/`trace_id` fields and
+normalized to lowercase nonzero 32-hex values. No message-text inference occurs.
+New staging log frames use the high row-count bit to mark the appended trace
+field. Old frames and Parquet files are readable with null trace IDs. Upgrade
+daemon and CLI together; before downgrading, stop the new daemon cleanly to roll
+new staging frames to Parquet, and preserve the outbox. Historical logs cannot
+gain missing trace IDs or regain evidence already evicted by retention.
+
+HTTPS uses Zig's verified TLS transport; no libcurl, OpenSSL runtime or target
+TLS sysroot is required. One fixed child process per outbound request applies a
+five-second wall timer across DNS, connect, handshake, write and read. Request
+credentials travel only over private stdin, never argv or spool files. Redirects
+are forbidden; responses are capped at 8192 bytes (2048 for completions), with
+bounded headers and no decompression. Pacing and retry state stay in the single
+parent worker. The host must have CA certificates; `SSL_CERT_FILE` can select a
+trusted CA bundle without disabling certificate or hostname verification.
+Local verification:
+
+```bash
+zig build -Dversion=0.0.2
+LD_LIBRARY_PATH=lib zig build test
+LD_LIBRARY_PATH=lib python3 scripts/test-host-log-protocol.py
+LD_LIBRARY_PATH=lib python3 scripts/test-https-transport.py
+```
+
+The Python fixture uses a disposable TLS server and real daemon processes to
+check store boundaries, timeout, restart replay and upload acknowledgments.
+It is not a test against the deployed hosted service.
+
+### Archive contents
+
 GitHub releases publish Linux glibc tarballs for:
 
 - `x86_64-linux-gnu`
 - `aarch64-linux-gnu`
+
+Release binaries target glibc **2.28 or newer**, with system `libstdc++6`
+(GLIBCXX 3.4.25/CXXABI 1.3.11 or newer), `libgcc_s` and CA certificates.
+DuckDB 1.2.1 is checksum-pinned per architecture and bundled. Only the package's
+relative `$ORIGIN/../lib` search path is embedded. `package-release.sh` runs
+`verify-release.py` before archiving: wrong ELF machine/interpreter, unexpected
+dependencies (including libcurl), absolute RPATHs and higher ABI requirements
+fail the build. The release workflow runs TLS and protocol fixtures against each
+unpacked archive on native x86_64 and aarch64 runners before its publish job.
+
+Build local candidates without publishing:
+
+```bash
+scripts/package-release.sh --version v0.0.2 --target x86_64-linux-gnu --out-dir .zig-cache/candidates
+scripts/package-release.sh --version v0.0.2 --target aarch64-linux-gnu --out-dir .zig-cache/candidates
+(cd .zig-cache/candidates && sha256sum -c *.sha256)
+```
+
+For archive fixtures, set `SERMON_AGENT` to the unpacked absolute
+`bin/sermon-agent` path and `SERMON_VERSION=v0.0.2`, and unset `LD_LIBRARY_PATH`
+so the package must resolve its own DuckDB. The TLS fixture also accepts
+`SERMON_RUNNER='qemu-aarch64-static -L /usr/aarch64-linux-gnu'` for emulation.
 
 Each archive includes:
 

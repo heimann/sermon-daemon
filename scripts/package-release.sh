@@ -85,6 +85,10 @@ case "${TARGET}" in
     exit 1
     ;;
 esac
+if [[ "${TARGET}" != "${ARCH}-linux-gnu" ]]; then
+  echo "Architecture ${ARCH} does not match target ${TARGET}" >&2
+  exit 1
+fi
 
 if [[ "${OUT_DIR}" != /* ]]; then
   OUT_DIR="${CALLER_DIR}/${OUT_DIR}"
@@ -94,7 +98,7 @@ cd "${DAEMON_ROOT}"
 
 "${SCRIPT_DIR}/bootstrap-duckdb.sh" --arch "${ARCH}"
 rm -rf zig-out
-zig build -Dtarget="${TARGET}" -Doptimize=ReleaseSafe -Dversion="${VERSION}"
+zig build -j2 -Dtarget="${TARGET}.2.28" -Doptimize=ReleaseSafe -Dversion="${VERSION}"
 
 mkdir -p "${OUT_DIR}"
 STAGING_DIR="$(mktemp -d)"
@@ -113,6 +117,9 @@ if [[ -f "${DAEMON_ROOT}/LICENSE" ]]; then
   cp "${DAEMON_ROOT}/LICENSE" "${package_dir}/LICENSE"
 fi
 
+# Inspect every shipped ELF before creating anything publishable. In
+# particular, accidental host libcurl/sysroot links must fail here.
+python3 "${SCRIPT_DIR}/verify-release.py" "${package_dir}" "${TARGET}"
 archive_path="${OUT_DIR}/${package_name}.tar.gz"
 tar -C "${STAGING_DIR}" -czf "${archive_path}" "${package_name}"
 (

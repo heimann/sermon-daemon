@@ -16,6 +16,8 @@ const roll_mod = @import("roll");
 // chokepoint (after collect, before staging-append AND push) so local parquet
 // and remote upload see identical redacted bytes. Pure Zig, no model, no FFI.
 const redact_mod = @import("redact");
+const host_log_worker = @import("host_log_worker");
+const durable_outbox = @import("durable_outbox");
 
 const default_db_path = "~/.local/share/sermon/metrics.db";
 const default_config_path = "~/.config/sermon/config.json";
@@ -159,6 +161,16 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    const worker_args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, worker_args);
+    if (worker_args.len == 2 and std.mem.eql(u8, worker_args[1], "--https-worker")) {
+        host_log_worker.httpChildMain() catch std.process.exit(1);
+        return;
+    }
+    if (worker_args.len == 3 and std.mem.eql(u8, worker_args[1], "--retained-log-worker")) {
+        return host_log_worker.childMain(worker_args[2]);
+    }
 
     const config_path_override = try readConfigPathArg(allocator);
     defer if (config_path_override) |path| allocator.free(path);
@@ -381,6 +393,13 @@ pub fn main() !void {
         }
     }
 
+    var outbox = try durable_outbox.Outbox.open(root);
+    defer outbox.close();
+    if (server_url != null and api_key != null) try outbox.bind(allocator, server_url.?, api_key.?);
+    var control = host_log_worker.Worker{ .root = root, .origin = server_url orelse "", .key = api_key orelse "" };
+    if (server_url != null and api_key != null) try control.start();
+    defer control.deinit();
+
     std.debug.print("sermon-agent started (root={s}, interval={d}s, max_processes={d}, roll_max_bytes={d}, roll_interval_s={d}s) [memory_limit_mb={d} retained for back-compat, unused]\n", .{ root, interval, max_processes, roll_max_bytes, roll_interval_s, memory_limit_mb });
     if (log_rules.len > 0) {
         std.debug.print("loaded {d} log rule(s)\n", .{log_rules.len});
@@ -549,14 +568,6 @@ pub fn main() !void {
             if (store_redact_failed) continue;
         }
 
-        var push_logs = std.ArrayList(logs_mod.LogEntry){};
-        defer {
-            for (push_logs.items) |*entry| {
-                entry.deinit(allocator);
-            }
-            push_logs.deinit(allocator);
-        }
-
         // ── WRITE PATH: append this cycle to the durable staging log ──
         // The resident DuckDB write path is retired (plan 25). One collect cycle
         // = one bracketed begin/end (takes the EX roll lock, appends each
@@ -622,20 +633,54 @@ pub fn main() !void {
             if (log_tailer) |*lt| {
                 var log_count: u32 = 0;
                 while (log_count < 1000) : (log_count += 1) {
-                    const maybe_entry = lt.next() catch break;
+                    if (server_url != null and api_key != null) {
+                        const used = try outbox.usage();
+                        if (used.bytes + 128 * 1024 > durable_outbox.max_bytes or used.records >= durable_outbox.max_records) {
+                            std.log.err("log collection backpressure: upload outbox full; source continuity unknown", .{});
+                            break;
+                        }
+                    }
+                    const maybe_entry = lt.next() catch |err| {
+                        std.log.warn("log source collection gap: {}; coverage unknown", .{err});
+                        break;
+                    };
                     if (maybe_entry == null) break;
                     var entry = maybe_entry.?;
                     // STORE-side log redaction: only when redact_local_store, scrub
                     // each line BEFORE the staging append so the local store holds
-                    // no raw PII. Default keeps the store raw and redacts push_logs
-                    // below (before push). On a (rare) redaction error here we DROP
-                    // the entry rather than persist raw - one lost line is OK.
+                    // no raw PII. Default keeps local evidence raw and the worker
+                    // redacts before upload. A local-redaction failure is reported
+                    // as collection loss rather than persisting forbidden raw PII.
                     if (redact_local_store) {
                         redact_mod.redactLog(allocator, &entry, null) catch |err| {
                             std.debug.print("Warning: log redaction failed, dropping entry: {}\n", .{err});
                             entry.deinit(allocator);
                             continue;
                         };
+                    }
+                    // Persist eligibility before advancing to the next source
+                    // record. Raw private outbox rows are redacted by the worker,
+                    // including retries after redaction failure or daemon restart.
+                    if (server_url != null and api_key != null and push_mod.pushEligible(entry, rule_set)) {
+                        const pending = try std.json.Stringify.valueAlloc(allocator, .{
+                            .hostname = hostname,
+                            .collected_at = now,
+                            .metrics = metrics,
+                            .logs = &[_]logs_mod.LogEntry{entry},
+                            .processes = &[_]u8{},
+                            .disks = &[_]u8{},
+                        }, .{});
+                        defer allocator.free(pending);
+                        if (pending.len <= 128 * 1024) {
+                            outbox.enqueue(pending) catch |err| {
+                                std.log.err("protected upload spool failure: {}; stopping collection rather than abandoning records", .{err});
+                                // Preserve this row in staging before surfacing a
+                                // fatal I/O error; never treat it as sampling.
+                                try stg.appendLogs(&.{entry});
+                                try stg.endCycle();
+                                return err;
+                            };
+                        } else std.log.err("oversized upload record retained locally only; upload loss, coverage unknown", .{});
                     }
                     if (!staging_failed) {
                         // appendLogs takes a slice; pass this single entry.
@@ -644,11 +689,7 @@ pub fn main() !void {
                             staging_failed = true;
                         };
                     }
-                    push_logs.append(allocator, entry) catch |err| {
-                        var owned_entry = entry;
-                        owned_entry.deinit(allocator);
-                        return err;
-                    };
+                    entry.deinit(allocator);
                 }
             }
 
@@ -729,8 +770,8 @@ pub fn main() !void {
             };
         };
 
-        if (server_url) |url| {
-            if (api_key) |key| {
+        if (server_url != null) {
+            if (api_key != null) {
                 const maybe_payload = pblk: {
                     // ── EDGE PII REDACTION (push side) ──
                     // The push must NEVER carry raw PII. When the local store was
@@ -752,10 +793,6 @@ pub fn main() !void {
                             std.debug.print("Warning: push redaction (containers) failed - skipping push this cycle\n", .{});
                             break :pblk null;
                         };
-                        redact_mod.redactLogs(allocator, push_logs.items, null) catch {
-                            std.debug.print("Warning: push redaction (logs) failed - skipping push this cycle\n", .{});
-                            break :pblk null;
-                        };
                     }
                     break :pblk push_mod.buildPayload(
                         allocator,
@@ -764,7 +801,7 @@ pub fn main() !void {
                         metrics,
                         procs,
                         disks,
-                        push_logs.items,
+                        &.{},
                         rule_set,
                         self_sample,
                         // No resident DuckDB after the cutover: there are no
@@ -785,9 +822,16 @@ pub fn main() !void {
 
                 if (maybe_payload) |payload| {
                     defer allocator.free(payload);
-                    const maybe_response = push_mod.pushMetrics(allocator, url, key, payload) catch |err| push_blk: {
-                        std.debug.print("Warning: metrics push failed: {}\n", .{err});
-                        break :push_blk null;
+                    // Best-effort metrics use one replaceable slot; no network
+                    // operation runs on the collection thread. Protected logs
+                    // have their own acknowledgment-gated records above.
+                    if (payload.len <= 2 * 1024 * 1024) outbox.write("telemetry.json", payload) catch |err| {
+                        std.log.warn("telemetry spool failed: {}", .{err});
+                    };
+                    const maybe_response: ?std.json.Parsed(push_mod.IngestResponse) = response_blk: {
+                        const bytes = (outbox.read(allocator, "rules.json", 8192) catch break :response_blk null) orelse break :response_blk null;
+                        defer allocator.free(bytes);
+                        break :response_blk std.json.parseFromSlice(push_mod.IngestResponse, allocator, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
                     };
 
                     if (maybe_response) |response| {
