@@ -76,9 +76,12 @@ coerce strings to numbers. HTTP headers are not echoed.
 
 Poll `/api/daemon/log-queries/claim` every ten seconds with ±20% jitter when
 idle. Poll independently of telemetry success; do not stop polling because
-ingest failed. The shared ingestion rate limiter currently allows 30 requests
-per key per minute **including** telemetry, claims, and completions. Do not
-refresh telemetry `last_seen_at` from claim/completion traffic; the hosted side
+ingest failed. Claim and completion requests share their own per-key control
+bucket, currently 30 requests per minute, separate from the telemetry
+`/api/ingest` bucket. A telemetry backlog cannot 429 control requests, and
+idle polling cannot starve ingest. The daemon must still pace itself and
+honor 429 `retry_after_seconds`. Do not refresh telemetry `last_seen_at` from
+claim/completion traffic; the hosted side
 tracks query-channel availability separately in `log_query_seen_at`. Do not
 busy-poll after empty claims. On network errors or 5xx, exponential backoff
 starting at two seconds, capped at 60 seconds, with jitter. On 429, honor
