@@ -118,7 +118,23 @@ const LogStatsPayload = struct {
     seen: usize,
     uploaded: usize,
     dropped: usize,
+    // Cumulative since daemon start; hosted ignores keys it does not know.
+    upload_queue_dropped: u64,
+    upload_quarantined: u64,
+    upload_held_evicted: u64,
+    spool_errors: u64,
 };
+
+/// Protected-upload loss counters. Logs no longer travel in this payload, so
+/// the collection thread sets this immediately before `buildPayload`.
+pub const UploadDiagnostics = struct {
+    cycle_dropped: usize = 0,
+    upload_queue_dropped: u64 = 0,
+    upload_quarantined: u64 = 0,
+    upload_held_evicted: u64 = 0,
+    spool_errors: u64 = 0,
+};
+pub var upload_diagnostics: UploadDiagnostics = .{};
 
 const LogPayload = struct {
     timestamp: i64,
@@ -256,7 +272,11 @@ pub fn buildPayload(
         .log_stats = .{
             .seen = log_entries.len,
             .uploaded = uploaded_logs.len,
-            .dropped = dropped_logs,
+            .dropped = dropped_logs + upload_diagnostics.cycle_dropped,
+            .upload_queue_dropped = upload_diagnostics.upload_queue_dropped,
+            .upload_quarantined = upload_diagnostics.upload_quarantined,
+            .upload_held_evicted = upload_diagnostics.upload_held_evicted,
+            .spool_errors = upload_diagnostics.spool_errors,
         },
         .daemon_self = .{
             .cpu_percent = daemon_self.cpu_percent,
@@ -574,6 +594,17 @@ test "buildPayload includes capped truncated logs" {
     try std.testing.expectEqual(@as(i64, 101), root.get("log_stats").?.object.get("seen").?.integer);
     try std.testing.expectEqual(@as(i64, 100), root.get("log_stats").?.object.get("uploaded").?.integer);
     try std.testing.expectEqual(@as(i64, 1), root.get("log_stats").?.object.get("dropped").?.integer);
+
+    upload_diagnostics = .{ .cycle_dropped = 4, .upload_queue_dropped = 9, .upload_quarantined = 2 };
+    defer upload_diagnostics = .{};
+    const reported = try buildPayload(allocator, "host-a", 1_739_443_200, metrics, &procs, &disks, &.{}, .{}, testSelfSample(), 0, 0, .not_proxmox, &.{}, &.{});
+    defer allocator.free(reported);
+    const stats = try std.json.parseFromSlice(std.json.Value, allocator, reported, .{});
+    defer stats.deinit();
+    const log_stats = stats.value.object.get("log_stats").?.object;
+    try std.testing.expectEqual(@as(i64, 4), log_stats.get("dropped").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), log_stats.get("upload_queue_dropped").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), log_stats.get("upload_quarantined").?.integer);
 }
 
 test "buildPayload emits proxmox_host runtime block + containers array" {

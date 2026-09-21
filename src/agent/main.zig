@@ -216,6 +216,7 @@ pub fn main() !void {
     var interval: u64 = if (config) |c| c.value.interval orelse default_interval else default_interval;
     var server_url: ?[]const u8 = if (config) |c| c.value.server_url else null;
     var api_key: ?[]const u8 = if (config) |c| c.value.api_key else null;
+    var cli_credentials = false;
     // RETAINED FOR BACK-COMPAT: still parsed so old config.json files load, but
     // the resident-DuckDB write path it capped is retired. Logged at startup.
     const memory_limit_mb: u32 = if (config) |c|
@@ -267,11 +268,13 @@ pub fn main() !void {
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--server")) {
+            cli_credentials = true;
             server_url = args.next() orelse {
                 std.debug.print("Error: --server requires a URL\n", .{});
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--key")) {
+            cli_credentials = true;
             api_key = args.next() orelse {
                 std.debug.print("Error: --key requires a token\n", .{});
                 return;
@@ -393,11 +396,32 @@ pub fn main() !void {
         }
     }
 
-    var outbox = try durable_outbox.Outbox.open(root);
-    defer outbox.close();
-    if (server_url != null and api_key != null) try outbox.bind(allocator, server_url.?, api_key.?);
-    var control = host_log_worker.Worker{ .root = root, .origin = server_url orelse "", .key = api_key orelse "" };
-    if (server_url != null and api_key != null) try control.start();
+    // The spool only serves remote delivery. Nothing here may stop collection:
+    // without a usable spool the daemon runs local-only and says so.
+    var outbox_shared = durable_outbox.Shared{};
+    var outbox: ?durable_outbox.Outbox = durable_outbox.Outbox.open(root, &outbox_shared) catch |err| blk: {
+        if (server_url != null and api_key != null) std.log.err("upload outbox unavailable: {}; remote delivery disabled, local collection continues", .{err});
+        break :blk null;
+    };
+    defer if (outbox) |*ob| ob.close();
+    var remote = server_url != null and api_key != null and outbox != null;
+    if (remote) {
+        const ob = &outbox.?;
+        ob.cleanOrphans() catch |err| std.log.warn("outbox temp cleanup failed: {}", .{err});
+        // Unverified binding could disclose old evidence to a new server.
+        ob.bind(allocator, server_url.?, api_key.?) catch |err| {
+            std.log.err("upload outbox binding failed: {}; remote delivery disabled, local collection continues", .{err});
+            remote = false;
+        };
+        ob.reconcile() catch |err| std.log.warn("outbox usage scan failed: {}", .{err});
+    }
+    var cycle_upload_drops: usize = 0;
+    var upload_gate = durable_outbox.Gate{ .box = if (remote) &outbox.? else null };
+    // Only a config file can be re-read after a 401; flags are fixed for the process.
+    const credentials_path: ?[]const u8 = if (config != null and !cli_credentials) expandPath(allocator, config_path) catch null else null;
+    defer if (credentials_path) |path| allocator.free(path);
+    var control = host_log_worker.Worker{ .root = root, .origin = server_url orelse "", .key = api_key orelse "", .shared = &outbox_shared, .credentials_path = credentials_path };
+    if (remote) try control.start();
     defer control.deinit();
 
     std.debug.print("sermon-agent started (root={s}, interval={d}s, max_processes={d}, roll_max_bytes={d}, roll_interval_s={d}s) [memory_limit_mb={d} retained for back-compat, unused]\n", .{ root, interval, max_processes, roll_max_bytes, roll_interval_s, memory_limit_mb });
@@ -631,15 +655,9 @@ pub fn main() !void {
             // per log entry mirrors the old per-entry insertLog), but they all
             // sit inside this one begin/end bracket and share one fdatasync.
             if (log_tailer) |*lt| {
+                cycle_upload_drops = 0;
                 var log_count: u32 = 0;
                 while (log_count < 1000) : (log_count += 1) {
-                    if (server_url != null and api_key != null) {
-                        const used = try outbox.usage();
-                        if (used.bytes + 128 * 1024 > durable_outbox.max_bytes or used.records >= durable_outbox.max_records) {
-                            std.log.err("log collection backpressure: upload outbox full; source continuity unknown", .{});
-                            break;
-                        }
-                    }
                     const maybe_entry = lt.next() catch |err| {
                         std.log.warn("log source collection gap: {}; coverage unknown", .{err});
                         break;
@@ -658,29 +676,26 @@ pub fn main() !void {
                             continue;
                         };
                     }
-                    // Persist eligibility before advancing to the next source
-                    // record. Raw private outbox rows are redacted by the worker,
-                    // including retries after redaction failure or daemon restart.
-                    if (server_url != null and api_key != null and push_mod.pushEligible(entry, rule_set)) {
-                        const pending = try std.json.Stringify.valueAlloc(allocator, .{
+                    // Offer the raw row to the private upload spool; the worker
+                    // redacts before upload, including retries after a restart.
+                    // Staging below is the durable copy and never waits on this.
+                    if (remote and entry.message.len != 0 and push_mod.pushEligible(entry, rule_set)) offer: {
+                        const pending = std.json.Stringify.valueAlloc(allocator, .{
                             .hostname = hostname,
                             .collected_at = now,
                             .metrics = metrics,
                             .logs = &[_]logs_mod.LogEntry{entry},
                             .processes = &[_]u8{},
                             .disks = &[_]u8{},
-                        }, .{});
+                        }, .{}) catch {
+                            cycle_upload_drops += 1;
+                            break :offer;
+                        };
                         defer allocator.free(pending);
-                        if (pending.len <= 128 * 1024) {
-                            outbox.enqueue(pending) catch |err| {
-                                std.log.err("protected upload spool failure: {}; stopping collection rather than abandoning records", .{err});
-                                // Preserve this row in staging before surfacing a
-                                // fatal I/O error; never treat it as sampling.
-                                try stg.appendLogs(&.{entry});
-                                try stg.endCycle();
-                                return err;
-                            };
-                        } else std.log.err("oversized upload record retained locally only; upload loss, coverage unknown", .{});
+                        if (pending.len > 128 * 1024) {
+                            std.log.err("oversized upload record retained locally only; upload loss, coverage unknown", .{});
+                            cycle_upload_drops += 1;
+                        } else if (!upload_gate.offer(pending)) cycle_upload_drops += 1;
                     }
                     if (!staging_failed) {
                         // appendLogs takes a slice; pass this single entry.
@@ -772,6 +787,14 @@ pub fn main() !void {
 
         if (server_url != null) {
             if (api_key != null) {
+                // Upload loss is reported, never folded into sampling.
+                push_mod.upload_diagnostics = .{
+                    .cycle_dropped = cycle_upload_drops,
+                    .upload_queue_dropped = durable_outbox.counters.upload_queue_dropped.load(.monotonic),
+                    .upload_quarantined = durable_outbox.counters.quarantined.load(.monotonic),
+                    .upload_held_evicted = durable_outbox.counters.held_evicted.load(.monotonic),
+                    .spool_errors = durable_outbox.counters.spool_errors.load(.monotonic),
+                };
                 const maybe_payload = pblk: {
                     // ── EDGE PII REDACTION (push side) ──
                     // The push must NEVER carry raw PII. When the local store was
@@ -825,11 +848,12 @@ pub fn main() !void {
                     // Best-effort metrics use one replaceable slot; no network
                     // operation runs on the collection thread. Protected logs
                     // have their own acknowledgment-gated records above.
-                    if (payload.len <= 2 * 1024 * 1024) outbox.write("telemetry.json", payload) catch |err| {
+                    if (remote and payload.len <= 2 * 1024 * 1024) outbox.?.write("telemetry.json", payload) catch |err| {
                         std.log.warn("telemetry spool failed: {}", .{err});
                     };
                     const maybe_response: ?std.json.Parsed(push_mod.IngestResponse) = response_blk: {
-                        const bytes = (outbox.read(allocator, "rules.json", 8192) catch break :response_blk null) orelse break :response_blk null;
+                        if (!remote) break :response_blk null;
+                        const bytes = (outbox.?.read(allocator, "rules.json", 8192) catch break :response_blk null) orelse break :response_blk null;
                         defer allocator.free(bytes);
                         break :response_blk std.json.parseFromSlice(push_mod.IngestResponse, allocator, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
                     };

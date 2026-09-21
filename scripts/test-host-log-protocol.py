@@ -142,6 +142,7 @@ def run():
         completions, uploads, errors = [], [], []
         claim_calls = []
         telemetry_failures = []
+        rejections = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -177,6 +178,10 @@ def run():
                             uploads.append(len(logs))
                         # Mismatched first acknowledgment must preserve all rows.
                         response = {"log_count": 0 if len(uploads) == 1 else len(logs), "log_rejected_count": 0}
+                        refused = sum("reject-me" in row["message"] for row in logs)
+                        if refused:
+                            rejections.append(len(logs))
+                            response = {"log_count": len(logs) - refused, "log_rejected_count": refused}
                         if not logs:
                             telemetry_failures.append(time.monotonic())
                             status = 503
@@ -229,6 +234,44 @@ def run():
             assert telemetry_failures, "fixture never exercised ordinary ingest failure"
             print("PASS TLS/auth/closed claim, lost claim, restart completion replay, <=100 batching, mismatched-ack retry")
             print("PASS claims and protected uploads continue while ordinary telemetry returns 503")
+
+            def spool(name, value):
+                (box / (name + ".tmp")).write_text(value if isinstance(value, str) else json.dumps(value))
+                (box / (name + ".tmp")).rename(box / name)
+
+            def record(message):
+                return {"hostname": "fixture", "collected_at": 101, "metrics": metrics,
+                        "logs": [{**row, "message": message}], "processes": [], "disks": []}
+
+            # Poison must neither wedge the queue nor take the daemon down.
+            delivered = sum(uploads)
+            spool("upload-poison-torn.json", '{"logs":[{"timestamp":')
+            spool("upload-poison-shape.json", {"logs": None})
+            spool("upload-poison-empty.json", record(""))
+            spool("upload-good-after-poison.json", record("good row"))
+            wait_for(lambda: not list(box.glob("upload-*.json")) or errors)
+            assert not errors, errors
+            assert process.poll() is None, "daemon exited on a poison spool record"
+            assert sum(uploads) >= delivered + 1, uploads
+            assert sorted(p.name for p in box.glob("*.bad")) == [
+                "upload-poison-empty.json.bad", "upload-poison-shape.json.bad", "upload-poison-torn.json.bad"]
+            print("PASS torn, malformed and empty-message spool records are quarantined; queue keeps draining")
+
+            # Hosted refuses one row without naming it. The daemon bisects, so
+            # only that record is set aside and its batch siblings still arrive.
+            quarantined = set(box.glob("*.bad"))
+            spool("upload-refused.json", record("reject-me"))
+            for i in range(7):
+                spool(f"upload-sibling-{i}.json", record(f"accepted sibling {i}"))
+            wait_for(lambda: not list(box.glob("upload-*.json")) or errors, seconds=180)
+            assert not errors, errors
+            assert set(box.glob("*.bad")) - quarantined == {box / "upload-refused.json.bad"}
+            assert rejections[-1] == 1 and len(rejections) <= 4, rejections
+            delivered = sum(uploads)
+            spool("upload-good-after-refusal.json", record("good row"))
+            wait_for(lambda: not list(box.glob("upload-*.json")) or errors)
+            assert sum(uploads) >= delivered + 1 and process.poll() is None
+            print("PASS refused row isolated by bisection and quarantined alone; siblings and later uploads delivered")
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()
