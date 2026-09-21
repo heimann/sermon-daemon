@@ -110,7 +110,7 @@ Remote push example:
 ## Log filtering rules
 
 By default every collected log line is eligible for hosted upload (subject
-to bounded local storage and collection backpressure). Log rules let you cut the noise: drop a chatty unit,
+to bounded local storage and a bounded upload queue). Log rules let you cut the noise: drop a chatty unit,
 keep only the error lines from an app, or sample a high-volume source down
 to a fraction.
 
@@ -215,13 +215,22 @@ source change. The hosted endpoint must support v1 and exact ingest log-count
 acknowledgments before upgrading; older ingest acknowledgments intentionally
 leave uploads pending.
 
-One outbound worker polls every 10 seconds ±20%, independently of ordinary
-telemetry. HTTPS certificate/hostname verification remains enabled; redirects
+One outbound worker polls every 10 seconds ±20% (or the hosted
+`poll_after_seconds`, accepted only within 5-300 seconds), independently of
+ordinary telemetry. HTTPS certificate/hostname verification remains enabled; redirects
 are forbidden. HTTP operations have five-second deadlines and bounded bodies.
 The worker honors rate-limit delays, backs off on disconnect/5xx, disables claims
-for five minutes on unsupported endpoints, and suspends after 401 until restart
-reloads credentials. Keep the host clock synchronized: a missing hosted HTTP
-Date or clock difference over five seconds fails closed.
+for five minutes on unsupported endpoints. After a 401 it logs once, pauses
+claims and log uploads on a backoff from 5 minutes up to 1 hour, and re-reads
+`server_url`/`api_key` from the config file before each retry (credentials given
+as flags cannot be re-read). A changed key is re-bound first, so old uploads are
+held rather than sent to a different server. Ordinary telemetry keeps its
+per-cycle attempts and resumes everything on its first accepted request; no
+restart is needed. Keep the host clock synchronized: a missing hosted HTTP Date
+or clock difference over five seconds fails closed, with a rate-limited warning.
+The daemon also enforces its own limit of 10 queries per hour (burst 10): beyond
+it a claim is answered `query_failed` without running the query or taking the
+roll lock, regardless of what hosted allows.
 Execution and delivery reserve that five-second skew allowance before expiry;
 near-expiry work can be discarded early, but is never granted a longer deadline.
 
@@ -242,7 +251,11 @@ renew expiry. Raw eligible upload records are independently spooled before
 proceeding to the next collected record, then redacted at delivery. Priority
 0–3 and every valid structured trace-correlated row bypass drop/sample rules.
 Only an exact `log_count` and zero `log_rejected_count` acknowledgment removes
-an upload record. Lost acknowledgments can produce duplicates: delivery is
+an upload record. A 2xx without both counters (a hosted build that predates
+them) leaves records pending. When hosted explicitly refuses part of a batch
+(counters disagree, or 400/413/422), the daemon halves the batch until the
+refused record is alone and quarantines only that record, instead of replaying
+rows hosted already accepted. Lost acknowledgments can produce duplicates: delivery is
 at-least-once, not exactly-once. Logs-only batches carry the collection-time
 metrics from their first record; ordinary metric delivery continues separately.
 Ordinary telemetry uses one replaceable 2 MiB slot on the same outbound worker,
@@ -250,18 +263,29 @@ so HTTPS cannot block the collector. Unlike protected logs, intermediate metric
 snapshots can be superseded under backpressure.
 
 The log-upload queue is bounded to 64 MiB/1024 records, with 128 KiB per raw record and
-100 rows/2 MiB of input per delivery attempt. A full outbox stops source draining
-rather than evicting queued protected records. Source buffers can still overflow;
-oversized records are retained locally when possible, and collection failures,
-upload truncation, queue pressure and retention eviction emit local diagnostics.
+100 rows/2 MiB of input per delivery attempt. A full or failing outbox never
+stops collection: the source keeps draining into the local store, the upload of
+that row is dropped, and `log_stats.upload_queue_dropped` counts it (one log line
+per state change, not per row). The local store is the durable copy and stays
+reachable through the retained-log query, so a lost upload is recoverable while
+a collection stall is not. Queued records are never evicted to make room. Spool
+I/O errors such as ENOSPC take the same drop path and count in
+`log_stats.spool_errors`. Records that cannot be parsed, validated or delivered
+are renamed to `.bad` (at most 64 records/8 MiB, oldest evicted) and counted in
+`log_stats.upload_quarantined`; empty-message rows are never queued. Source
+buffers can still overflow; oversized records are retained locally only, and
+collection failures, upload truncation and retention eviction emit local
+diagnostics.
 No finite system guarantees unlimited delivery or retention. Disk/I/O failures
 and the source-read-to-fsync crash window remain collection risks; coverage does
 not hide them. `redact_local_store=true` also applies before writing upload spools.
 
 The ingestion binding is fingerprinted. Changing origin/key on restart holds old
 uploads as `.held` files and clears old claims, preventing evidence from being
-sent under a potentially different server binding. Held files count toward the
-disk cap. An operator must verify the new key belongs to the same server before
+sent under a potentially different server binding. Held files do not count
+toward the live queue; they have their own 256 record/16 MiB cap with the oldest
+evicted (`log_stats.upload_held_evicted`). Temp files left by an interrupted
+write are removed at startup. An operator must verify the new key belongs to the same server before
 recovering held uploads; otherwise retain/archive them privately. Do not remove
 the outbox to troubleshoot without considering the only remaining copies.
 
