@@ -14,6 +14,10 @@ const c = @cImport({
 pub const httpChildMain = http.childMain;
 const auth_backoff_min_s = 300;
 const auth_backoff_max_s = 3600;
+// A hosted 429 delay is honored only up to the longest idle poll interval the
+// protocol allows, so a buggy or hostile value cannot silence a channel.
+const rate_limit_min_s = 60;
+const rate_limit_max_s = p.max_poll_seconds;
 const max_upload_batch = 100;
 const reconcile_interval_ms = 5 * 60 * 1000;
 const log_interval_ms = 10 * 60 * 1000;
@@ -39,6 +43,10 @@ pub const QueryBudget = struct {
     }
 };
 
+/// Hosted rate-limit buckets: claims and completions share one; ordinary
+/// telemetry and protected uploads both post to /api/ingest and share the other.
+const Bucket = enum { control, ingest };
+
 pub const Worker = struct {
     root: []const u8,
     origin: []const u8,
@@ -50,7 +58,7 @@ pub const Worker = struct {
     reloaded: ?std.json.Parsed(Credentials) = null,
     stop: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
-    rate_limit_until: i64 = 0,
+    rate_limited_until: std.EnumArray(Bucket, i64) = .initFill(0),
     last_request_at: i64 = 0,
     auth_failed: bool = false,
     auth_retry_at: i64 = 0,
@@ -107,7 +115,7 @@ pub const Worker = struct {
             // backoff. Telemetry keeps its per-cycle cadence and is the probe
             // that notices a repaired key first.
             const authorized = !self.auth_failed or now >= self.auth_retry_at;
-            if (authorized and now >= self.rate_limit_until and now >= next_control and compatibleVersion()) {
+            if (authorized and self.open(.control, now) and now >= next_control and compatibleVersion()) {
                 self.reloadCredentials(a, &box);
                 if (self.control(a, &box, false)) |delay| {
                     backoff = 2;
@@ -118,7 +126,7 @@ pub const Worker = struct {
                     backoff = @min(backoff * 2, 60);
                 }
             }
-            if (authorized and now >= self.rate_limit_until and now >= next_upload) {
+            if (authorized and self.open(.ingest, now) and now >= next_upload) {
                 self.reloadCredentials(a, &box);
                 if (self.upload(a, &box)) |delay| {
                     upload_backoff = 2;
@@ -129,7 +137,7 @@ pub const Worker = struct {
                     upload_backoff = @min(upload_backoff * 2, 60);
                 }
             }
-            if (now >= self.rate_limit_until and now >= next_telemetry) {
+            if (self.open(.ingest, now) and now >= next_telemetry) {
                 self.reloadCredentials(a, &box);
                 if (self.telemetry(a, &box)) |delay| {
                     telemetry_backoff = 2;
@@ -141,6 +149,12 @@ pub const Worker = struct {
             }
             std.Thread.sleep(100 * std.time.ns_per_ms);
         }
+    }
+    fn noteRateLimit(self: *Worker, a: std.mem.Allocator, bucket: Bucket, body: []const u8) void {
+        self.rate_limited_until.set(bucket, std.time.milliTimestamp() + @as(i64, rateLimitDelay(a, body)) * 1000);
+    }
+    fn open(self: *const Worker, bucket: Bucket, now: i64) bool {
+        return now >= self.rate_limited_until.get(bucket);
     }
     /// Only after a 401. A changed key goes through `bind`, so records spooled
     /// under the old binding are held rather than sent to a different server.
@@ -237,7 +251,7 @@ pub const Worker = struct {
             }
             const body = (try box.read(a, "completion.json", 140 * 1024)).?;
             const path = try std.fmt.allocPrint(a, "/api/daemon/log-queries/{s}/complete", .{claim.id});
-            const res = try self.post(a, path, body, 2048, expiry);
+            const res = try self.post(a, .control, path, body, 2048, expiry);
             if (res.status == 200) {
                 const ack = try std.json.parseFromSlice(struct { status: []const u8, accepted: bool }, a, res.body, .{});
                 if (!std.mem.eql(u8, ack.value.status, "completed") and !std.mem.eql(u8, ack.value.status, "failed") and !std.mem.eql(u8, ack.value.status, "expired")) return error.InvalidAck;
@@ -282,7 +296,7 @@ pub const Worker = struct {
     }
     fn poll(self: *Worker, a: std.mem.Allocator) !http.Response {
         const body = try std.json.Stringify.valueAlloc(a, .{ .protocol_version = p.version, .daemon_version = build_options.version, .trace_id = true }, .{});
-        const res = try self.post(a, "/api/daemon/log-queries/claim", body, 8192, null);
+        const res = try self.post(a, .control, "/api/daemon/log-queries/claim", body, 8192, null);
         if (res.status == 200) {
             const server_time = res.server_time orelse return error.ClockSkew;
             if (@abs(std.time.timestamp() - server_time) > 5) return error.ClockSkew;
@@ -330,7 +344,7 @@ pub const Worker = struct {
         try payload.?.object.put("logs", .{ .array = rows });
         try payload.?.object.put("daemon_version", .{ .string = build_options.version });
         const body = try std.json.Stringify.valueAlloc(a, payload.?, .{});
-        const res = try self.post(a, "/api/ingest", body, 8192, null);
+        const res = try self.post(a, .ingest, "/api/ingest", body, 8192, null);
         switch (classifyUpload(a, res, rows.items.len)) {
             .delivered => {
                 for (names.items) |name| try box.removeUpload(name);
@@ -360,7 +374,7 @@ pub const Worker = struct {
     }
     fn telemetry(self: *Worker, a: std.mem.Allocator, box: *outbox.Outbox) !u32 {
         const body = (try box.read(a, "telemetry.json", 2 * 1024 * 1024)) orelse return 10;
-        const res = try self.post(a, "/api/ingest", body, 8192, null);
+        const res = try self.post(a, .ingest, "/api/ingest", body, 8192, null);
         if (res.status >= 200 and res.status < 300) {
             // Main owns rule parsing and sample counters. This bounded mailbox
             // transfers the last acknowledgment without sharing allocator state.
@@ -373,16 +387,16 @@ pub const Worker = struct {
         if (res.status == 401) return 10; // Per-cycle probe, as before the worker existed.
         return responseDelay(a, res);
     }
-    fn post(self: *Worker, a: std.mem.Allocator, path: []const u8, body: []const u8, cap: usize, expiry: ?i64) !http.Response {
-        // All three streams share one ingestion-key allowance: at most one
-        // request per two seconds, and a 429 suspends every stream.
+    fn post(self: *Worker, a: std.mem.Allocator, bucket: Bucket, path: []const u8, body: []const u8, cap: usize, expiry: ?i64) !http.Response {
+        // All streams share one ingestion key, so pace them together to at
+        // most one request per two seconds, within either hosted bucket.
         const wait_ms = self.last_request_at + 2000 - std.time.milliTimestamp();
         if (wait_ms > 0) std.Thread.sleep(@as(u64, @intCast(@min(wait_ms, 2000))) * std.time.ns_per_ms);
         if (expiry) |deadline| if (deadline <= std.time.microTimestamp() + 5_000000) return error.Expired;
         self.last_request_at = std.time.milliTimestamp();
         const res = try http.post(a, self.origin, self.key, path, body, cap);
         self.noteStatus(res.status);
-        if (res.status == 429) self.rate_limit_until = std.time.milliTimestamp() + @as(i64, try responseDelay(a, res)) * 1000;
+        if (res.status == 429) self.noteRateLimit(a, bucket, res.body);
         return res;
     }
 };
@@ -400,12 +414,15 @@ fn responseDelay(a: std.mem.Allocator, res: http.Response) !u32 {
     return switch (res.status) {
         // 401 is paced by Worker.auth_retry_at; this is only the stream's floor.
         401, 404, 422 => 300,
-        429 => blk: {
-            const body = try std.json.parseFromSlice(struct { retry_after_seconds: u32 = 60 }, a, res.body, .{ .ignore_unknown_fields = true });
-            break :blk @max(body.value.retry_after_seconds, 60);
-        },
+        429 => rateLimitDelay(a, res.body),
         else => error.HttpFailed,
     };
+}
+/// A malformed body is still a 429: fall back to the minimum rather than
+/// treating it as a transport failure and retrying in seconds.
+fn rateLimitDelay(a: std.mem.Allocator, body: []const u8) u32 {
+    const parsed = std.json.parseFromSlice(struct { retry_after_seconds: i64 = rate_limit_min_s }, a, body, .{ .ignore_unknown_fields = true }) catch return rate_limit_min_s;
+    return @intCast(std.math.clamp(parsed.value.retry_after_seconds, rate_limit_min_s, rate_limit_max_s));
 }
 const UploadOutcome = enum { delivered, rejected, unacknowledged, other };
 /// A 2xx without both counters is a hosted build that predates acknowledged
@@ -593,6 +610,17 @@ test "control status handling and jitter preserve required minimum delays" {
     try std.testing.expectEqual(@as(u32, 300), try responseDelay(a, .{ .status = 404, .body = "{}" }));
     try std.testing.expectEqual(@as(u32, 300), try responseDelay(a, .{ .status = 422, .body = "{}" }));
     try std.testing.expectEqual(@as(u32, 120), try responseDelay(a, .{ .status = 429, .body = "{\"retry_after_seconds\":120}" }));
+    for ([_]struct { []const u8, u32 }{
+        .{ "{\"retry_after_seconds\":4000000000}", rate_limit_max_s },
+        .{ "{\"retry_after_seconds\":99999999999999999999999}", rate_limit_min_s },
+        .{ "{\"retry_after_seconds\":-5}", rate_limit_min_s },
+        .{ "{\"retry_after_seconds\":0}", rate_limit_min_s },
+        .{ "{\"retry_after_seconds\":1.5}", rate_limit_min_s },
+        .{ "{\"retry_after_seconds\":null}", rate_limit_min_s },
+        .{ "{\"error\":\"rate_limited\"}", rate_limit_min_s },
+        .{ "<html>Too Many Requests</html>", rate_limit_min_s },
+        .{ "", rate_limit_min_s },
+    }) |case| try std.testing.expectEqual(case[1], try responseDelay(a, .{ .status = 429, .body = case[0] }));
     try std.testing.expectError(error.HttpFailed, responseDelay(a, .{ .status = 503, .body = "{}" }));
     for (0..100) |_| {
         const idle = jitter(10);
@@ -646,6 +674,36 @@ test "upload acknowledgment separates delivered, refused and pre-acknowledgment 
     try t.expectEqual(UploadOutcome.unacknowledged, classifyUpload(a, .{ .status = 200, .body = "<html>" }, 2));
     try t.expectEqual(UploadOutcome.other, classifyUpload(a, .{ .status = 503, .body = "{}" }, 2));
     try t.expectEqual(UploadOutcome.other, classifyUpload(a, .{ .status = 401, .body = "{}" }, 2));
+}
+
+test "a 429 suspends only its own bucket, bounded, and each bucket recovers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = std.testing;
+    var shared = outbox.Shared{};
+    var w = Worker{ .root = "", .origin = "", .key = "", .shared = &shared };
+    const cap_ms = @as(i64, rate_limit_max_s) * 1000;
+
+    const before = std.time.milliTimestamp();
+    w.noteRateLimit(a, .ingest, "{\"retry_after_seconds\":4000000000}");
+    const ingest_until = w.rate_limited_until.get(.ingest);
+    try t.expect(ingest_until >= before + cap_ms and ingest_until <= std.time.milliTimestamp() + cap_ms);
+    try t.expect(!w.open(.ingest, before));
+    try t.expect(w.open(.control, before));
+
+    // Repeated 429s re-arm from now rather than compounding past the cap.
+    for (0..5) |_| w.noteRateLimit(a, .ingest, "{\"retry_after_seconds\":4000000000}");
+    try t.expect(w.rate_limited_until.get(.ingest) <= std.time.milliTimestamp() + cap_ms);
+
+    w.noteRateLimit(a, .control, "not json");
+    const control_until = w.rate_limited_until.get(.control);
+    try t.expect(control_until >= before + rate_limit_min_s * 1000 and control_until < ingest_until);
+    try t.expect(!w.open(.control, before));
+
+    try t.expect(w.open(.control, w.rate_limited_until.get(.control)));
+    try t.expect(!w.open(.ingest, w.rate_limited_until.get(.control)));
+    try t.expect(w.open(.ingest, w.rate_limited_until.get(.ingest)));
 }
 
 test "rejected key backs off slowly and recovers without a restart" {
