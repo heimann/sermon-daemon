@@ -20,14 +20,9 @@ pub const OutputFormat = enum {
 
 const Writer = std.fs.File.DeprecatedWriter;
 
-fn writeJsonString(writer: Writer, allocator: Allocator, value: []const u8) !void {
-    if (std.unicode.utf8ValidateSlice(value)) {
-        try writer.print("{f}", .{std.json.fmt(value, .{})});
-        return;
-    }
-
+fn repairUtf8(allocator: Allocator, value: []const u8) ![]u8 {
     var valid = std.ArrayList(u8){};
-    defer valid.deinit(allocator);
+    errdefer valid.deinit(allocator);
 
     var i: usize = 0;
     while (i < value.len) {
@@ -50,7 +45,18 @@ fn writeJsonString(writer: Writer, allocator: Allocator, value: []const u8) !voi
         i += sequence_len;
     }
 
-    try writer.print("{f}", .{std.json.fmt(valid.items, .{})});
+    return valid.toOwnedSlice(allocator);
+}
+
+fn writeJsonString(writer: Writer, allocator: Allocator, value: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(value)) {
+        try writer.print("{f}", .{std.json.fmt(value, .{ .escape_unicode = true })});
+        return;
+    }
+
+    const valid = try repairUtf8(allocator, value);
+    defer allocator.free(valid);
+    try writer.print("{f}", .{std.json.fmt(valid, .{ .escape_unicode = true })});
 }
 
 fn writeJsonFloat(writer: Writer, value: f32) !void {
@@ -761,23 +767,58 @@ fn printQueryTable(writer: Writer, columns: []const []const u8, rows: []const []
     try writer.print("\n", .{});
 }
 
+fn uniqueJsonKey(allocator: Allocator, used_keys: *const std.StringHashMap(void), column: []const u8) ![]u8 {
+    const base = if (std.unicode.utf8ValidateSlice(column))
+        try allocator.dupe(u8, column)
+    else
+        try repairUtf8(allocator, column);
+    if (!used_keys.contains(base)) return base;
+    defer allocator.free(base);
+
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ base, suffix });
+        if (!used_keys.contains(candidate)) return candidate;
+        allocator.free(candidate);
+    }
+}
+
 fn printQueryJson(writer: Writer, allocator: Allocator, columns: []const []const u8, rows: []const []?[]const u8) !void {
+    var keys = try allocator.alloc([]u8, columns.len);
+    defer allocator.free(keys);
+    var initialized_keys: usize = 0;
+    defer for (keys[0..initialized_keys]) |key| allocator.free(key);
+
+    var used_keys = std.StringHashMap(void).init(allocator);
+    defer used_keys.deinit();
+
+    // JSON objects cannot represent duplicate column aliases without silently
+    // dropping values in common parsers, so assign later duplicates stable keys.
+    for (columns, 0..) |column, i| {
+        const key = try uniqueJsonKey(allocator, &used_keys, column);
+        errdefer allocator.free(key);
+        try used_keys.put(key, {});
+        keys[i] = key;
+        initialized_keys += 1;
+    }
+
     try writer.print("[\n", .{});
 
     for (rows, 0..) |row, i| {
         try writer.print("  {{\n", .{});
 
-        for (columns, row, 0..) |col, cell, j| {
+        const field_count = @min(keys.len, row.len);
+        for (keys[0..field_count], row[0..field_count], 0..) |key, cell, j| {
             if (cell) |val| {
                 try writer.writeAll("    ");
-                try writeJsonString(writer, allocator, col);
+                try writeJsonString(writer, allocator, key);
                 try writer.writeAll(": ");
                 try writeJsonString(writer, allocator, val);
-                try writer.print("{s}\n", .{if (j < columns.len - 1) "," else ""});
+                try writer.print("{s}\n", .{if (j + 1 < field_count) "," else ""});
             } else {
                 try writer.writeAll("    ");
-                try writeJsonString(writer, allocator, col);
-                try writer.print(": null{s}\n", .{if (j < columns.len - 1) "," else ""});
+                try writeJsonString(writer, allocator, key);
+                try writer.print(": null{s}\n", .{if (j + 1 < field_count) "," else ""});
             }
         }
 
@@ -802,7 +843,7 @@ fn printQueryCsv(writer: Writer, columns: []const []const u8, rows: []const []?[
     }
 }
 
-const hostile_text = "quote\" slash\\ comma, cr\r lf\n ansi\x1b]0;owned\x07 bidi\u{202e} unicode café";
+const hostile_text = "quote\" slash\\ comma, cr\r lf\n ansi\x1b]0;owned\x07 c1\u{009b} bidi\u{202e} unicode café";
 
 fn testProcess(name: []const u8, state: u8) ProcessInfo {
     return .{
@@ -859,6 +900,10 @@ test "all JSON modes encode hostile strings and remain parseable" {
         file.close();
         const bytes = try tmp.dir.readFileAlloc(allocator, "status.json", 64 * 1024);
         defer allocator.free(bytes);
+        try testing.expect(std.mem.indexOf(u8, bytes, "\u{009b}") == null);
+        try testing.expect(std.mem.indexOf(u8, bytes, "\u{202e}") == null);
+        try testing.expect(std.mem.indexOf(u8, bytes, "\\u009b") != null);
+        try testing.expect(std.mem.indexOf(u8, bytes, "\\u202e") != null);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
         defer parsed.deinit();
         try testing.expectEqualStrings(hostile_text, parsed.value.object.get("hostname").?.string);
@@ -909,6 +954,35 @@ test "all JSON modes encode hostile strings and remain parseable" {
         defer parsed.deinit();
         try testing.expectEqualStrings(hostile_text, parsed.value.array.items[0].object.get(hostile_text).?.string);
     }
+}
+
+test "query JSON disambiguates duplicate and repaired column names" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const columns = [_][]const u8{ "x", "x", "x#2", "bad\xff", "bad\xfe" };
+    var full_row = [_]?[]const u8{ "one", "two", "three", "four", "five" };
+    var short_row = [_]?[]const u8{"only"};
+    const rows = [_][]?[]const u8{ &full_row, &short_row };
+    var file = try tmp.dir.createFile("duplicate-columns.json", .{});
+    try printQueryResult(file.deprecatedWriter(), .json, allocator, &columns, &rows);
+    file.close();
+
+    const bytes = try tmp.dir.readFileAlloc(allocator, "duplicate-columns.json", 4096);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    const row = parsed.value.array.items[0].object;
+    try testing.expectEqual(@as(usize, 5), row.count());
+    try testing.expectEqualStrings("one", row.get("x").?.string);
+    try testing.expectEqualStrings("two", row.get("x#2").?.string);
+    try testing.expectEqualStrings("three", row.get("x#2#2").?.string);
+    try testing.expectEqualStrings("four", row.get("bad\xef\xbf\xbd").?.string);
+    try testing.expectEqualStrings("five", row.get("bad\xef\xbf\xbd#2").?.string);
+    try testing.expectEqual(@as(usize, 1), parsed.value.array.items[1].object.count());
 }
 
 test "JSON string output preserves type for invalid UTF-8" {
