@@ -12,9 +12,8 @@ const storage_mod = @import("storage");
 // only for its back-compat constants (default_memory_limit_mb) - see below.
 const staging_mod = @import("staging");
 const roll_mod = @import("roll");
-// Edge PII redaction: deterministic byte-scanners run once per cycle at a single
-// chokepoint (after collect, before staging-append AND push) so local parquet
-// and remote upload see identical redacted bytes. Pure Zig, no model, no FFI.
+// Pattern-based PII redaction is shared by the local-store and outbound paths.
+// Pure Zig, no model, no FFI.
 const redact_mod = @import("redact");
 const host_log_worker = @import("host_log_worker");
 const durable_outbox = @import("durable_outbox");
@@ -72,15 +71,15 @@ const Config = struct {
     // its last roll, so low-volume tables don't sit un-rolled. See
     // default_roll_interval_s.
     roll_interval_s: ?u64 = null,
-    // PII redaction scope. The remote push is ALWAYS redacted (raw PII never
-    // leaves the box). This knob only controls the LOCAL parquet store:
+    // PII redaction scope. The remote push always passes through the best-effort
+    // deterministic redactor. This knob only controls the LOCAL parquet store:
     //   false (default): the local store keeps RAW data at full fidelity, so
     //     on-box `sermon query` / diagnosis sees real IPs, cmdlines, names. The
     //     raw is already on the box anyway (journald, /proc), so this is the
     //     sensible default.
-    //   true: redact before the local store too, so on-disk parquet never holds
-    //     a raw secret/IP - for disk-theft / compliance threat models. Costs the
-    //     local-diagnosis fidelity above.
+    //   true: redact recognized patterns before the local store too, reducing
+    //     exposure for disk-theft / compliance threat models. Costs the local
+    //     diagnosis fidelity above, but cannot guarantee arbitrary PII removal.
     redact_local_store: ?bool = null,
 };
 
@@ -570,7 +569,8 @@ pub fn main() !void {
 
         // ── EDGE PII REDACTION (store side) ──
         // When redact_local_store is set, scrub procs/disks/containers IN PLACE
-        // BEFORE the staging append, so the local parquet also holds no raw PII.
+        // BEFORE the staging append, so recognized patterns are also removed
+        // from local parquet.
         // Default (false) leaves the local store raw and redacts only on the push
         // path below (after the append). Either way the remote push is redacted.
         // Fatal-for-cycle here: if we mean to keep the store clean and can't, skip
@@ -665,10 +665,11 @@ pub fn main() !void {
                     if (maybe_entry == null) break;
                     var entry = maybe_entry.?;
                     // STORE-side log redaction: only when redact_local_store, scrub
-                    // each line BEFORE the staging append so the local store holds
-                    // no raw PII. Default keeps local evidence raw and the worker
-                    // redacts before upload. A local-redaction failure is reported
-                    // as collection loss rather than persisting forbidden raw PII.
+                    // each line BEFORE the staging append so the local store gets
+                    // the same pattern-based protection. Default keeps local
+                    // evidence raw and the worker redacts before upload. A local
+                    // redaction failure is reported as collection loss rather than
+                    // bypassing the configured protection.
                     if (redact_local_store) {
                         redact_mod.redactLog(allocator, &entry, null) catch |err| {
                             std.debug.print("Warning: log redaction failed, dropping entry: {}\n", .{err});
@@ -797,12 +798,11 @@ pub fn main() !void {
                 };
                 const maybe_payload = pblk: {
                     // ── EDGE PII REDACTION (push side) ──
-                    // The push must NEVER carry raw PII. When the local store was
-                    // NOT pre-redacted (the default), scrub procs/disks/containers
-                    // /logs IN PLACE now - after they were stored raw - so only the
-                    // bytes leaving the box are redacted. On a (rare) failure, yield
-                    // null to SKIP the push this cycle: the data is safe in the
-                    // local store and the push retries next cycle; we never send raw.
+                    // When the local store was NOT pre-redacted (the default), run
+                    // the same best-effort pattern redactor over outbound fields now.
+                    // On an allocation/inference failure, SKIP the push rather than
+                    // bypassing the redactor; unmatched free-form PII remains a
+                    // documented limitation of deterministic scanning.
                     if (!redact_local_store) {
                         redact_mod.redactProcesses(allocator, procs, null) catch {
                             std.debug.print("Warning: push redaction (processes) failed - skipping push this cycle\n", .{});

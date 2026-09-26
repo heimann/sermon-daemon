@@ -1,10 +1,9 @@
 //! Edge PII redaction for the sermon-daemon.
 //!
-//! Runs ONCE per collect cycle, in main.zig, on the in-memory ProcessInfo /
-//! LogEntry / DiskInfo slices AFTER collection and BEFORE both the staging
-//! append (local parquet) and push.buildPayload (remote upload). Redacting at
-//! this single chokepoint means local persistence and remote upload see the
-//! exact same redacted bytes, and nothing downstream has to be redaction-aware.
+//! The same pattern-based redactor is used at every outbound boundary and,
+//! optionally, before local persistence. It deliberately favors useful
+//! diagnostics over an indiscriminate high-entropy blanket, so it reduces
+//! exposure but is not a proof that arbitrary free-form PII has been removed.
 //!
 //! Design constraints (PRAGMATIC-MINIMAL):
 //!   * Only the highest-PII free-text fields are scanned: LogEntry.message,
@@ -26,10 +25,10 @@
 //!       "Failed password for admin from 10.0.0.1"
 //!         -> "Failed password for admin from <REDACTED:IP>"
 //!
-//! Recall note: the deterministic scanners below were measured at 100% recall
-//! on structured secrets/credentials/cards/SSN/IP (labs pii-redaction-recall).
-//! They do NOT catch free-form human usernames or street addresses - that needs
-//! an NER model and is a documented follow-on, not part of this pass.
+//! Recall note: the deterministic scanners cover the structured patterns in the
+//! adversarial corpus below. They do NOT catch every provider token, free-form
+//! human username, or street address. Those require a maintained pattern corpus
+//! and/or an NER model; deterministic redaction is a best-effort safety layer.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -46,8 +45,7 @@ const ContainerEntry = proxmox.ContainerEntry;
 /// Optional NER backend. The interface is pure (ner.zig links nothing); the
 /// concrete model-backed backend lives in ner_pf.zig and is constructed in
 /// main.zig. A null `Ner` means deterministic-scanners-only - the daemon
-/// degrades to that whenever NER is disabled or the model is absent, and never
-/// emits raw PII as a result.
+/// degrades to that whenever NER is disabled or the model is absent.
 const Ner = ner.Ner;
 const Kind = ner.Kind;
 
@@ -69,7 +67,7 @@ const Tag = enum {
     token,
     value, // generic key=value structural redaction
     // NER-derived tags. These come ONLY from the model backend (ner.Kind),
-    // never from a byte scanner, so the deterministic recall guarantee is
+    // never from a byte scanner, so corpus-covered deterministic matches are
     // unaffected. They are merged into the same emit pass as the scanner tags.
     person,
     address,
@@ -135,6 +133,12 @@ inline fn isUpperAlnum(c: u8) bool {
 }
 inline fn isAlnum(c: u8) bool {
     return isDigit(c) or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+}
+inline fn isHorizontalSpace(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
+inline fn isUriSchemeChar(c: u8) bool {
+    return isAlnum(c) or c == '+' or c == '-' or c == '.';
 }
 /// Base64url-ish alphabet used by JWTs / AWS secrets / OpenAI key bodies.
 inline fn isB64(c: u8) bool {
@@ -419,21 +423,53 @@ fn scanProviderToken(s: []const u8, start: usize) Probe {
 }
 
 // ============================================================================
-// key=value structural rule.
+// Structured credential rules.
 //
-// When the text contains <key><=|:><value> and <key> is one of the sensitive
+// When the text contains <key><=|:|space><value> and <key> is one of the sensitive
 // key names (pw, pass, password, pwd, secret, token, apikey, user, username,
 // login, holder), the VALUE is redacted as <REDACTED:VALUE>. This is what
-// catches free-form secrets the entropy scanners can't characterize (e.g.
-// "password=hunter2"). The key text itself is preserved (it is structure, not
-// PII), so a log line keeps its shape.
+// catches free-form secrets the standalone scanners can't characterize (e.g.
+// "password=hunter2"). Whitespace is inherently ambiguous: quoted and `--flag`
+// values always match, while bare values must contain a non-letter credential
+// character. The key text itself is preserved so a log line keeps its shape.
 // ============================================================================
 
 const sensitive_keys = [_][]const u8{
-    "password", "passwd", "pass",   "pwd",     "pw",
-    "secret",   "token",  "apikey", "api_key", "access_key",
-    "username", "user",   "login",  "holder",
+    "password",   "passwd",   "pass",   "pwd",     "pw",
+    "secret",     "token",    "apikey", "api_key", "api-key",
+    "access_key", "username", "user",   "login",   "holder",
 };
+
+// Whitespace has much more natural-language ambiguity than ':' or '='. Limit
+// that form to credential-bearing keys; user/login/holder are deliberately
+// excluded so ordinary prose such as "user root logged in" remains useful.
+const whitespace_sensitive_keys = [_][]const u8{
+    "password",   "passwd", "pass",   "pwd",     "pw",
+    "secret",     "token",  "apikey", "api_key", "api-key",
+    "access_key",
+};
+
+fn matchKeyEndingAt(s: []const u8, raw_end: usize, keys: []const []const u8) ?usize {
+    var key_end = raw_end;
+    if (key_end > 0 and (s[key_end - 1] == '"' or s[key_end - 1] == '\'')) key_end -= 1;
+    for (keys) |key| {
+        if (key.len > key_end) continue;
+        if (!eqIgnoreCaseSlice(s[key_end - key.len .. key_end], key)) continue;
+        const before = key_end - key.len;
+        if (before > 0 and isAlnum(s[before - 1])) continue;
+        return key.len;
+    }
+    return null;
+}
+
+fn matchWholeKeyEndingAt(s: []const u8, raw_end: usize, keys: []const []const u8) bool {
+    var key_end = raw_end;
+    if (key_end > 0 and (s[key_end - 1] == '"' or s[key_end - 1] == '\'')) key_end -= 1;
+    var key_start = key_end;
+    while (key_start > 0 and (isAlnum(s[key_start - 1]) or s[key_start - 1] == '-' or s[key_start - 1] == '_')) key_start -= 1;
+    for (keys) |key| if (eqIgnoreCaseSlice(s[key_start..key_end], key)) return true;
+    return false;
+}
 
 // Benign env-style keys, matched case-SENSITIVELY as WHOLE bare tokens with a
 // value-shape guard (see matchSensitiveKey / benignEnvValue). All-uppercase
@@ -495,6 +531,13 @@ fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
         return key.len;
     }
     return null;
+}
+
+fn looksLikeBareCredential(value: []const u8) bool {
+    var end = value.len;
+    while (end > 0 and std.mem.indexOfScalar(u8, ".!?)]}", value[end - 1]) != null) end -= 1;
+    for (value[0..end]) |c| if (!std.ascii.isAlphabetic(c)) return true;
+    return false;
 }
 
 /// Value-shape guard for the benign env-key allowlist. `key` is "PWD" or "USER".
@@ -573,6 +616,10 @@ fn scanValueToken(s: []const u8, start: usize) Probe {
     while (i < s.len) : (i += 1) {
         const c = s[i];
         if (quote != 0) {
+            if (c == '\\' and i + 1 < s.len) {
+                i += 1;
+                continue;
+            }
             if (c == quote) break;
         } else if (c == ' ' or c == '\t' or c == ',' or c == ';' or c == '\n' or c == '\r') {
             break;
@@ -580,6 +627,135 @@ fn scanValueToken(s: []const u8, start: usize) Probe {
     }
     if (i == v_start) return null;
     return i; // exclusive end of the value (closing quote, if any, left in place)
+}
+
+fn valueMatch(s: []const u8, start: usize, tag: Tag) ?Match {
+    const end = scanValueToken(s, start) orelse return null;
+    const value_start = if (s[start] == '"' or s[start] == '\'') start + 1 else start;
+    return .{ .start = value_start, .end = end, .tag = tag };
+}
+
+fn isAuthorizationScheme(value: []const u8) bool {
+    const schemes = [_][]const u8{ "bearer", "basic", "token", "negotiate", "digest", "apikey", "aws4-hmac-sha256", "hawk", "oauth", "signature" };
+    for (schemes) |scheme| if (eqIgnoreCaseSlice(value, scheme)) return true;
+    return false;
+}
+
+fn isSingleTokenAuthorizationScheme(value: []const u8) bool {
+    const schemes = [_][]const u8{ "bearer", "basic", "token", "negotiate", "apikey" };
+    for (schemes) |scheme| if (eqIgnoreCaseSlice(value, scheme)) return true;
+    return false;
+}
+
+/// Authorization and Proxy-Authorization values are credentials regardless of
+/// scheme. Preserve a leading scheme such as Bearer, Basic, Token, Negotiate,
+/// or Digest for diagnostics, and replace the credential portion.
+fn scanAuthorization(s: []const u8, sep: usize) ?Match {
+    if (s[sep] != ':' and s[sep] != '=') return null;
+    var key_end = sep;
+    while (key_end > 0 and isHorizontalSpace(s[key_end - 1])) key_end -= 1;
+    const authorization_keys = [_][]const u8{
+        "authorization",
+        "proxy-authorization",
+        "x-authorization",
+        "http_authorization",
+        "http_proxy_authorization",
+        "redirect_http_authorization",
+    };
+    if (!matchWholeKeyEndingAt(s, key_end, &authorization_keys)) return null;
+
+    var value_start = sep + 1;
+    while (value_start < s.len and isHorizontalSpace(s[value_start])) value_start += 1;
+    const quote: u8 = if (value_start < s.len and (s[value_start] == '"' or s[value_start] == '\'')) s[value_start] else 0;
+    if (quote != 0) value_start += 1;
+    if (value_start >= s.len) return null;
+
+    var scheme_end = value_start;
+    while (scheme_end < s.len and (isAlnum(s[scheme_end]) or s[scheme_end] == '-' or s[scheme_end] == '_' or s[scheme_end] == '.')) scheme_end += 1;
+    var credential_start = scheme_end;
+    while (credential_start < s.len and isHorizontalSpace(s[credential_start])) credential_start += 1;
+    const has_scheme = credential_start > scheme_end;
+
+    // A header without a separate scheme is still credential-bearing, unless
+    // it contains only a known scheme and therefore carries no credential.
+    if (credential_start == scheme_end) {
+        if (isAuthorizationScheme(s[value_start..scheme_end])) return null;
+        credential_start = value_start;
+    }
+    if (credential_start >= s.len or (quote != 0 and s[credential_start] == quote)) return null;
+    // Known token schemes carry one opaque token. Any other explicit scheme is
+    // conservatively treated as auth-param syntax so an unknown future scheme
+    // cannot leak secrets after its first comma.
+    const parameterized = has_scheme and !isSingleTokenAuthorizationScheme(s[value_start..scheme_end]);
+    var credential_end = credential_start;
+    while (credential_end < s.len) : (credential_end += 1) {
+        const c = s[credential_end];
+        if (quote != 0 and c == '\\' and credential_end + 1 < s.len) {
+            credential_end += 1;
+            continue;
+        }
+        if ((quote != 0 and c == quote) or (quote == 0 and (c == '\n' or c == '\r'))) break;
+        if (!parameterized and quote == 0 and (isHorizontalSpace(c) or c == ',' or c == ';')) break;
+    }
+    if (credential_end == credential_start) return null;
+    return .{ .start = credential_start, .end = credential_end, .tag = .token };
+}
+
+/// Recognize URI authorities carrying userinfo. Replacing the entire userinfo
+/// keeps the scheme, host, port, path, and query useful while removing both the
+/// username and any password: `postgres://user:pass@db`.
+fn scanUriUserinfo(s: []const u8, start: usize) ?Match {
+    if (start > 0 and isUriSchemeChar(s[start - 1])) return null;
+    if (start >= s.len or !std.ascii.isAlphabetic(s[start])) return null;
+    var i = start + 1;
+    while (i < s.len and isUriSchemeChar(s[i])) i += 1;
+    if (i + 3 > s.len or !std.mem.eql(u8, s[i .. i + 3], "://")) return null;
+    const userinfo_start = i + 3;
+    i = userinfo_start;
+    var last_at: ?usize = null;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '@') last_at = i;
+        if (isAuthorityTerminator(c)) break;
+    }
+    const at = last_at orelse return null;
+    if (at == userinfo_start or at + 1 >= i) return null;
+    return .{ .start = userinfo_start, .end = at, .tag = .value };
+}
+
+fn isAuthorityTerminator(c: u8) bool {
+    return c == '/' or c == '?' or c == '#' or c == '"' or c == '\'' or
+        c == '\n' or c == '\r' or isHorizontalSpace(c);
+}
+
+/// Match structured credentials at the current byte. The returned span may
+/// start after `i`, allowing the emitter to preserve separators, quotes, URI
+/// schemes, and authorization schemes verbatim.
+fn scanStructured(s: []const u8, i: usize) ?Match {
+    if (scanUriUserinfo(s, i)) |m| return m;
+
+    if ((s[i] == '=' or s[i] == ':') and i > 0) {
+        if (scanAuthorization(s, i)) |m| return m;
+        if (matchSensitiveKey(s, i)) |_| {
+            var value_start = i + 1;
+            while (value_start < s.len and isHorizontalSpace(s[value_start])) value_start += 1;
+            if (value_start < s.len) return valueMatch(s, value_start, .value);
+        }
+    }
+
+    if (isHorizontalSpace(s[i]) and i > 0 and !isHorizontalSpace(s[i - 1])) {
+        const key_len = matchKeyEndingAt(s, i, &whitespace_sensitive_keys) orelse return null;
+        var value_start = i;
+        while (value_start < s.len and isHorizontalSpace(s[value_start])) value_start += 1;
+        if (value_start >= s.len or s[value_start] == '=' or s[value_start] == ':') return null;
+        const quoted = s[value_start] == '"' or s[value_start] == '\'';
+        const m = valueMatch(s, value_start, .value) orelse return null;
+        const key_start = i - key_len;
+        const flag = key_start >= 2 and s[key_start - 2] == '-' and s[key_start - 1] == '-';
+        if (!quoted and !flag and !looksLikeBareCredential(s[m.start..m.end])) return null;
+        return m;
+    }
+    return null;
 }
 
 // ============================================================================
@@ -621,26 +797,11 @@ pub fn redactText(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
 
     var i: usize = 0;
     while (i < src.len) {
-        // 1. key=value structural rule. When we are sitting on a '=' or ':'
-        //    whose left side is a sensitive key, redact the value token.
-        if ((src[i] == '=' or src[i] == ':') and i > 0) {
-            if (matchSensitiveKey(src, i)) |_| {
-                var j = i + 1;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
-                // For "user:" we keep the colon-as-separator only when a value
-                // follows on the same token; otherwise treat ':' as ordinary.
-                if (scanValueToken(src, j)) |vend| {
-                    // Emit up to and including the separator + leading spaces,
-                    // then the placeholder, preserving any opening quote.
-                    try out.appendSlice(allocator, src[i..j]);
-                    if (j < src.len and (src[j] == '"' or src[j] == '\'')) {
-                        try out.append(allocator, src[j]);
-                    }
-                    try out.appendSlice(allocator, Tag.value.text());
-                    i = vend;
-                    continue;
-                }
-            }
+        if (scanStructured(src, i)) |m| {
+            try out.appendSlice(allocator, src[i..m.start]);
+            try out.appendSlice(allocator, m.tag.text());
+            i = m.end;
+            continue;
         }
 
         // 2. standalone scanners.
@@ -660,8 +821,8 @@ pub fn redactText(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
 // ============================================================================
 // Merged NER + deterministic redaction.
 //
-// The deterministic scanners (above) are the recall floor: measured 100% on
-// structured secrets, and the daemon must NEVER regress that. The optional NER
+// The deterministic scanners (above) are the recall floor for corpus-covered
+// structured secrets and must not silently regress. The optional NER
 // model adds free-form PII the scanners can't characterize (human names, street
 // addresses). To compose them in ONE pass we:
 //   1. collect every deterministic match as a span (origin = .deterministic),
@@ -703,28 +864,16 @@ fn collectDeterministic(
 ) Allocator.Error!void {
     var i: usize = 0;
     while (i < src.len) {
-        // 1. key=value structural rule (same condition as redactText).
-        if ((src[i] == '=' or src[i] == ':') and i > 0) {
-            if (matchSensitiveKey(src, i)) |_| {
-                var j = i + 1;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
-                if (scanValueToken(src, j)) |vend| {
-                    // The placeholder replaces only the value token (after the
-                    // separator, spaces, and an optional opening quote), exactly
-                    // mirroring redactText. So the span starts past the quote.
-                    var v_start = j;
-                    if (j < src.len and (src[j] == '"' or src[j] == '\'')) v_start = j + 1;
-                    try list.append(allocator, .{
-                        .start = v_start,
-                        .end = vend,
-                        .tag = .value,
-                        .origin = .deterministic,
-                        .score = 1.0,
-                    });
-                    i = vend;
-                    continue;
-                }
-            }
+        if (scanStructured(src, i)) |m| {
+            try list.append(allocator, .{
+                .start = m.start,
+                .end = m.end,
+                .tag = m.tag,
+                .origin = .deterministic,
+                .score = 1.0,
+            });
+            i = m.end;
+            continue;
         }
 
         // 2. standalone scanners.
@@ -895,8 +1044,8 @@ pub fn redactTextMerged(
 // ============================================================================
 // Field-level helpers. Each frees the OLD owned slice and stores a fresh one.
 // On allocation failure the OLD slice is left intact and the error propagates;
-// the caller (main.zig) treats a redact error as fatal-for-cycle so raw PII is
-// never persisted/pushed.
+// the caller (main.zig) treats a redact error as fatal-for-cycle so a failed
+// redaction attempt is not bypassed for persistence or push.
 // ============================================================================
 
 /// Default model confidence threshold for free-text fields. Below this, NER
@@ -1006,14 +1155,14 @@ fn redactMountPoint(allocator: Allocator, field: *[]const u8) Allocator.Error!vo
 
 /// Redact a single LogEntry: message (full scan + optional NER, shape-
 /// preserving) and source (basename only). identifier / systemd_unit / unit /
-/// numerics are preserved. `maybe_ner` null => deterministic-only (never raw).
+/// numerics are preserved. `maybe_ner` null => deterministic-only.
 pub fn redactLog(allocator: Allocator, entry: *LogEntry, maybe_ner: ?Ner) ner.Error!void {
     try replaceField(allocator, &entry.message, maybe_ner);
     try redactSource(allocator, &entry.source);
 }
 
 /// Redact a slice of LogEntry in place. Stops and returns the first error; the
-/// caller must treat that as fatal-for-cycle (don't persist/push raw PII).
+/// caller must treat that as fatal-for-cycle rather than bypassing redaction.
 pub fn redactLogs(allocator: Allocator, entries: []LogEntry, maybe_ner: ?Ner) ner.Error!void {
     for (entries) |*e| try redactLog(allocator, e, maybe_ner);
 }
@@ -1159,6 +1308,104 @@ test "key=value tolerates spaces and quotes before the separator" {
     try expectRedact("password = hunter2 ok", "password = <REDACTED:VALUE> ok");
     // Boundary still holds: a longer word ending in a key name does not match.
     try expectRedact("mypassword = keep", "mypassword = keep");
+}
+
+test "adversarial credential forms redact without destroying log context" {
+    const cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{
+            .input = "request failed; Authorization: Bearer mF_9.B5f-4.1JqM, trace=ok",
+            .expected = "request failed; Authorization: Bearer <REDACTED:TOKEN>, trace=ok",
+        },
+        .{
+            .input = "{\"authorization\":\"Basic dXNlcjpwYXNz\"}",
+            .expected = "{\"authorization\":\"Basic <REDACTED:TOKEN>\"}",
+        },
+        .{
+            .input = "pRoXy-AuThOrIzAtIoN = Negotiate YIIF-w0K; peer=frontend",
+            .expected = "pRoXy-AuThOrIzAtIoN = Negotiate <REDACTED:TOKEN>; peer=frontend",
+        },
+        .{
+            .input = "authorization: opaque-credential, route=/health",
+            .expected = "authorization: <REDACTED:TOKEN>, route=/health",
+        },
+        .{
+            .input = "X-Api-Key: short, route=/health",
+            .expected = "X-Api-Key: <REDACTED:VALUE>, route=/health",
+        },
+        .{
+            .input = "Authorization: Digest username=admin, nonce=abc, response=deadbeef\ntrace=ok",
+            .expected = "Authorization: Digest <REDACTED:TOKEN>\ntrace=ok",
+        },
+        .{
+            .input = "{\"authorization\":\"AWS4-HMAC-SHA256 Credential=AKID/20260926, SignedHeaders=host, Signature=deadbeef\",\"trace\":\"ok\"}",
+            .expected = "{\"authorization\":\"AWS4-HMAC-SHA256 <REDACTED:TOKEN>\",\"trace\":\"ok\"}",
+        },
+        .{
+            .input = "Authorization: Signature keyId=service, algorithm=rsa-sha256, signature=deadbeef\ntrace=ok",
+            .expected = "Authorization: Signature <REDACTED:TOKEN>\ntrace=ok",
+        },
+        .{
+            .input = "HTTP_AUTHORIZATION=Bearer opaque-token, route=/health",
+            .expected = "HTTP_AUTHORIZATION=Bearer <REDACTED:TOKEN>, route=/health",
+        },
+        .{
+            .input = "{\"password\":\"abc\\\"def\"}",
+            .expected = "{\"password\":\"<REDACTED:VALUE>\"}",
+        },
+        .{
+            .input = "database rejected password hunter2, retrying",
+            .expected = "database rejected password <REDACTED:VALUE>, retrying",
+        },
+        .{
+            .input = "exec --ToKeN 'short value' --mode check",
+            .expected = "exec --ToKeN '<REDACTED:VALUE>' --mode check",
+        },
+        .{
+            .input = "connect postgres://alice:hunter2@db.internal:5432/app?ssl=true",
+            .expected = "connect postgres://<REDACTED:VALUE>@db.internal:5432/app?ssl=true",
+        },
+        .{
+            .input = "GET https://opaque-token@api.example.com/v1 failed",
+            .expected = "GET https://<REDACTED:VALUE>@api.example.com/v1 failed",
+        },
+        .{
+            .input = "connect postgres://user:p@ss@db.internal/app",
+            .expected = "connect postgres://<REDACTED:VALUE>@db.internal/app",
+        },
+    };
+    for (cases) |case| try expectRedact(case.input, case.expected);
+}
+
+test "credential scanner preserves ambiguous prose and invalid boundaries" {
+    const unchanged = [_][]const u8{
+        "the password is required",
+        "the password is required.",
+        "password authentication failed",
+        "password reset accepted",
+        "password expiration warning",
+        "password expired.",
+        "secret mount failed",
+        "token refresh started",
+        "token refresh!",
+        "secret service started",
+        "token bucket empty",
+        "api_key rotation complete",
+        "mypassword hunter2",
+        "passwordless login enabled",
+        "Authorization: Bearer",
+        "ghp_short",
+        "sk-short",
+        "https://example.com/path@operator",
+        "scheme://@host",
+        "scheme://user@",
+        "scheme://user@/path",
+    };
+    for (unchanged) |input| try expectRedact(input, input);
+
+    // Short credentials remain sensitive when their context is unambiguous.
+    try expectRedact("Authorization: Bearer x, denied", "Authorization: Bearer <REDACTED:TOKEN>, denied");
+    try expectRedact("password 'x' rejected", "password '<REDACTED:VALUE>' rejected");
+    try expectRedact("--token service --mode check", "--token <REDACTED:VALUE> --mode check");
 }
 
 test "uppercase PWD=/USER= are benign env keys (sudo audit trail stays readable)" {

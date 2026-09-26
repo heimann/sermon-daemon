@@ -242,6 +242,9 @@ through the prepared query; collection/roll may briefly wait on this lock. The
 typed accessor enforces UTC [since, until), 24 hours, exact filters, severity
 thresholds, 200 rows, 128 KiB compact JSON and 4096-byte UTF-8 messages. Results
 always use outbound deterministic redaction, even with raw local retention.
+This is pattern-based risk reduction, not a guarantee that every secret or
+free-form PII value is recognized. Allocation or inference failures fail closed
+for that outbound attempt rather than bypassing the redactor.
 Coverage is conservatively incomplete with `unknown` gaps: available oldest/
 newest timestamps do not prove collection continuity, including for empty results.
 
