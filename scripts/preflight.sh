@@ -18,4 +18,6 @@ if [[ ! -f "${DAEMON_ROOT}/lib/libduckdb.so" ]]; then
   exit 1
 fi
 
+"${SCRIPT_DIR}/test-install-attestation.sh"
+
 echo "daemon preflight ok"

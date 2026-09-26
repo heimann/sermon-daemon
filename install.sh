@@ -14,7 +14,7 @@ Options:
   --ingestion-key <key>         Optional Sermon ingestion key. If omitted, installs local-only.
   --server-url <url>            Sermon web URL for remote push. Default: https://sermon.fyi
   --version <tag>               Release tag. Default: latest GitHub release.
-  --release-base-url <url>      Base URL containing tarball + .sha256 files.
+  --release-base-url <url>      Mirror containing the attested tarball + .sha256 files.
   --install-dir <path>          Install dir. Default: /opt/sermon or ~/.local/opt/sermon.
   --config-dir <path>           Config dir. Default: /etc/sermon or ~/.config/sermon.
   --db-path <path>              Metrics DB path. Default: /var/lib/sermon/metrics.db or ~/.local/share/sermon/metrics.db.
@@ -140,6 +140,7 @@ case "$(uname -m)" in
 esac
 
 need_cmd curl
+need_cmd gh
 need_cmd tar
 need_cmd sha256sum
 need_cmd sed
@@ -195,6 +196,14 @@ curl -fsSL "${SHA_URL}" -o "${tmpdir}/${ARCHIVE}.sha256"
   cd "${tmpdir}"
   sha256sum -c "${ARCHIVE}.sha256"
 )
+
+log "verifying GitHub build provenance for ${ARCHIVE}"
+gh attestation verify "${tmpdir}/${ARCHIVE}" \
+  --repo "${GITHUB_REPO}" \
+  --signer-workflow "${GITHUB_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${VERSION}" \
+  --predicate-type "https://slsa.dev/provenance/v1" \
+  --deny-self-hosted-runners
 
 new_dir="${INSTALL_DIR}.new"
 old_dir="${INSTALL_DIR}.old"
