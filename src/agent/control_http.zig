@@ -79,16 +79,23 @@ pub fn childMain() !void {
     try body.end();
     try req.connection.?.flush();
     var response = try req.receiveHead(&.{});
-    if (response.head.content_encoding != .identity) return error.UnexpectedEncoding;
+    // A throttling answer must reach the worker even when its body or headers
+    // are unusable (e.g. a proxy's HTML page), so its bucket still pauses.
+    const throttled = response.head.status == .too_many_requests;
+    if (response.head.content_encoding != .identity and !throttled) return error.UnexpectedEncoding;
     var server_time: ?i64 = null;
     var headers = response.head.iterateHeaders();
     while (headers.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "date")) server_time = parseDate(header.value) catch return error.InvalidDate;
+        if (std.ascii.eqlIgnoreCase(header.name, "date")) server_time = parseDate(header.value) catch if (throttled) null else return error.InvalidDate;
     }
     var bytes: [8193]u8 = undefined;
     var transfer: [64]u8 = undefined;
-    const n = try response.reader(&transfer).readSliceShort(bytes[0 .. in.cap + 1]);
-    if (n > in.cap) return error.ResponseTooLarge;
+    var n: usize = 0;
+    if (response.head.content_encoding == .identity) n = try response.reader(&transfer).readSliceShort(bytes[0 .. in.cap + 1]);
+    if (n > in.cap) {
+        if (!throttled) return error.ResponseTooLarge;
+        n = 0;
+    }
     const output = try std.json.Stringify.valueAlloc(a, Response{ .status = @intFromEnum(response.head.status), .body = bytes[0..n], .server_time = server_time }, .{});
     try (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).writeAll(output);
 }
