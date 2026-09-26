@@ -271,12 +271,15 @@ def run():
             # even while a busy host keeps spooling more than a narrowed batch.
             stop_inflow = threading.Event()
 
+            inflowed = []
+
             def inflow():
-                n = 0
                 # Only the narrowing needs a busy host; siblings then drain.
-                while not stop_inflow.wait(.5) and not (box / "upload-refused.json.bad").exists():
-                    spool(f"upload-inflow-{n}.json", {**record("busy host"), "logs": [{**row, "unit": "inflow", "message": "busy host"}]})
-                    n += 1
+                while not (box / "upload-refused.json.bad").exists():
+                    inflowed.append(spool(f"upload-inflow-{len(inflowed)}.json",
+                                          {**record("busy host"), "logs": [{**row, "unit": "inflow", "message": "busy host"}]}))
+                    if stop_inflow.wait(.5):
+                        break
 
             batch = [spool("upload-refused.json", record("reject-me"))]
             batch += [spool(f"upload-sibling-{i}.json", record(f"accepted sibling {i}")) for i in range(7)]
@@ -289,6 +292,7 @@ def run():
                 filler.join()
             assert not errors, errors
             assert (box / "upload-refused.json.bad").exists()
+            assert len(inflowed) >= 20, "bisection never ran against steady inflow"
             assert not any((box / f"upload-sibling-{i}.json.bad").exists() for i in range(7))
             # One halving per round from the 100-row cap: at most 8 refusals.
             assert len(rejections) <= 8, rejections

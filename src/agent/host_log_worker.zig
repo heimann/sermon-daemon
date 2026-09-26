@@ -297,6 +297,7 @@ pub const Worker = struct {
         const batch = try self.collectUpload(a, box);
         var payload = batch.payload orelse {
             // No suspect is left to send: each was quarantined as poison or its file has gone.
+            std.debug.assert(batch.remaining.len == 0);
             if (self.suspects.len != 0) self.clearSuspects();
             return 10;
         };
