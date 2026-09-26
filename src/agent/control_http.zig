@@ -91,7 +91,7 @@ pub fn childMain() !void {
     var bytes: [8193]u8 = undefined;
     var transfer: [64]u8 = undefined;
     var n: usize = 0;
-    if (response.head.content_encoding == .identity) n = try response.reader(&transfer).readSliceShort(bytes[0 .. in.cap + 1]);
+    if (response.head.content_encoding == .identity) n = response.reader(&transfer).readSliceShort(bytes[0 .. in.cap + 1]) catch |err| if (throttled) 0 else return err;
     if (n > in.cap) {
         if (!throttled) return error.ResponseTooLarge;
         n = 0;
