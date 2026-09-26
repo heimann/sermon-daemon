@@ -18,4 +18,10 @@ if [[ ! -f "${DAEMON_ROOT}/lib/libduckdb.so" ]]; then
   exit 1
 fi
 
+attestation_help="$(gh attestation verify --help)"
+for required_flag in --repo --signer-workflow --source-ref --predicate-type --deny-self-hosted-runners; do
+  grep -Fq -- "${required_flag}" <<<"${attestation_help}"
+done
+"${SCRIPT_DIR}/test-install-attestation.sh"
+
 echo "daemon preflight ok"
