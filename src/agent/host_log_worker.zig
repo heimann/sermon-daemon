@@ -55,7 +55,10 @@ pub const Worker = struct {
     auth_failed: bool = false,
     auth_retry_at: i64 = 0,
     auth_backoff_s: u32 = auth_backoff_min_s,
-    upload_batch: usize = max_upload_batch,
+    /// Records of a refused batch, held by name while bisecting so records
+    /// spooled meanwhile cannot starve the search for the refused one.
+    suspects: []const []const u8 = &.{},
+    suspect_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     query_budget: QueryBudget = .{},
     poll_after_s: u32 = 10,
     last_skew_log: i64 = 0,
@@ -70,6 +73,7 @@ pub const Worker = struct {
         self.stop.store(true, .release);
         if (self.thread) |t| t.join();
         if (self.reloaded) |r| r.deinit();
+        self.suspect_arena.deinit();
     }
     fn run(self: *Worker) void {
         var box = outbox.Outbox.open(self.root, self.shared) catch |err| {
@@ -290,15 +294,50 @@ pub const Worker = struct {
         return res;
     }
     fn upload(self: *Worker, a: std.mem.Allocator, box: *outbox.Outbox) !u32 {
+        const batch = try self.collectUpload(a, box);
+        var payload = batch.payload orelse {
+            // No suspect is left to send: each was quarantined as poison or its file has gone.
+            if (self.suspects.len != 0) self.clearSuspects();
+            return 10;
+        };
+        try payload.object.put("logs", .{ .array = batch.rows });
+        try payload.object.put("daemon_version", .{ .string = build_options.version });
+        const body = try std.json.Stringify.valueAlloc(a, payload, .{});
+        const res = try self.post(a, "/api/ingest", body, 8192, null);
+        const outcome = classifyUpload(a, res, batch.rows.items.len);
+        try self.settleUpload(a, box, batch, outcome, res.status);
+        return switch (outcome) {
+            .delivered, .rejected => 10,
+            .unacknowledged => error.InvalidAck,
+            .other => responseDelay(a, res),
+        };
+    }
+    const UploadBatch = struct {
+        names: []const []const u8,
+        rows: std.array_list.Managed(std.json.Value),
+        payload: ?std.json.Value,
+        /// Suspects not sent in this batch.
+        remaining: []const []const u8,
+    };
+    fn collectUpload(self: *Worker, a: std.mem.Allocator, box: *outbox.Outbox) !UploadBatch {
+        const cap = if (self.suspects.len != 0) (self.suspects.len + 1) / 2 else max_upload_batch;
         var it = box.dir.iterate();
+        var next_suspect: usize = 0;
         var names = std.ArrayList([]const u8){};
         var poison = std.ArrayList([]const u8){};
         var rows = std.array_list.Managed(std.json.Value).init(a);
         var payload: ?std.json.Value = null;
         var input_bytes: usize = 0;
-        while (try it.next()) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, "upload-") or !std.mem.endsWith(u8, entry.name, ".json")) continue;
-            const name = try a.dupe(u8, entry.name);
+        while (rows.items.len < cap) {
+            const name = if (self.suspects.len != 0) suspect: {
+                if (next_suspect == self.suspects.len) break;
+                next_suspect += 1;
+                break :suspect self.suspects[next_suspect - 1];
+            } else scan: {
+                const entry = (try it.next()) orelse break;
+                if (!outbox.isLive(entry.name)) continue;
+                break :scan try a.dupe(u8, entry.name);
+            };
             const data = box.read(a, name, 128 * 1024) catch |err| switch (err) {
                 error.FileTooBig => {
                     try poison.append(a, name);
@@ -306,7 +345,10 @@ pub const Worker = struct {
                 },
                 else => return err,
             } orelse continue;
-            if (input_bytes + data.len > 2 * 1024 * 1024) break;
+            if (input_bytes + data.len > 2 * 1024 * 1024) {
+                if (self.suspects.len != 0) next_suspect -= 1;
+                break;
+            }
             const record = loadRecord(a, data) catch |err| switch (err) {
                 // Fail closed and retry: these say nothing about the record.
                 error.OutOfMemory, error.RedactionFailed => return err,
@@ -319,44 +361,53 @@ pub const Worker = struct {
             try names.append(a, name);
             if (payload == null) payload = record.payload;
             input_bytes += data.len;
-            if (rows.items.len >= self.upload_batch) break;
         }
         // After iteration: renames must not disturb the directory walk.
         for (poison.items) |name| {
             std.log.err("undeliverable upload record quarantined as {s}.bad; the retained local store still has the row", .{name});
             try box.quarantine(a, name);
         }
-        if (payload == null) return 10;
-        try payload.?.object.put("logs", .{ .array = rows });
-        try payload.?.object.put("daemon_version", .{ .string = build_options.version });
-        const body = try std.json.Stringify.valueAlloc(a, payload.?, .{});
-        const res = try self.post(a, "/api/ingest", body, 8192, null);
-        switch (classifyUpload(a, res, rows.items.len)) {
+        return .{ .names = names.items, .rows = rows, .payload = payload, .remaining = self.suspects[next_suspect..] };
+    }
+    /// Suspect names may live in the arena being replaced, so every use of
+    /// them in a settlement branch must precede setSuspects/clearSuspects.
+    fn settleUpload(self: *Worker, a: std.mem.Allocator, box: *outbox.Outbox, batch: UploadBatch, outcome: UploadOutcome, status: u16) !void {
+        switch (outcome) {
             .delivered => {
-                for (names.items) |name| try box.removeUpload(name);
-                // Stay narrow while isolating a refused row; widen once the
-                // backlog that contained it has drained.
-                if (names.items.len < self.upload_batch) self.upload_batch = max_upload_batch;
-                return 10;
+                for (batch.names) |name| try box.removeUpload(name);
+                if (self.suspects.len != 0) try self.setSuspects(batch.remaining);
             },
             // Hosted answered and will not take this batch as it stands, and
             // does not say which row. Replaying it duplicates the rows it did
             // accept, so bisect: halve until the refused record is alone, then
             // set only that record aside. Retries are bounded by log2(batch).
             .rejected => {
-                if (names.items.len == 1) {
-                    std.log.err("hosted refused upload record {s} (status {d}): quarantined", .{ names.items[0], res.status });
-                    try box.quarantine(a, names.items[0]);
-                    self.upload_batch = max_upload_batch;
+                if (batch.names.len == 1) {
+                    std.log.err("hosted refused upload record {s} (status {d}): quarantined", .{ batch.names[0], status });
+                    try box.quarantine(a, batch.names[0]);
+                    self.clearSuspects();
                 } else {
-                    std.log.warn("hosted refused part of a {d}-record upload (status {d}): retrying in smaller batches", .{ names.items.len, res.status });
-                    self.upload_batch = names.items.len / 2;
+                    std.log.warn("hosted refused part of a {d}-record upload (status {d}): retrying in smaller batches", .{ batch.names.len, status });
+                    try self.setSuspects(batch.names);
                 }
-                return 10;
             },
-            .unacknowledged => return error.InvalidAck,
-            .other => return responseDelay(a, res),
+            .unacknowledged, .other => {},
         }
+    }
+    fn setSuspects(self: *Worker, names: []const []const u8) !void {
+        if (names.len == 0) return self.clearSuspects();
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer arena.deinit();
+        const copy = try arena.allocator().alloc([]const u8, names.len);
+        for (names, copy) |name, *dest| dest.* = try arena.allocator().dupe(u8, name);
+        self.suspect_arena.deinit();
+        self.suspect_arena = arena;
+        self.suspects = copy;
+    }
+    fn clearSuspects(self: *Worker) void {
+        self.suspect_arena.deinit();
+        self.suspect_arena = .init(std.heap.page_allocator);
+        self.suspects = &.{};
     }
     fn telemetry(self: *Worker, a: std.mem.Allocator, box: *outbox.Outbox) !u32 {
         const body = (try box.read(a, "telemetry.json", 2 * 1024 * 1024)) orelse return 10;
@@ -646,6 +697,48 @@ test "upload acknowledgment separates delivered, refused and pre-acknowledgment 
     try t.expectEqual(UploadOutcome.unacknowledged, classifyUpload(a, .{ .status = 200, .body = "<html>" }, 2));
     try t.expectEqual(UploadOutcome.other, classifyUpload(a, .{ .status = 503, .body = "{}" }, 2));
     try t.expectEqual(UploadOutcome.other, classifyUpload(a, .{ .status = 401, .body = "{}" }, 2));
+}
+
+test "bisection isolates a refused record while new records keep arriving" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+    var shared = outbox.Shared{};
+    var box = try outbox.Outbox.open(root, &shared);
+    defer box.close();
+    try box.bind(a, "https://example.invalid", "fixture-key");
+    var w = Worker{ .root = root, .origin = "https://example.invalid", .key = "fixture-key", .shared = &shared };
+    defer w.deinit();
+    const row = "{{\"collected_at\":1,\"logs\":[{{\"timestamp\":1,\"source\":\"systemd\",\"unit\":null,\"identifier\":null,\"systemd_unit\":null,\"priority\":3,\"message\":\"{s}\",\"pid\":null,\"trace_id\":null}}]}}";
+    var buf: [512]u8 = undefined;
+    for (0..99) |_| try box.enqueue(try std.fmt.bufPrint(&buf, row, .{"accepted"}));
+    try box.enqueue(try std.fmt.bufPrint(&buf, row, .{"reject-me"}));
+
+    var rejections: usize = 0;
+    var rounds: usize = 0;
+    const isolated = while (rounds < 64) : (rounds += 1) {
+        // A busy journal spools more records per round than a narrowed batch
+        // carries; the search must still converge.
+        for (0..3) |_| try box.enqueue(try std.fmt.bufPrint(&buf, row, .{"arrived later"}));
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const batch = try w.collectUpload(arena.allocator(), &box);
+        try std.testing.expect(batch.payload != null);
+        var refused = false;
+        for (batch.rows.items) |r| refused = refused or std.mem.eql(u8, r.object.get("message").?.string, "reject-me");
+        // Quarantine of the isolated record logs at error level, which fails
+        // a Zig test; the protocol fixture covers that step.
+        if (refused and batch.names.len == 1) break true;
+        try w.settleUpload(arena.allocator(), &box, batch, if (refused) .rejected else .delivered, if (refused) 422 else 200);
+        if (refused) rejections += 1;
+    } else false;
+    try std.testing.expect(isolated);
+    // One halving per round: 100, 50, 25, 13, 7, 4, 2, then the record alone,
+    // plus at most one earlier scan batch that did not contain it.
+    try std.testing.expect(rejections <= 7);
+    try std.testing.expect(rounds <= 8);
 }
 
 test "rejected key backs off slowly and recovers without a restart" {

@@ -255,8 +255,9 @@ an upload record. A 2xx without both counters (a hosted build that predates
 them) leaves records pending. When hosted explicitly refuses part of a batch
 (counters disagree, or 400/413/422), the daemon halves the batch until the
 refused record is alone and quarantines only that record, instead of replaying
-rows hosted already accepted. Lost acknowledgments can produce duplicates: delivery is
-at-least-once, not exactly-once. Logs-only batches carry the collection-time
+rows hosted already accepted. The search stays within the refused batch, so
+records spooled meanwhile wait rather than starve it. Lost acknowledgments can
+produce duplicates: delivery is at-least-once, not exactly-once. Logs-only batches carry the collection-time
 metrics from their first record; ordinary metric delivery continues separately.
 Ordinary telemetry uses one replaceable 2 MiB slot on the same outbound worker,
 so HTTPS cannot block the collector. Unlike protected logs, intermediate metric
