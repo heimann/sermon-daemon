@@ -141,11 +141,19 @@ esac
 
 need_cmd curl
 need_cmd gh
+need_cmd grep
 need_cmd tar
 need_cmd sha256sum
 need_cmd sed
 need_cmd awk
 need_cmd systemctl
+
+gh_attestation_help="$(gh attestation verify --help 2>/dev/null)" ||
+  fail "GitHub CLI does not support 'gh attestation verify'; install a recent gh release"
+for required_flag in --repo --signer-workflow --source-ref --predicate-type --deny-self-hosted-runners; do
+  grep -Fq -- "${required_flag}" <<<"${gh_attestation_help}" ||
+    fail "GitHub CLI attestation verifier does not support ${required_flag}; install a recent gh release"
+done
 
 if [[ "$(id -u)" == "0" ]]; then
   ROOT_INSTALL=1
@@ -168,7 +176,6 @@ else
 fi
 
 if [[ -z "${VERSION}" ]]; then
-  need_cmd grep
   latest_json="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest")"
   VERSION="$(printf '%s\n' "${latest_json}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
   [[ -n "${VERSION}" ]] || fail "could not resolve latest release version"

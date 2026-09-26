@@ -25,6 +25,8 @@ The installer fails closed unless the downloaded archive has GitHub/Sigstore
 build provenance from this repository's release workflow, the requested tag,
 and a GitHub-hosted runner. A custom `--release-base-url` mirror must therefore
 serve the exact archive published by the corresponding GitHub release.
+This prevents artifact or mirror substitution. Repository workflow writers
+remain trusted and can produce valid attestations for builds they authorize.
 
 Standalone local-only install:
 

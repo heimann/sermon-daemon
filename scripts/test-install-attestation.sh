@@ -34,6 +34,13 @@ tar -czf "${archives}/${archive}" -C "${work}/package" "$(basename "${package}")
 cat > "${fake_bin}/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "$*" == "attestation verify --help" ]]; then
+  if [[ "${SERMON_TEST_GH_HELP:-supported}" == supported ]]; then
+    printf '%s\n' --repo --signer-workflow --source-ref --predicate-type --deny-self-hosted-runners
+    exit 0
+  fi
+  exit 1
+fi
 printf '%s\n' "$@" > "${SERMON_TEST_GH_ARGS:?}"
 [[ "${SERMON_TEST_GH_RESULT:-fail}" == pass ]]
 EOF
@@ -68,6 +75,16 @@ common_args=(
 
 mkdir -p "${install_dir}/bin"
 printf 'original install\n' > "${install_dir}/bin/sentinel"
+
+if HOME="${work}/home" PATH="${fake_bin}:${PATH}" \
+  SERMON_TEST_GH_ARGS="${gh_args}" SERMON_TEST_GH_HELP=unsupported \
+  bash "${repo}/install.sh" "${common_args[@]}" >/dev/null 2>&1; then
+  echo "installer accepted a GitHub CLI without attestation verification support" >&2
+  exit 1
+fi
+
+test -f "${install_dir}/bin/sentinel"
+test ! -e "${gh_args}"
 
 if HOME="${work}/home" PATH="${fake_bin}:${PATH}" \
   SERMON_TEST_GH_ARGS="${gh_args}" SERMON_TEST_GH_RESULT=fail \
