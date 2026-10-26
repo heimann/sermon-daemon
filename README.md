@@ -37,8 +37,10 @@ including when selected as `latest`; there is no verification bypass. Mirrors
 still require access to GitHub's attestation service and a usable local GitHub
 CLI authentication setup. Checksum, provenance and package-root verification
 finish before replacement or service changes. Concurrent installs targeting the
-same canonical install directory fail immediately while its transaction lock
-is held; retry after the other installer exits. The `.lock` file is retained.
+same canonical install directory fail nonblockingly at lock acquisition after
+verification; retry after the other installer exits. The `.lock` file is
+retained. Install only into a trusted directory whose parent other users cannot
+modify; the lock does not defend against hostile local filesystem changes.
 
 For a disposable installer control-flow test from a source checkout, run
 `bash scripts/test-install-attestation.sh`. It stubs `gh`, systemd and installed

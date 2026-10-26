@@ -230,7 +230,7 @@ tar -tzf "${tmpdir}/${ARCHIVE}" |
 # Canonicalization makes equivalent destination spellings share the same lock.
 INSTALL_DIR="$(realpath -m -- "${INSTALL_DIR}")"
 mkdir -p "$(dirname "${INSTALL_DIR}")"
-exec 9>"${INSTALL_DIR}.lock"
+exec 9>>"${INSTALL_DIR}.lock"
 flock -n 9 || fail "another installation is already using ${INSTALL_DIR}"
 
 new_dir="${INSTALL_DIR}.new"

@@ -175,9 +175,18 @@ cp "${work}/valid.sha256" "${archives}/${archive}.sha256"
 
 # Hold the same transaction lock as a concurrent installer, without timing or
 # sleeps. The contender must fail rather than touch shared .new/.old trees.
-exec 9>"${install_dir}.lock"
+mkdir -p "${install_dir}.new" "${install_dir}.old"
+printf 'staging\n' > "${install_dir}.new/sentinel"
+printf 'rollback\n' > "${install_dir}.old/sentinel"
+# Opening a preexisting lock must not truncate data, even through a symlink.
+printf 'lock target\n' > "${work}/lock-target"
+ln -s "${work}/lock-target" "${install_dir}.lock"
+exec 9>>"${install_dir}.lock"
 flock -n 9
 reject_install 'a concurrent installation'
+test "$(cat "${work}/lock-target")" = 'lock target'
+test "$(cat "${install_dir}.new/sentinel")" = staging
+test "$(cat "${install_dir}.old/sentinel")" = rollback
 flock -u 9
 exec 9>&-
 
