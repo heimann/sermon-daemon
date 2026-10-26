@@ -34,6 +34,9 @@ jobs:
       - name: Unit tests
         run: LD_LIBRARY_PATH=lib zig build test
 
+      - name: Journal initialization failure fixture
+        run: python3 scripts/test-journal-lifecycle.py
+
       - name: Resource benchmark
         run: LD_LIBRARY_PATH=lib zig build bench
 

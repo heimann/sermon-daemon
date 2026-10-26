@@ -655,6 +655,7 @@ pub fn main() !void {
             // per log entry mirrors the old per-entry insertLog), but they all
             // sit inside this one begin/end bracket and share one fdatasync.
             if (log_tailer) |*lt| {
+                lt.beginCollectionCycle();
                 cycle_upload_drops = 0;
                 var log_count: u32 = 0;
                 while (log_count < 1000) : (log_count += 1) {

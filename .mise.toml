@@ -28,5 +28,6 @@ run = [
   "./scripts/preflight.sh",
   "zig build",
   "LD_LIBRARY_PATH=lib zig build test",
+  "python3 scripts/test-journal-lifecycle.py",
   "LD_LIBRARY_PATH=lib zig build bench",
 ]
