@@ -286,6 +286,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const output_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/output.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    output_test_mod.addImport("collector", collector_mod);
+    output_test_mod.addImport("logs", logs_mod);
+    const output_tests = b.addTest(.{ .root_module = output_test_mod });
+
     // ── Parquet hot tier (plan 25): test targets ──
     // staging_mod, roll_mod, and parquet_query_mod are declared up top (shared
     // with the daemon and CLI). Their test targets live here.
@@ -314,6 +324,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(push_tests).step);
     test_step.dependOn(&b.addRunArtifact(proc_self_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxmox_tests).step);
+    test_step.dependOn(&b.addRunArtifact(output_tests).step);
     test_step.dependOn(&b.addRunArtifact(staging_tests).step);
     test_step.dependOn(&b.addRunArtifact(roll_tests).step);
     test_step.dependOn(&b.addRunArtifact(parquet_query_tests).step);
