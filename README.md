@@ -219,7 +219,10 @@ One outbound worker polls every 10 seconds ±20% (or the hosted
 `poll_after_seconds`, accepted only within 5-300 seconds), independently of
 ordinary telemetry. HTTPS certificate/hostname verification remains enabled; redirects
 are forbidden. HTTP operations have five-second deadlines and bounded bodies.
-The worker honors rate-limit delays, backs off on disconnect/5xx, disables claims
+The worker honors rate-limit delays per hosted bucket (a 429 on `/api/ingest`
+does not pause claims, and vice versa), with a base delay clamped to 60-300
+seconds; a missing or malformed retry value defaults to 60 seconds. Scheduling
+may add positive jitter. It backs off on disconnect/5xx and disables claims
 for five minutes on unsupported endpoints. After a 401 it logs once, pauses
 claims and log uploads on a backoff from 5 minutes up to 1 hour, and re-reads
 `server_url`/`api_key` from the config file before each retry (credentials given

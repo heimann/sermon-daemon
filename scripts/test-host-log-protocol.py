@@ -143,6 +143,8 @@ def run():
         claim_calls = []
         telemetry_failures = []
         rejections = []
+        throttled = []
+        throttle = {"ingest": False}
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -170,6 +172,16 @@ def run():
                             return  # hosted accepted; acknowledgment lost
                         assert raw == completions[0], "completion replay changed bytes"
                         response = {"status": "completed", "accepted": False}
+                    elif throttle["ingest"]:
+                        throttled.append(time.monotonic())
+                        # A proxy-style HTML page over the 8 KiB cap: no usable
+                        # retry value, yet the ingest bucket must still pause.
+                        encoded = b"<html>" + b"Too Many Requests " * 600 + b"</html>"
+                        self.send_response(429)
+                        self.send_header("Content-Length", str(len(encoded)))
+                        self.end_headers()
+                        self.wfile.write(encoded)
+                        return
                     else:
                         logs = body.get("logs", [])
                         if logs:
@@ -269,9 +281,23 @@ def run():
             assert rejections[-1] == 1 and len(rejections) <= 4, rejections
             delivered = sum(uploads)
             spool("upload-good-after-refusal.json", record("good row"))
-            wait_for(lambda: not list(box.glob("upload-*.json")) or errors)
+            wait_for(lambda: not (box / "upload-good-after-refusal.json").exists() or errors)
+            assert not errors, errors
             assert sum(uploads) >= delivered + 1 and process.poll() is None
             print("PASS refused row isolated by bisection and quarantined alone; siblings and later uploads delivered")
+
+            # Hosted throttles /api/ingest. Claims use a separate hosted bucket
+            # and keep polling; neither upload nor telemetry retries early.
+            throttle["ingest"] = True
+            spool("upload-throttled.json", record("throttled row"))
+            wait_for(lambda: throttled or errors)
+            polled = len(claim_calls)
+            wait_for(lambda: len(claim_calls) >= polled + 2 or errors)
+            assert not errors, errors
+            assert len(throttled) == 1, throttled
+            assert (box / "upload-throttled.json").exists()
+            assert process.poll() is None
+            print("PASS oversized ingest 429: two further claims, no additional ingest request; upload remains queued")
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()
