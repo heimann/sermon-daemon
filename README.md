@@ -19,14 +19,31 @@ Remote push includes daemon version, host metrics, disks, top processes by CPU, 
 
 ## Install
 
-Installation requires `curl`, `tar`, `sha256sum`, systemd, and a recent
-[GitHub CLI](https://cli.github.com/) with `gh attestation verify` support.
+Installation requires `curl`, `tar`, `sha256sum`, `realpath`, `flock`, systemd,
+and a recent [GitHub CLI](https://cli.github.com/) whose `gh attestation verify`
+supports `--repo`, `--signer-workflow`, `--source-ref`, `--predicate-type`,
+and `--deny-self-hosted-runners`. The installer checks these capabilities.
 The installer fails closed unless the downloaded archive has GitHub/Sigstore
 build provenance from this repository's release workflow, the requested tag,
-and a GitHub-hosted runner. A custom `--release-base-url` mirror must therefore
-serve the exact archive published by the corresponding GitHub release.
-This prevents artifact or mirror substitution. Repository workflow writers
-remain trusted and can produce valid attestations for builds they authorize.
+and a GitHub-hosted attestation runner. A custom `--release-base-url` mirror
+must serve an archive with matching provenance and the requested platform's
+package root. This rejects substitutions without matching provenance; it does
+not check release-asset membership or pin an immutable source commit.
+Repository workflow writers remain trusted and can produce valid attestations
+for builds they authorize. The installer script itself must also be trusted.
+
+Legacy releases and local builds without matching attestations are rejected,
+including when selected as `latest`; there is no verification bypass. Mirrors
+still require access to GitHub's attestation service and a usable local GitHub
+CLI authentication setup. Checksum, provenance and package-root verification
+finish before replacement or service changes. Concurrent installs targeting the
+same canonical install directory fail immediately while its transaction lock
+is held; retry after the other installer exits. The `.lock` file is retained.
+
+For a disposable installer control-flow test from a source checkout, run
+`bash scripts/test-install-attestation.sh`. It stubs `gh`, systemd and installed
+binaries: it tests policy arguments and refusal/replacement behavior, not real
+cryptographic attestation verification or a live service install.
 
 Standalone local-only install:
 
