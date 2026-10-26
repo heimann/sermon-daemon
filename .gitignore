@@ -19,3 +19,6 @@ test_io
 
 # Local worktrees
 .worktrees/
+
+# Amp orb portal registrations
+.amp/portals/*
