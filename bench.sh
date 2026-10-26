@@ -5,13 +5,30 @@ set -euo pipefail
 MAX_RSS_KB=98304  # 96MB (bumped from 50MB - very conservative; baseline already sat at 50.4MB)
 MAX_CPU=2.0       # percent (averaged over run)
 DURATION=35       # seconds (3+ collection cycles at 10s interval)
-DB="/tmp/sermon-bench-$$.db"
+# The daemon stores tables and its roll lock in the DB path's parent directory.
+# A unique filename in /tmp does not isolate a benchmark from other daemons.
+WORK_DIR=$(mktemp -d /tmp/sermon-bench.XXXXXXXX)
+DB="$WORK_DIR/metrics.db"
+PID=""
 
-cleanup() { kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -f "$DB"; }
+cleanup() {
+    local status=$? child_status=0
+    if [[ -n "$PID" ]]; then
+        kill "$PID" 2>/dev/null || true
+        wait "$PID" 2>/dev/null || child_status=$?
+        if (( status == 0 )); then status=$child_status; fi
+    fi
+    if ! rm -rf "$WORK_DIR"; then
+        if (( status == 0 )); then status=1; fi
+    fi
+    exit "$status"
+}
 trap cleanup EXIT
 
+# Use daemon defaults, not the invoking user's optional remote/storage config.
+printf '{}\n' > "$WORK_DIR/config.json"
 echo "Starting agent (${DURATION}s measurement)..."
-LD_LIBRARY_PATH=lib ./zig-out/bin/sermon-agent --db "$DB" --interval 10 &
+LD_LIBRARY_PATH=lib ./zig-out/bin/sermon-agent --config "$WORK_DIR/config.json" --db "$DB" --interval 10 &
 PID=$!
 sleep "$DURATION"
 
