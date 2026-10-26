@@ -6,8 +6,8 @@
 //! exposure but is not a proof that arbitrary free-form PII has been removed.
 //!
 //! Design constraints (PRAGMATIC-MINIMAL):
-//!   * Only the highest-PII free-text fields are scanned: LogEntry.message,
-//!     LogEntry.source, DiskInfo.mount_point, ProcessInfo.cgroup. Everything
+//!   * Selected free-text fields are scanned: LogEntry.message, LogEntry.source,
+//!     DiskInfo.mount_point, ProcessInfo.cgroup/cmdline, and container name/node. Everything
 //!     else (process name, units, identifiers, ALL numerics) is preserved -
 //!     it is operational signal the anomaly engine needs.
 //!   * No regex (Zig stdlib has none). Every rule is a hand-written byte
@@ -42,10 +42,8 @@ const DiskInfo = collector.DiskInfo;
 const LogEntry = logs.LogEntry;
 const ContainerEntry = proxmox.ContainerEntry;
 
-/// Optional NER backend. The interface is pure (ner.zig links nothing); the
-/// concrete model-backed backend lives in ner_pf.zig and is constructed in
-/// main.zig. A null `Ner` means deterministic-scanners-only - the daemon
-/// degrades to that whenever NER is disabled or the model is absent.
+/// Optional backend-agnostic NER interface (ner.zig links nothing). This build
+/// passes null in production and uses deterministic scanning only.
 const Ner = ner.Ner;
 const Kind = ner.Kind;
 
@@ -635,6 +633,34 @@ fn valueMatch(s: []const u8, start: usize, tag: Tag) ?Match {
     return .{ .start = value_start, .end = end, .tag = tag };
 }
 
+/// A flag's value is one shell-like word, not a comma-delimited log token.
+/// Handle adjacent quoted segments and escaped separators without evaluating
+/// expansions or substitutions. Preserve quotes only around a single segment.
+fn flagValueMatch(s: []const u8, start: usize) ?Match {
+    var end = start;
+    var quote: u8 = 0;
+    var first_quote_end: ?usize = null;
+    while (end < s.len) : (end += 1) {
+        const c = s[end];
+        if (c == '\\' and quote != '\'' and end + 1 < s.len) {
+            end += 1;
+        } else if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+                if (first_quote_end == null) first_quote_end = end;
+            }
+        } else if (c == '"' or c == '\'') {
+            quote = c;
+        } else if (std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&') {
+            break;
+        }
+    }
+    if (end == start) return null;
+    const wrapped = (s[start] == '"' or s[start] == '\'') and first_quote_end == end - 1;
+    if (wrapped and end - start == 2) return null;
+    return .{ .start = start + @intFromBool(wrapped), .end = end - @intFromBool(wrapped), .tag = .value };
+}
+
 fn isAuthorizationScheme(value: []const u8) bool {
     const schemes = [_][]const u8{ "bearer", "basic", "token", "negotiate", "digest", "apikey", "aws4-hmac-sha256", "hawk", "oauth", "signature" };
     for (schemes) |scheme| if (eqIgnoreCaseSlice(value, scheme)) return true;
@@ -676,17 +702,23 @@ fn scanAuthorization(s: []const u8, sep: usize) ?Match {
     while (credential_start < s.len and isHorizontalSpace(s[credential_start])) credential_start += 1;
     const has_scheme = credential_start > scheme_end;
 
-    // A header without a separate scheme is still credential-bearing, unless
-    // it contains only a known scheme and therefore carries no credential.
-    if (credential_start == scheme_end) {
-        if (isAuthorizationScheme(s[value_start..scheme_end])) return null;
+    // Only recognized schemes are safe to preserve. An unknown first word
+    // may itself be a provider token or opaque credential followed by log
+    // context; skipping it would also bypass the standalone token scanners.
+    if (!isAuthorizationScheme(s[value_start..scheme_end])) {
         credential_start = value_start;
-    }
+    } else if (!has_scheme) return null;
     if (credential_start >= s.len or (quote != 0 and s[credential_start] == quote)) return null;
     // Known token schemes carry one opaque token. Any other explicit scheme is
     // conservatively treated as auth-param syntax so an unknown future scheme
     // cannot leak secrets after its first comma.
     const parameterized = has_scheme and !isSingleTokenAuthorizationScheme(s[value_start..scheme_end]);
+    // Logs may quote just the token instead of the whole header. Use the same
+    // escape-aware value scanner as key/value and flag credentials, otherwise
+    // whitespace inside that quote would expose the rest of the credential.
+    if (quote == 0 and !parameterized and (s[credential_start] == '"' or s[credential_start] == '\'')) {
+        return valueMatch(s, credential_start, .token);
+    }
     var credential_end = credential_start;
     while (credential_end < s.len) : (credential_end += 1) {
         const c = s[credential_end];
@@ -697,6 +729,7 @@ fn scanAuthorization(s: []const u8, sep: usize) ?Match {
         if ((quote != 0 and c == quote) or (quote == 0 and (c == '\n' or c == '\r'))) break;
         if (!parameterized and quote == 0 and (isHorizontalSpace(c) or c == ',' or c == ';')) break;
     }
+    while (credential_end > credential_start and isHorizontalSpace(s[credential_end - 1])) credential_end -= 1;
     if (credential_end == credential_start) return null;
     return .{ .start = credential_start, .end = credential_end, .tag = .token };
 }
@@ -724,7 +757,8 @@ fn scanUriUserinfo(s: []const u8, start: usize) ?Match {
 }
 
 fn isAuthorityTerminator(c: u8) bool {
-    return c == '/' or c == '?' or c == '#' or c == '"' or c == '\'' or
+    // Apostrophes are legal URI sub-delimiters, including in userinfo.
+    return c == '/' or c == '?' or c == '#' or c == '"' or
         c == '\n' or c == '\r' or isHorizontalSpace(c);
 }
 
@@ -736,10 +770,16 @@ fn scanStructured(s: []const u8, i: usize) ?Match {
 
     if ((s[i] == '=' or s[i] == ':') and i > 0) {
         if (scanAuthorization(s, i)) |m| return m;
-        if (matchSensitiveKey(s, i)) |_| {
+        if (matchSensitiveKey(s, i)) |key_len| {
             var value_start = i + 1;
             while (value_start < s.len and isHorizontalSpace(s[value_start])) value_start += 1;
-            if (value_start < s.len) return valueMatch(s, value_start, .value);
+            if (value_start < s.len) {
+                const key_start = i - key_len;
+                if (s[i] == '=' and key_start >= 2 and std.mem.eql(u8, s[key_start - 2 .. key_start], "--")) {
+                    return flagValueMatch(s, value_start);
+                }
+                return valueMatch(s, value_start, .value);
+            }
         }
     }
 
@@ -748,11 +788,12 @@ fn scanStructured(s: []const u8, i: usize) ?Match {
         var value_start = i;
         while (value_start < s.len and isHorizontalSpace(s[value_start])) value_start += 1;
         if (value_start >= s.len or s[value_start] == '=' or s[value_start] == ':') return null;
-        const quoted = s[value_start] == '"' or s[value_start] == '\'';
-        const m = valueMatch(s, value_start, .value) orelse return null;
         const key_start = i - key_len;
         const flag = key_start >= 2 and s[key_start - 2] == '-' and s[key_start - 1] == '-';
-        if (!quoted and !flag and !looksLikeBareCredential(s[m.start..m.end])) return null;
+        if (flag) return flagValueMatch(s, value_start);
+        const quoted = s[value_start] == '"' or s[value_start] == '\'';
+        const m = valueMatch(s, value_start, .value) orelse return null;
+        if (!quoted and !looksLikeBareCredential(s[m.start..m.end])) return null;
         return m;
     }
     return null;
@@ -962,7 +1003,7 @@ fn clipAndAppend(
 /// Merge rule (DETERMINISTIC-WINS, structural - not sort-order-dependent):
 ///   1. Every deterministic span is kept. They are non-overlapping among
 ///      themselves by construction (collectDeterministic walks left-to-right
-///      and advances past each match), and they are the 100%-recall floor the
+///      and advances past each match), and they are the corpus-covered floor the
 ///      daemon must never regress. A loose NER span that overlaps a structured
 ///      secret (e.g. an over-extended address span swallowing the start of an
 ///      AKIA key) must NOT suppress that secret's redaction.
@@ -1170,9 +1211,9 @@ pub fn redactLogs(allocator: Allocator, entries: []LogEntry, maybe_ner: ?Ner) ne
 /// Redact a single ProcessInfo: cgroup (path redaction, keep unit suffix) and
 /// cmdline (full PII/secret scrub + optional NER). name / unit / username /
 /// numerics are preserved (see field policy) - the process NAME is the anomaly
-/// signal. cmdline is omitted from the remote push (push.zig) but is still
-/// written to local parquet staging, so we scrub it here too: on-disk history
-/// never holds a raw token/password even though it never leaves the box.
+/// signal. cmdline is omitted from remote push but retained locally. When local
+/// redaction is enabled, recognized patterns are scrubbed before persistence;
+/// local history is raw by default.
 /// `maybe_ner` null => deterministic-only.
 pub fn redactProcess(allocator: Allocator, proc: *ProcessInfo, maybe_ner: ?Ner) ner.Error!void {
     try redactCgroup(allocator, &proc.cgroup);
@@ -1224,6 +1265,13 @@ fn expectRedact(src: []const u8, want: []const u8) !void {
     const got = try redactText(testing.allocator, src);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(want, got);
+    // An active backend with no extra spans also exercises backend invocation.
+    // Neither it nor inference failure may weaken deterministic coverage or
+    // change negative controls.
+    var stub = StubNer{ .spans = &.{} };
+    try expectMerged(src, null, want);
+    try expectMerged(src, stub.asNer(), want);
+    try expectMerged(src, FailingNer.asNer(), want);
 }
 
 test "ipv4 in a brute-force line keeps shape" {
@@ -1349,6 +1397,38 @@ test "adversarial credential forms redact without destroying log context" {
             .expected = "HTTP_AUTHORIZATION=Bearer <REDACTED:TOKEN>, route=/health",
         },
         .{
+            .input = "Authorization: Bearer 'opaque secret', route=/health",
+            .expected = "Authorization: Bearer '<REDACTED:TOKEN>', route=/health",
+        },
+        .{
+            .input = "Authorization: Basic \"opaque\\\" secret\"; route=/health",
+            .expected = "Authorization: Basic \"<REDACTED:TOKEN>\"; route=/health",
+        },
+        .{
+            .input = "Authorization: opaque-credential \t",
+            .expected = "Authorization: <REDACTED:TOKEN> \t",
+        },
+        .{
+            .input = "Authorization: ghp_0123456789abcdefghijklmnopqrstuvwx status=401",
+            .expected = "Authorization: <REDACTED:TOKEN>",
+        },
+        .{
+            .input = "Authorization: Custom credential=fixture, signature=opaque",
+            .expected = "Authorization: <REDACTED:TOKEN>",
+        },
+        .{
+            .input = "{\"Authorization\":\"opaque-credential \t\"}",
+            .expected = "{\"Authorization\":\"<REDACTED:TOKEN> \t\"}",
+        },
+        .{
+            .input = "connect postgres://alice:hun'ter2@db/app",
+            .expected = "connect postgres://<REDACTED:VALUE>@db/app",
+        },
+        .{
+            .input = "connect 'postgres://alice:fixture@db/app' failed",
+            .expected = "connect 'postgres://<REDACTED:VALUE>@db/app' failed",
+        },
+        .{
             .input = "{\"password\":\"abc\\\"def\"}",
             .expected = "{\"password\":\"<REDACTED:VALUE>\"}",
         },
@@ -1359,6 +1439,30 @@ test "adversarial credential forms redact without destroying log context" {
         .{
             .input = "exec --ToKeN 'short value' --mode check",
             .expected = "exec --ToKeN '<REDACTED:VALUE>' --mode check",
+        },
+        .{
+            .input = "exec --token alpha,beta --mode check",
+            .expected = "exec --token <REDACTED:VALUE> --mode check",
+        },
+        .{
+            .input = "exec --token=alpha,beta --mode check",
+            .expected = "exec --token=<REDACTED:VALUE> --mode check",
+        },
+        .{
+            .input = "exec --token \"alpha\"beta --mode check",
+            .expected = "exec --token <REDACTED:VALUE> --mode check",
+        },
+        .{
+            .input = "exec --token alpha\\ beta --mode check",
+            .expected = "exec --token <REDACTED:VALUE> --mode check",
+        },
+        .{
+            .input = "exec --token 'alpha\\'beta --mode check",
+            .expected = "exec --token <REDACTED:VALUE> --mode check",
+        },
+        .{
+            .input = "exec --token 'alpha,beta' ; echo done",
+            .expected = "exec --token '<REDACTED:VALUE>' ; echo done",
         },
         .{
             .input = "connect postgres://alice:hunter2@db.internal:5432/app?ssl=true",
@@ -1393,6 +1497,10 @@ test "credential scanner preserves ambiguous prose and invalid boundaries" {
         "mypassword hunter2",
         "passwordless login enabled",
         "Authorization: Bearer",
+        "Authorization: Bearer \t",
+        "{\"Authorization\":\"Bearer \t\"}",
+        "'https://example.com/path' operator",
+        "exec --token '' --mode check",
         "ghp_short",
         "sk-short",
         "https://example.com/path@operator",
@@ -1582,7 +1690,7 @@ test "record count and structure invariant: in-place replace preserves slice" {
 
 test "process named xmrig is not redacted (name/username/numerics preserved)" {
     // A miner named like a real attacker payload must keep its name intact -
-    // the anomaly engine matches on it. redactProcess only touches cgroup.
+    // the anomaly engine matches on it. redactProcess preserves process names.
     var proc = ProcessInfo{
         .pid = 4242,
         .name = try testing.allocator.dupe(u8, "xmrig"),
@@ -1671,8 +1779,8 @@ test "redaction never touches numeric fields (process + disk invariant)" {
 // ============================================================================
 // NER merge tests. These use a STUB backend implementing the same ner.Ner
 // vtable (no model, no .so), so they run in CI unconditionally and lock the
-// tie-break rules that protect deterministic-secret recall. The model-backed
-// end-to-end path is exercised separately in ner_pf.zig (gated on the model).
+// tie-break rules that protect deterministic-secret recall. These tests do not
+// exercise model inference.
 // ============================================================================
 
 /// Test-only NER backend returning a fixed span set. Mirrors the production
@@ -1737,7 +1845,7 @@ test "merged: null ner is byte-identical to deterministic-only" {
     try expectMerged("token=\"abc.def\" end", null, "token=\"<REDACTED:VALUE>\" end");
 }
 
-test "merged END-TO-END: NER (person+address) AND scanners (email+AKIA) compose" {
+test "merged: stub NER (person+address) and scanners (email+AKIA) compose" {
     // The canonical regression: the model contributes person + address spans,
     // the deterministic scanners contribute the email + AWS key, all in ONE
     // merged pass. This runs in CI always (stub backend, no model).

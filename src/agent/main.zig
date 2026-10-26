@@ -72,7 +72,8 @@ const Config = struct {
     // default_roll_interval_s.
     roll_interval_s: ?u64 = null,
     // PII redaction scope. The remote push always passes through the best-effort
-    // deterministic redactor. This knob only controls the LOCAL parquet store:
+    // deterministic redactor. This knob controls redaction before local
+    // persistence, including upload spools:
     //   false (default): the local store keeps RAW data at full fidelity, so
     //     on-box `sermon query` / diagnosis sees real IPs, cmdlines, names. The
     //     raw is already on the box anyway (journald, /proc), so this is the
@@ -677,7 +678,7 @@ pub fn main() !void {
                             continue;
                         };
                     }
-                    // Offer the raw row to the private upload spool; the worker
+                    // Offer the row (raw by default) to the private upload spool; the worker
                     // redacts before upload, including retries after a restart.
                     // Staging below is the durable copy and never waits on this.
                     if (remote and entry.message.len != 0 and push_mod.pushEligible(entry, rule_set)) offer: {
@@ -800,7 +801,7 @@ pub fn main() !void {
                     // ── EDGE PII REDACTION (push side) ──
                     // When the local store was NOT pre-redacted (the default), run
                     // the same best-effort pattern redactor over outbound fields now.
-                    // On an allocation/inference failure, SKIP the push rather than
+                    // On a redaction allocation failure, SKIP the push rather than
                     // bypassing the redactor; unmatched free-form PII remains a
                     // documented limitation of deterministic scanning.
                     if (!redact_local_store) {
