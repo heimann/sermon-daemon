@@ -37,8 +37,17 @@ pub fn post(a: std.mem.Allocator, origin: []const u8, key: []const u8, path: []c
     const output = try child.stdout.?.readToEndAlloc(a, 64 * 1024);
     defer a.free(output);
     const term = try child.wait();
-    if (term != .Exited or term.Exited != 0) return error.HttpFailed;
-    const parsed = try std.json.parseFromSlice(Response, a, output, .{});
+    const throttled = std.mem.startsWith(u8, output, "429\n");
+    // Only the verified child's observed status can authorize this fallback.
+    // Its body/header read may fail or hit the process deadline afterwards.
+    if (term != .Exited or term.Exited != 0) {
+        if (throttled) return .{ .status = 429, .body = "" };
+        return error.HttpFailed;
+    }
+    const parsed = std.json.parseFromSlice(Response, a, if (throttled) output[4..] else output, .{}) catch |err| {
+        if (throttled) return .{ .status = 429, .body = "" };
+        return err;
+    };
     defer parsed.deinit();
     return .{ .status = parsed.value.status, .body = try a.dupe(u8, parsed.value.body), .server_time = parsed.value.server_time };
 }
@@ -78,9 +87,19 @@ pub fn childMain() !void {
     try body.writer.writeAll(in.body);
     try body.end();
     try req.connection.?.flush();
-    var response = try req.receiveHead(&.{});
-    // A throttling answer must reach the worker even when its body or headers
-    // are unusable (e.g. a proxy's HTML page), so its bucket still pauses.
+    // Observe only a complete HTTP status line on the verified connection,
+    // before parsing optional headers or reading a potentially stalled body.
+    // The private marker survives those failures, including SIGALRM.
+    req.handle_continue = false;
+    var response = while (true) {
+        const line = try req.reader.in.peekDelimiterInclusive('\n');
+        if (std.mem.endsWith(u8, line, "\r\n") and
+            (std.mem.startsWith(u8, line, "HTTP/1.1 429 ") or std.mem.startsWith(u8, line, "HTTP/1.0 429 ")))
+            try (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).writeAll("429\n");
+        const head = try req.receiveHead(&.{});
+        if (head.head.status == .@"continue") continue;
+        break head;
+    };
     const throttled = response.head.status == .too_many_requests;
     if (response.head.content_encoding != .identity and !throttled) return error.UnexpectedEncoding;
     var server_time: ?i64 = null;

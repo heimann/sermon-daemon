@@ -281,7 +281,8 @@ def run():
             assert rejections[-1] == 1 and len(rejections) <= 4, rejections
             delivered = sum(uploads)
             spool("upload-good-after-refusal.json", record("good row"))
-            wait_for(lambda: not list(box.glob("upload-*.json")) or errors)
+            wait_for(lambda: not (box / "upload-good-after-refusal.json").exists() or errors)
+            assert not errors, errors
             assert sum(uploads) >= delivered + 1 and process.poll() is None
             print("PASS refused row isolated by bisection and quarantined alone; siblings and later uploads delivered")
 
@@ -296,7 +297,7 @@ def run():
             assert len(throttled) == 1, throttled
             assert (box / "upload-throttled.json").exists()
             assert process.poll() is None
-            print("PASS oversized ingest 429 leaves claims polling; ingest is not retried early")
+            print("PASS oversized ingest 429: two further claims, no additional ingest request; upload remains queued")
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()
