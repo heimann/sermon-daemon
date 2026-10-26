@@ -143,11 +143,20 @@ pub const LogTailer = struct {
 
         // Copy sources
         const sources_copy = try allocator.alloc(LogSource, sources.len);
+        var copied_sources: usize = 0;
+        errdefer {
+            for (sources_copy[0..copied_sources]) |source| switch (source) {
+                .systemd => {},
+                .file => |path| allocator.free(path),
+            };
+            allocator.free(sources_copy);
+        }
         for (sources, 0..) |source, i| {
             sources_copy[i] = switch (source) {
                 .systemd => .systemd,
                 .file => |path| .{ .file = try allocator.dupe(u8, path) },
             };
+            copied_sources += 1;
         }
 
         // Initialize tailers for each source
@@ -156,6 +165,7 @@ pub const LogTailer = struct {
                 .systemd => {
                     if (journal_tailer == null) {
                         const jt = try allocator.create(JournalTailer);
+                        errdefer allocator.destroy(jt);
                         jt.* = try JournalTailer.init(allocator);
                         journal_tailer = jt;
                     }
@@ -599,6 +609,156 @@ const FileTailer = struct {
 };
 
 // Tests
+test "journal next preserves real nonblocking pipe fragments and reports partial EOF once" {
+    const a = std.testing.allocator;
+    const pipe = try std.posix.pipe2(.{ .NONBLOCK = true });
+    const reader = std.fs.File{ .handle = pipe[0] };
+    const writer = std.fs.File{ .handle = pipe[1] };
+    defer reader.close();
+    var writer_open = true;
+    defer if (writer_open) writer.close();
+    var child = ChildProcess.init(&.{}, a);
+    child.stdout = reader;
+    var journal = JournalTailer{
+        .allocator = a,
+        .process = child,
+        .record_buffer = try JournalRecordBuffer.init(a, max_journal_record_bytes),
+        .running = true,
+    };
+    defer journal.record_buffer.deinit(a);
+
+    try std.testing.expect((try journal.next(100)).entry == null);
+    try writer.writeAll("{\"MESSAGE\":\"split");
+    const partial = try journal.next(100);
+    try std.testing.expectEqual(@as(usize, 17), partial.bytes_processed);
+    try std.testing.expect(partial.entry == null);
+    try std.testing.expectEqual(@as(usize, 0), (try journal.next(100)).bytes_processed);
+    try writer.writeAll(" record\",\"__REALTIME_TIMESTAMP\":\"12000000\"}\n{\"MESSAGE\":\"next\"}\n");
+    var entry = (try journal.next(100)).entry.?;
+    defer entry.deinit(a);
+    try std.testing.expectEqualStrings("split record", entry.message);
+    try std.testing.expectEqual(@as(i64, 12), entry.timestamp);
+    try std.testing.expectEqual(@as(usize, 0), (try journal.next(0)).bytes_processed);
+    const before_newline = try journal.next(18);
+    try std.testing.expectEqual(@as(usize, 18), before_newline.bytes_processed);
+    try std.testing.expect(before_newline.entry == null);
+    const at_newline = try journal.next(1);
+    try std.testing.expectEqual(@as(usize, 1), at_newline.bytes_processed);
+    var next = at_newline.entry.?;
+    defer next.deinit(a);
+    try std.testing.expectEqualStrings("next", next.message);
+    // Cross the real ceiling without filling the pipe, then force WouldBlock
+    // while discarding. A suffix that looks like valid JSON is still discarded.
+    const chunk = [_]u8{'x'} ** 4096;
+    for (0..65) |_| {
+        try writer.writeAll(&chunk);
+        const discarded = try journal.next(chunk.len);
+        try std.testing.expectEqual(chunk.len, discarded.bytes_processed);
+        try std.testing.expect(discarded.entry == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try journal.next(1)).bytes_processed);
+    try writer.writeAll("{\"MESSAGE\":\"not a record\"}\n{\"MESSAGE\":\"recovered\"}\n{");
+    var recovered = (try journal.next(100)).entry.?;
+    defer recovered.deinit(a);
+    try std.testing.expectEqualStrings("recovered", recovered.message);
+    writer.close();
+    writer_open = false;
+    try std.testing.expectError(error.IncompleteJournalRecord, journal.next(100));
+    try std.testing.expect((try journal.next(100)).entry == null);
+}
+
+test "journal collection enforces real record and cycle boundaries and recovers alignment" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile("journal", .{ .read = true });
+    defer file.close();
+    const prefix = "{\"MESSAGE\":\"";
+    const suffix = "\"}";
+    const payload = try a.alloc(u8, max_journal_record_bytes + 1);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    // One below, exactly at, and one above the ceiling (excluding newline).
+    for ([_]usize{ max_journal_record_bytes - 1, max_journal_record_bytes, max_journal_record_bytes + 1 }) |size| {
+        try file.writeAll(prefix);
+        try file.writeAll(payload[0 .. size - prefix.len - suffix.len]);
+        try file.writeAll(suffix ++ "\n");
+    }
+    // An unterminated oversized record crosses the 16 MiB cycle boundary.
+    const start = try file.getPos();
+    var remaining = max_journal_bytes_per_collection_cycle - start;
+    while (remaining != 0) {
+        const n = @min(remaining, payload.len);
+        try file.writeAll(payload[0..n]);
+        remaining -= n;
+    }
+    try file.writeAll("\n{\"MESSAGE\":\"aligned\"}\n");
+    try file.seekTo(0);
+    var child = ChildProcess.init(&.{}, a);
+    child.stdout = file;
+    var journal = JournalTailer{
+        .allocator = a,
+        .process = child,
+        .record_buffer = try JournalRecordBuffer.init(a, max_journal_record_bytes),
+        .running = true,
+    };
+    defer journal.record_buffer.deinit(a);
+    var tailer = LogTailer{
+        .allocator = a,
+        .sources = &.{},
+        .journal_tailer = &journal,
+        .journal_bytes_remaining = 0,
+        .file_tailers = .{},
+    };
+    tailer.beginCollectionCycle();
+    for ([_]usize{ max_journal_record_bytes - 1, max_journal_record_bytes }) |size| {
+        var entry = (try tailer.next()).?;
+        defer entry.deinit(a);
+        try std.testing.expectEqual(size - prefix.len - suffix.len, entry.message.len);
+    }
+    try std.testing.expect((try tailer.next()) == null);
+    try std.testing.expectEqual(@as(usize, 0), tailer.journal_bytes_remaining);
+    try std.testing.expectEqual(@as(u64, max_journal_bytes_per_collection_cycle), try file.getPos());
+    try std.testing.expect((try tailer.next()) == null);
+    try std.testing.expectEqual(@as(u64, max_journal_bytes_per_collection_cycle), try file.getPos());
+    tailer.beginCollectionCycle();
+    var recovered = (try tailer.next()).?;
+    defer recovered.deinit(a);
+    try std.testing.expectEqualStrings("aligned", recovered.message);
+    try std.testing.expect((try tailer.next()) == null); // clean EOF
+    try std.testing.expect((try tailer.next()) == null);
+}
+
+test "journal EOF rejects both bounded and oversized unterminated records" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]usize{ 0, max_journal_record_bytes - 1, max_journal_record_bytes, max_journal_record_bytes + 1 }) |size| {
+        var file = try tmp.dir.createFile("journal", .{ .read = true });
+        defer file.close();
+        const bytes = try a.alloc(u8, size);
+        defer a.free(bytes);
+        @memset(bytes, 'x');
+        try file.writeAll(bytes);
+        try file.seekTo(0);
+        var child = ChildProcess.init(&.{}, a);
+        child.stdout = file;
+        var journal = JournalTailer{
+            .allocator = a,
+            .process = child,
+            .record_buffer = try JournalRecordBuffer.init(a, max_journal_record_bytes),
+            .running = true,
+        };
+        defer journal.record_buffer.deinit(a);
+        if (size == 0) {
+            try std.testing.expect((try journal.next(max_journal_bytes_per_collection_cycle)).entry == null);
+        } else {
+            try std.testing.expectError(error.IncompleteJournalRecord, journal.next(max_journal_bytes_per_collection_cycle));
+        }
+        try std.testing.expect((try journal.next(max_journal_bytes_per_collection_cycle)).entry == null);
+    }
+}
+
 fn pushRecordBytes(buffer: *JournalRecordBuffer, bytes: []const u8) ?JournalRecordBuffer.Event {
     for (bytes) |byte| if (buffer.push(byte)) |event| return event;
     return null;

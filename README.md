@@ -114,9 +114,9 @@ to bounded local storage and a bounded upload queue). Log rules let you cut the 
 keep only the error lines from an app, or sample a high-volume source down
 to a fraction.
 
-Rules gate **hosted upload only**. Every log line is still written to local
-DuckDB at full fidelity, so anything a rule drops is still queryable on the
-host with `sermon ... logs` or `sermon ... query`.
+Rules gate **hosted upload only**. Collected log entries are still written to
+the local store, so entries a rule drops remain queryable on the host with
+`sermon ... logs` or `sermon ... query`, subject to collection and retention limits.
 
 Rules live in `log_rules.json` next to `config.json` - so
 `~/.config/sermon/log_rules.json`, or `/etc/sermon/log_rules.json` for a
@@ -273,9 +273,17 @@ I/O errors such as ENOSPC take the same drop path and count in
 `log_stats.spool_errors`. Records that cannot be parsed, validated or delivered
 are renamed to `.bad` (at most 64 records/8 MiB, oldest evicted) and counted in
 `log_stats.upload_quarantined`; empty-message rows are never queued. Source
-buffers can still overflow; oversized records are retained locally only, and
-collection failures, upload truncation and retention eviction emit local
-diagnostics.
+buffers can still overflow. Journal JSON records up to 256 KiB (excluding the
+newline) are accepted; larger records are discarded through their next newline,
+not retained locally or uploaded. Partial records survive nonblocking reads and
+collection-cycle boundaries in memory, but not a daemon restart. Journal scanning
+is limited to 16 MiB per collection cycle, including discarded bytes. Oversized
+record gaps emit warnings coalesced over 60 seconds, with pending counts flushed
+on graceful shutdown; EOF in a partial record reports a collection gap. The journal child
+starts with `--since now`: there is no restart replay or lossless-collection
+guarantee. Records that fit collection limits but exceed upload limits remain
+local-only. Collection failures, upload truncation and retention eviction emit
+local diagnostics.
 No finite system guarantees unlimited delivery or retention. Disk/I/O failures
 and the source-read-to-fsync crash window remain collection risks; coverage does
 not hide them. `redact_local_store=true` also applies before writing upload spools.
