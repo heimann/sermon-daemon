@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Disposable real systemd install/start/upgrade check. Requires root in a test
 # VM/orb, not a production host. Archives/checksums must already be downloaded.
+# Both tags must have matching release-workflow attestations; legacy unattested
+# releases and unsigned local candidates cannot be used. Requires recent gh,
+# GitHub authentication/network access, and explicit real-install authorization.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 archives="$(realpath "${1:?archive directory required}")"
-baseline="${2:?published baseline tag required (e.g. v0.0.1-rc19)}"
-candidate="${3:-v0.0.2}"
+baseline="${2:?attested baseline tag required}"
+candidate="${3:?attested candidate tag required}"
 [[ $(id -u) == 0 && $(cat /proc/1/comm) == systemd ]] || { echo 'Requires root and running systemd in a disposable environment'; exit 1; }
 work="$(mktemp -d "$repo/.zig-cache/install-XXXXXX")"
 service="sermon-candidate-$$"

@@ -14,16 +14,17 @@ Options:
   --ingestion-key <key>         Optional Sermon ingestion key. If omitted, installs local-only.
   --server-url <url>            Sermon web URL for remote push. Default: https://sermon.fyi
   --version <tag>               Release tag. Default: latest GitHub release.
-  --release-base-url <url>      Base URL containing tarball + .sha256 files.
+  --release-base-url <url>      Mirror containing the attested tarball + .sha256 files.
   --install-dir <path>          Install dir. Default: /opt/sermon or ~/.local/opt/sermon.
   --config-dir <path>           Config dir. Default: /etc/sermon or ~/.config/sermon.
   --db-path <path>              Metrics DB path. Default: /var/lib/sermon/metrics.db or ~/.local/share/sermon/metrics.db.
   --service-name <name>         systemd service name. Default: sermon-agent.
   -h, --help                    Show this help.
 
-Local test example:
-  SERMON_RELEASE_BASE_URL=http://localhost:8000 \
-    bash install.sh --version v0.0.0-local --server-name test --ingestion-key serm_... --server-url http://localhost:4000
+Only archives with matching GitHub release-workflow attestations are accepted.
+Legacy unattested releases and unsigned local builds are rejected, even from
+mirrors. To test installer control flow without installing on this host, run:
+  bash scripts/test-install-attestation.sh
 EOF
 }
 
@@ -140,11 +141,22 @@ case "$(uname -m)" in
 esac
 
 need_cmd curl
+need_cmd gh
+need_cmd grep
 need_cmd tar
 need_cmd sha256sum
 need_cmd sed
 need_cmd awk
 need_cmd systemctl
+need_cmd flock
+need_cmd realpath
+
+gh_attestation_help="$(gh attestation verify --help 2>/dev/null)" ||
+  fail "GitHub CLI does not support 'gh attestation verify'; install a recent gh release"
+for required_flag in --repo --signer-workflow --source-ref --predicate-type --deny-self-hosted-runners; do
+  grep -Fq -- "${required_flag}" <<<"${gh_attestation_help}" ||
+    fail "GitHub CLI attestation verifier does not support ${required_flag}; install a recent gh release"
+done
 
 if [[ "$(id -u)" == "0" ]]; then
   ROOT_INSTALL=1
@@ -167,7 +179,6 @@ else
 fi
 
 if [[ -z "${VERSION}" ]]; then
-  need_cmd grep
   latest_json="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest")"
   VERSION="$(printf '%s\n' "${latest_json}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
   [[ -n "${VERSION}" ]] || fail "could not resolve latest release version"
@@ -191,10 +202,36 @@ trap cleanup EXIT
 log "downloading ${ARCHIVE_URL}"
 curl -fsSL "${ARCHIVE_URL}" -o "${tmpdir}/${ARCHIVE}"
 curl -fsSL "${SHA_URL}" -o "${tmpdir}/${ARCHIVE}.sha256"
+# Do not let an untrusted manifest select other local files to hash.
+checksum="$(cat "${tmpdir}/${ARCHIVE}.sha256")"
+[[ "${checksum}" =~ ^([[:xdigit:]]{64})\ [\ *](.+)$ ]] &&
+  [[ "${BASH_REMATCH[2]}" == "${ARCHIVE}" ]] ||
+  fail "checksum manifest must contain only the requested archive"
 (
   cd "${tmpdir}"
   sha256sum -c "${ARCHIVE}.sha256"
 )
+
+log "verifying GitHub build provenance for ${ARCHIVE}"
+gh attestation verify "${tmpdir}/${ARCHIVE}" \
+  --repo "${GITHUB_REPO}" \
+  --signer-workflow "${GITHUB_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${VERSION}" \
+  --predicate-type "https://slsa.dev/provenance/v1" \
+  --deny-self-hosted-runners
+
+# Both platforms share the provenance identity. Require the requested package
+# root too, so a mirror cannot substitute the other platform's signed archive.
+tar -tzf "${tmpdir}/${ARCHIVE}" |
+  awk -v root="${ARCHIVE%.tar.gz}/" 'index($0, root) != 1 { bad = 1 } END { exit (bad || NR == 0) }' ||
+  fail "archive does not contain the requested version/platform package"
+
+# Keep the lock file: unlinking it lets another installer lock a different inode.
+# Canonicalization makes equivalent destination spellings share the same lock.
+INSTALL_DIR="$(realpath -m -- "${INSTALL_DIR}")"
+mkdir -p "$(dirname "${INSTALL_DIR}")"
+exec 9>>"${INSTALL_DIR}.lock"
+flock -n 9 || fail "another installation is already using ${INSTALL_DIR}"
 
 new_dir="${INSTALL_DIR}.new"
 old_dir="${INSTALL_DIR}.old"
@@ -203,7 +240,6 @@ mkdir -p "${new_dir}"
 tar -xzf "${tmpdir}/${ARCHIVE}" -C "${new_dir}" --strip-components=1
 chmod +x "${new_dir}/bin/sermon" "${new_dir}/bin/sermon-agent"
 
-mkdir -p "$(dirname "${INSTALL_DIR}")"
 if [[ -d "${INSTALL_DIR}" ]]; then
   mv "${INSTALL_DIR}" "${old_dir}"
 fi

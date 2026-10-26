@@ -18,4 +18,8 @@ if [[ ! -f "${DAEMON_ROOT}/lib/libduckdb.so" ]]; then
   exit 1
 fi
 
+# This fixture supplies its own gh; building from source needs no GitHub login
+# or installed verifier. The real installer checks verifier capabilities.
+"${SCRIPT_DIR}/test-install-attestation.sh"
+
 echo "daemon preflight ok"
