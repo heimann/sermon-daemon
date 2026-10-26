@@ -41,6 +41,8 @@ CREDENTIAL_CASES = [
     ('{"password":"opaque\\" secret"}', '{"password":"<REDACTED:VALUE>"}'),
     ("exec --token 'opaque value' --mode check", "exec --token '<REDACTED:VALUE>' --mode check"),
     ("exec --token alpha,beta --mode check", "exec --token <REDACTED:VALUE> --mode check"),
+    ("exec --token=alpha&beta --mode check", "exec --token=<REDACTED:VALUE> --mode check"),
+    ("exec --password=alpha|beta --mode check", "exec --password=<REDACTED:VALUE> --mode check"),
     ('exec --token="alpha"beta --mode check', "exec --token=<REDACTED:VALUE> --mode check"),
     ("exec --token alpha\\ beta --mode check", "exec --token <REDACTED:VALUE> --mode check"),
     ("postgres://fixture:opaque@db/app", "postgres://<REDACTED:VALUE>@db/app"),

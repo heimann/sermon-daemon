@@ -636,6 +636,8 @@ fn valueMatch(s: []const u8, start: usize, tag: Tag) ?Match {
 /// A flag's value is one shell-like word, not a comma-delimited log token.
 /// Handle adjacent quoted segments and escaped separators without evaluating
 /// expansions or substitutions. Preserve quotes only around a single segment.
+/// Do not split at shell operators: collected argv has already lost its quotes,
+/// and those bytes may be literal parts of credentials.
 fn flagValueMatch(s: []const u8, start: usize) ?Match {
     var end = start;
     var quote: u8 = 0;
@@ -651,7 +653,7 @@ fn flagValueMatch(s: []const u8, start: usize) ?Match {
             }
         } else if (c == '"' or c == '\'') {
             quote = c;
-        } else if (std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&') {
+        } else if (isHorizontalSpace(c) or c == '\n' or c == '\r') {
             break;
         }
     }
@@ -1447,6 +1449,10 @@ test "adversarial credential forms redact without destroying log context" {
         .{
             .input = "exec --token=alpha,beta --mode check",
             .expected = "exec --token=<REDACTED:VALUE> --mode check",
+        },
+        .{
+            .input = "exec --token=alpha&beta --password=alpha|beta --secret=alpha;beta --mode check",
+            .expected = "exec --token=<REDACTED:VALUE> --password=<REDACTED:VALUE> --secret=<REDACTED:VALUE> --mode check",
         },
         .{
             .input = "exec --token \"alpha\"beta --mode check",
