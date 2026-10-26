@@ -23,7 +23,7 @@ import uuid
 import zlib
 
 REPO = Path(__file__).resolve().parent.parent
-FIXTURE_UNIT = "sermon-fixture"
+FIXTURE_UNIT = "sermon-fixture-" + uuid.uuid4().hex
 AGENT = Path(os.environ.get("SERMON_AGENT", REPO / "zig-out/bin/sermon-agent"))
 VERSION = os.environ.get("SERMON_VERSION", "0.0.2")
 UTC = dt.timezone.utc
@@ -149,6 +149,7 @@ def run():
         retry_rows = None
         retry_attempts = 0
         ambient_seen = 0
+        acknowledged = set()
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -215,9 +216,12 @@ def run():
                                 # narrowed attempt faces a full batch of new rows.
                                 for _ in range(100):
                                     name = f"upload-inflow-{len(inflowed)}.json"
-                                    inflowed.append(spool(name, {**record("busy host"), "logs": [{**row, "unit": "inflow", "message": name}]}))
+                                    inflowed.append(spool(name, {**record("busy host"), "logs": [{**row, "unit": FIXTURE_UNIT + "-inflow", "message": name}]}))
                             else:
                                 suspect_rows = None
+                        if response == {"log_count": len(batch), "log_rejected_count": 0}:
+                            acknowledged.update(row["message"] for row in batch
+                                                if row.get("unit") in (FIXTURE_UNIT, FIXTURE_UNIT + "-inflow"))
                         if not batch:
                             telemetry_failures.append(time.monotonic())
                             status = 503
@@ -323,11 +327,13 @@ def run():
             assert len(inflowed) >= 100, "fixture never exercised a refused cohort under inflow"
             assert retry_attempts == 3, "fixture never checked malformed and transport retries of pinned rows"
             assert not any((box / f"upload-sibling-{i}.json.bad").exists() for i in range(7))
+            assert {f"accepted sibling {i}" for i in range(7)} <= acknowledged
             # One halving per round from the 100-row cap: at most 8 refusals.
             assert len(rejections) <= 8, rejections
             wait_for(lambda: drained(inflowed) or errors, seconds=300)
             assert not errors, errors
             assert not any((box / (name + ".bad")).exists() for name in inflowed)
+            assert set(inflowed) <= acknowledged, "inflow disappeared without an exact acknowledgment"
             delivered = sum(uploads)
             later = [spool("upload-good-after-refusal.json", record("good row"))]
             wait_for(lambda: drained(later) or errors)
