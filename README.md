@@ -57,6 +57,30 @@ When installed with the default user path, the binary is at:
 ~/.local/opt/sermon/bin/sermon
 ```
 
+### Output formats
+
+Use `--format json`, `--format csv`, or `--format table` (the default).
+JSON result fields escape strings and replace malformed UTF-8 bytes with U+FFFD;
+non-finite typed telemetry numbers become `null`. Raw SQL values remain strings
+or null. Query JSON retains every column value using deterministic unique keys:
+aliases `x, x, x#2` become `x, x#2, x#2#2`.
+
+CSV quotes text fields, doubles quotes, and uses CRLF records, retaining embedded
+CR/LF inside quoted fields. Text beginning with `=`, `+`, `-`, `@`, tab, CR, or LF
+gets an apostrophe prefix to neutralize common spreadsheet formula prefixes.
+Other controls and malformed bytes are visibly escaped. CSV is therefore not a
+lossless export; spreadsheet importer-specific coercion is not guaranteed safe.
+Table result fields visibly escape terminal and bidi controls while preserving
+ordinary UTF-8. These result encoders do not sanitize CLI error diagnostics.
+Empty metrics, logs, and query results currently print human-readable messages
+even when a machine format is selected.
+
+Run the disposable real-CLI output fixture after building:
+
+```bash
+LD_LIBRARY_PATH=lib python3 scripts/test-cli-output.py
+```
+
 ## Configuration
 
 The daemon reads JSON config from `~/.config/sermon/config.json` by default. CLI flags override config values.

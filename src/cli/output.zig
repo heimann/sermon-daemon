@@ -86,9 +86,8 @@ fn writeUnicodeEscape(writer: Writer, codepoint: u21) !usize {
 fn writeCsvField(writer: Writer, value: []const u8) !void {
     try writer.writeByte('"');
 
-    // Spreadsheet programs interpret these leading bytes as formulas even in
-    // quoted CSV fields. Prefix an apostrophe so exporting hostile telemetry
-    // never turns it into an executable spreadsheet cell.
+    // Neutralize common spreadsheet formula prefixes, including in quoted
+    // fields. Importer-specific coercion is outside this text export contract.
     if (value.len > 0 and switch (value[0]) {
         '=', '+', '-', '@', '\t', '\r', '\n' => true,
         else => false,
@@ -110,8 +109,10 @@ fn writeCsvField(writer: Writer, value: []const u8) !void {
             continue;
         }
         if (byte < 0x80) {
-            try writer.writeByte(byte);
+            const start = i;
             i += 1;
+            while (i < value.len and value[i] >= 0x20 and value[i] < 0x7f and value[i] != '"') : (i += 1) {}
+            try writer.writeAll(value[start..i]);
             continue;
         }
 
@@ -152,9 +153,11 @@ fn writeTerminalSafe(writer: Writer, value: []const u8, min_width: usize) !void 
             continue;
         }
         if (byte < 0x80) {
-            try writer.writeByte(byte);
-            rendered_len += 1;
+            const start = i;
             i += 1;
+            while (i < value.len and value[i] >= 0x20 and value[i] < 0x7f) : (i += 1) {}
+            try writer.writeAll(value[start..i]);
+            rendered_len += i - start;
             continue;
         }
 
@@ -992,7 +995,9 @@ test "JSON string output preserves type for invalid UTF-8" {
     defer tmp.cleanup();
 
     const columns = [_][]const u8{"bad\xffkey"};
-    var row = [_]?[]const u8{"bad\xfevalue"};
+    // Invalid lead, overlong encoding, surrogate, valid supplementary scalar,
+    // and a truncated sequence: repair each invalid byte without eating text.
+    var row = [_]?[]const u8{"bad\xfevalue \xc0\xaf \xed\xa0\x80 😀 \xe2\x82"};
     const rows = [_][]?[]const u8{&row};
     var file = try tmp.dir.createFile("invalid.json", .{});
     try printQueryResult(file.deprecatedWriter(), .json, allocator, &columns, &rows);
@@ -1003,7 +1008,7 @@ test "JSON string output preserves type for invalid UTF-8" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     const value = parsed.value.array.items[0].object.get("bad\xef\xbf\xbdkey").?;
-    try testing.expectEqualStrings("bad\xef\xbf\xbdvalue", value.string);
+    try testing.expectEqualStrings("bad�value �� ��� 😀 ��", value.string);
 }
 
 test "JSON modes encode non-finite telemetry as null" {

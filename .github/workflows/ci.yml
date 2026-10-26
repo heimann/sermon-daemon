@@ -34,6 +34,9 @@ jobs:
       - name: Unit tests
         run: LD_LIBRARY_PATH=lib zig build test
 
+      - name: CLI output contract fixture
+        run: LD_LIBRARY_PATH=lib python3 scripts/test-cli-output.py
+
       - name: Resource benchmark
         run: LD_LIBRARY_PATH=lib zig build bench
 
