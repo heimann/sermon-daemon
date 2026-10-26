@@ -254,9 +254,10 @@ Only an exact `log_count` and zero `log_rejected_count` acknowledgment removes
 an upload record. A 2xx without both counters (a hosted build that predates
 them) leaves records pending. When hosted explicitly refuses part of a batch
 (counters disagree, or 400/413/422), the daemon halves the batch until the
-refused record is alone and quarantines only that record, instead of replaying
-rows hosted already accepted. Lost acknowledgments can produce duplicates: delivery is
-at-least-once, not exactly-once. Logs-only batches carry the collection-time
+refused record is alone and quarantines that record. The search stays within
+the refused batch, so records spooled meanwhile wait rather than starve it.
+Partial or lost acknowledgments can produce duplicates; retries are not an
+exactly-once or loss-free delivery guarantee. Logs-only batches carry the collection-time
 metrics from their first record; ordinary metric delivery continues separately.
 Ordinary telemetry uses one replaceable 2 MiB slot on the same outbound worker,
 so HTTPS cannot block the collector. Unlike protected logs, intermediate metric
@@ -266,9 +267,9 @@ The log-upload queue is bounded to 64 MiB/1024 records, with 128 KiB per raw rec
 100 rows/2 MiB of input per delivery attempt. A full or failing outbox never
 stops collection: the source keeps draining into the local store, the upload of
 that row is dropped, and `log_stats.upload_queue_dropped` counts it (one log line
-per state change, not per row). The local store is the durable copy and stays
-reachable through the retained-log query, so a lost upload is recoverable while
-a collection stall is not. Queued records are never evicted to make room. Spool
+per state change, not per row). Successfully stored rows remain reachable through
+the retained-log query until retention removes them; failed collection or storage
+can prevent recovery of a lost upload. Queued records are never evicted to make room. Spool
 I/O errors such as ENOSPC take the same drop path and count in
 `log_stats.spool_errors`. Records that cannot be parsed, validated or delivered
 are renamed to `.bad` (at most 64 records/8 MiB, oldest evicted) and counted in

@@ -23,6 +23,7 @@ import uuid
 import zlib
 
 REPO = Path(__file__).resolve().parent.parent
+FIXTURE_UNIT = "sermon-fixture-" + uuid.uuid4().hex
 AGENT = Path(os.environ.get("SERMON_AGENT", REPO / "zig-out/bin/sermon-agent"))
 VERSION = os.environ.get("SERMON_VERSION", "0.0.2")
 UTC = dt.timezone.utc
@@ -143,12 +144,19 @@ def run():
         claim_calls = []
         telemetry_failures = []
         rejections = []
+        suspect_rows = None
+        inflowed = []
+        retry_rows = None
+        retry_attempts = 0
+        ambient_seen = 0
+        acknowledged = set()
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
 
             def do_POST(self):
+                nonlocal suspect_rows, retry_rows, retry_attempts, ambient_seen
                 try:
                     assert self.headers.get("x-sermon-ingestion-key") == "fixture-only-key"
                     raw = self.rfile.read(int(self.headers["Content-Length"]))
@@ -171,18 +179,50 @@ def run():
                         assert raw == completions[0], "completion replay changed bytes"
                         response = {"status": "completed", "accepted": False}
                     else:
-                        logs = body.get("logs", [])
+                        batch = body.get("logs", [])
+                        assert len(batch) <= 100
+                        assert all("private-value" not in row["message"] for row in batch)
+                        if batch and suspect_rows is not None:
+                            assert all(json.dumps(row, sort_keys=True) in suspect_rows for row in batch), "new inflow entered the refused cohort"
+                            if retry_attempts < 3:
+                                if retry_rows is None:
+                                    retry_rows = batch
+                                assert batch == retry_rows, "malformed/lost acknowledgment changed the pending batch"
+                                retry_attempts += 1
+                                if retry_attempts == 1:
+                                    self.send_response(200)
+                                    self.send_header("Content-Length", "2")
+                                    self.end_headers()
+                                    self.wfile.write(b"{}")
+                                    return
+                                if retry_attempts == 2:
+                                    self.connection.shutdown(socket.SHUT_RDWR)
+                                    return
+                        # Ack counts include the real host journal; fixture
+                        # delivery assertions count only the seeded rows.
+                        ambient_seen += sum(row.get("unit") == "ambient-fixture" for row in batch)
+                        logs = [row for row in batch if row.get("unit") == FIXTURE_UNIT]
                         if logs:
-                            assert len(logs) <= 100
-                            assert all("private-value" not in row["message"] for row in logs)
                             uploads.append(len(logs))
                         # Mismatched first acknowledgment must preserve all rows.
-                        response = {"log_count": 0 if len(uploads) == 1 else len(logs), "log_rejected_count": 0}
+                        response = {"log_count": 0 if logs and len(uploads) == 1 else len(batch), "log_rejected_count": 0}
                         refused = sum("reject-me" in row["message"] for row in logs)
                         if refused:
-                            rejections.append(len(logs))
-                            response = {"log_count": len(logs) - refused, "log_rejected_count": refused}
-                        if not logs:
+                            rejections.append(len(batch))
+                            response = {"log_count": len(batch) - refused, "log_rejected_count": refused}
+                            if len(batch) > 1:
+                                suspect_rows = {json.dumps(row, sort_keys=True) for row in batch}
+                                # Publish before acknowledging rejection: every
+                                # narrowed attempt faces a full batch of new rows.
+                                for _ in range(100):
+                                    name = f"upload-inflow-{len(inflowed)}.json"
+                                    inflowed.append(spool(name, {**record("busy host"), "logs": [{**row, "unit": FIXTURE_UNIT + "-inflow", "message": name}]}))
+                            else:
+                                suspect_rows = None
+                        if response == {"log_count": len(batch), "log_rejected_count": 0}:
+                            acknowledged.update(row["message"] for row in batch
+                                                if row.get("unit") in (FIXTURE_UNIT, FIXTURE_UNIT + "-inflow"))
+                        if not batch:
                             telemetry_failures.append(time.monotonic())
                             status = 503
                             response = {"error": "fixture_telemetry_unavailable"}
@@ -207,15 +247,28 @@ def run():
             (box / name).unlink(missing_ok=True)
         metrics = {"cpu_percent": 0, "cpu_user": 0, "cpu_system": 0, "cpu_iowait": 0,
                    "mem_total": 100, "mem_used": 10, "mem_percent": 10, "swap_total": 0, "swap_used": 0}
-        row = {"timestamp": 101, "source": "systemd", "unit": "api", "identifier": "api",
+        row = {"timestamp": 101, "source": "systemd", "unit": FIXTURE_UNIT, "identifier": "api",
                "systemd_unit": "api.service", "priority": 3, "message": "password=" + ("private-" + "value"), "pid": None}
-        for i in range(101):
-            (box / f"upload-{i:032x}.json").write_text(json.dumps({"hostname": "fixture", "collected_at": 101,
+        initial = [f"upload-{i:032x}.json" for i in range(101)]
+        for name in initial:
+            (box / name).write_text(json.dumps({"hostname": "fixture", "collected_at": 101,
                                                                "metrics": metrics, "logs": [row], "processes": [], "disks": []}))
+        # Retain real journal collection, but guarantee non-fixture traffic
+        # even on quiet runners so namespace accounting is always exercised.
+        for i in range(3):
+            name = f"upload-ambient-{i}.json"
+            initial.append(name)
+            (box / name).write_text(json.dumps({"hostname": "fixture", "collected_at": 101,
+                                               "metrics": metrics, "logs": [{**row, "unit": "ambient-fixture"}],
+                                               "processes": [], "disks": []}))
         config = base / "config.json"
         config.write_text(json.dumps({"db_path": str(root / "metrics.db"), "interval": 60,
                                       "server_url": origin, "api_key": "fixture-only-key"}))
         env = {**os.environ, "SSL_CERT_FILE": str(cert)}
+
+        def drained(names):
+            return not any((box / name).exists() for name in names)
+
         process = None
         try:
             process = subprocess.Popen([AGENT, "--config", config], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -226,10 +279,10 @@ def run():
             process.wait()
             process = subprocess.Popen([AGENT, "--config", config], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             wait_for(lambda: len(completions) >= 2 or errors)
-            wait_for(lambda: not list(box.glob("upload-*.json")) or errors)
+            wait_for(lambda: drained(initial) or errors, seconds=90)
             assert not errors, errors
-            assert uploads[:2] == [100, 100], uploads
             assert sum(uploads[1:]) == 101, uploads
+            assert ambient_seen >= 3, "fixture never exercised non-fixture upload accounting"
             assert len(claim_calls) >= 2
             assert telemetry_failures, "fixture never exercised ordinary ingest failure"
             print("PASS TLS/auth/closed claim, lost claim, restart completion replay, <=100 batching, mismatched-ack retry")
@@ -238,6 +291,7 @@ def run():
             def spool(name, value):
                 (box / (name + ".tmp")).write_text(value if isinstance(value, str) else json.dumps(value))
                 (box / (name + ".tmp")).rename(box / name)
+                return name
 
             def record(message):
                 return {"hostname": "fixture", "collected_at": 101, "metrics": metrics,
@@ -245,33 +299,47 @@ def run():
 
             # Poison must neither wedge the queue nor take the daemon down.
             delivered = sum(uploads)
-            spool("upload-poison-torn.json", '{"logs":[{"timestamp":')
-            spool("upload-poison-shape.json", {"logs": None})
-            spool("upload-poison-empty.json", record(""))
-            spool("upload-good-after-poison.json", record("good row"))
-            wait_for(lambda: not list(box.glob("upload-*.json")) or errors)
+            poisoned = [spool("upload-poison-torn.json", '{"logs":[{"timestamp":'),
+                        spool("upload-poison-shape.json", {"logs": None}),
+                        spool("upload-poison-empty.json", record("")),
+                        spool("upload-good-after-poison.json", record("good row"))]
+            wait_for(lambda: drained(poisoned) or errors)
             assert not errors, errors
             assert process.poll() is None, "daemon exited on a poison spool record"
             assert sum(uploads) >= delivered + 1, uploads
-            assert sorted(p.name for p in box.glob("*.bad")) == [
+            assert sorted(p.name for p in box.glob("upload-poison-*.bad")) == [
                 "upload-poison-empty.json.bad", "upload-poison-shape.json.bad", "upload-poison-torn.json.bad"]
             print("PASS torn, malformed and empty-message spool records are quarantined; queue keeps draining")
 
             # Hosted refuses one row without naming it. The daemon bisects, so
-            # only that record is set aside and its batch siblings still arrive.
-            quarantined = set(box.glob("*.bad"))
-            spool("upload-refused.json", record("reject-me"))
-            for i in range(7):
-                spool(f"upload-sibling-{i}.json", record(f"accepted sibling {i}"))
-            wait_for(lambda: not list(box.glob("upload-*.json")) or errors, seconds=180)
+            # only that record is set aside and its batch siblings still arrive,
+            # even while a busy host keeps spooling more than a narrowed batch.
+            # Stop collection while publishing the cohort so the refused row
+            # cannot be consumed alone before its siblings exist.
+            process.terminate()
+            assert process.wait(timeout=12) == 0
+            batch = [spool("upload-refused.json", record("reject-me"))]
+            batch += [spool(f"upload-sibling-{i}.json", record(f"accepted sibling {i}")) for i in range(7)]
+            process = subprocess.Popen([AGENT, "--config", config], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            wait_for(lambda: drained(batch) or errors, seconds=300)
             assert not errors, errors
-            assert set(box.glob("*.bad")) - quarantined == {box / "upload-refused.json.bad"}
-            assert rejections[-1] == 1 and len(rejections) <= 4, rejections
+            assert (box / "upload-refused.json.bad").exists()
+            assert len(inflowed) >= 100, "fixture never exercised a refused cohort under inflow"
+            assert retry_attempts == 3, "fixture never checked malformed and transport retries of pinned rows"
+            assert not any((box / f"upload-sibling-{i}.json.bad").exists() for i in range(7))
+            assert {f"accepted sibling {i}" for i in range(7)} <= acknowledged
+            # One halving per round from the 100-row cap: at most 8 refusals.
+            assert len(rejections) <= 8, rejections
+            wait_for(lambda: drained(inflowed) or errors, seconds=300)
+            assert not errors, errors
+            assert not any((box / (name + ".bad")).exists() for name in inflowed)
+            assert set(inflowed) <= acknowledged, "inflow disappeared without an exact acknowledgment"
             delivered = sum(uploads)
-            spool("upload-good-after-refusal.json", record("good row"))
-            wait_for(lambda: not list(box.glob("upload-*.json")) or errors)
+            later = [spool("upload-good-after-refusal.json", record("good row"))]
+            wait_for(lambda: drained(later) or errors)
+            assert not errors, errors
             assert sum(uploads) >= delivered + 1 and process.poll() is None
-            print("PASS refused row isolated by bisection and quarantined alone; siblings and later uploads delivered")
+            print("PASS pinned cohort under rejection-boundary inflow, malformed/lost ack retries, singleton quarantine; siblings, inflow and later uploads delivered")
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()

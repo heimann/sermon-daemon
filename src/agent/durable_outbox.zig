@@ -53,7 +53,7 @@ pub const Shared = struct {
 };
 pub const Usage = struct { bytes: u64, records: usize };
 
-fn isLive(name: []const u8) bool {
+pub fn isLive(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "upload-") and std.mem.endsWith(u8, name, ".json");
 }
 
