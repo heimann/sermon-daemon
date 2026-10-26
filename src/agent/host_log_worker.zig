@@ -575,6 +575,26 @@ test "outbound redaction precedes compact byte cap and UTF8 message cap" {
     try std.testing.expect(empty.coverage.oldest_available_at == null);
 }
 
+test "retained-query and protected-upload paths share credential redaction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const secret = "opaque-credential-123";
+    const message = "Authorization: Bearer " ++ secret ++ ", db=postgres://alice:hunter2@db/app";
+    const f = p.Filters{ .since = "1970-01-01T00:00:00Z", .until = "1970-01-01T00:00:10Z" };
+
+    var retained = [_]logs.LogEntry{.{ .timestamp = 1, .source = try a.dupe(u8, "systemd"), .unit = null, .identifier = null, .systemd_unit = null, .priority = 3, .message = try a.dupe(u8, message), .pid = null }};
+    const result = try prepareResult(a, &retained, f, .{ 1, 1 });
+    try std.testing.expect(std.mem.indexOf(u8, result.rows[0].message, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.rows[0].message, "hunter2") == null);
+
+    const row = "{{\"collected_at\":1,\"logs\":[{{\"timestamp\":1,\"source\":\"systemd\",\"unit\":null,\"identifier\":null,\"systemd_unit\":null,\"priority\":3,\"message\":\"{s}\",\"pid\":null,\"trace_id\":null}}]}}";
+    const upload = try loadRecord(a, try std.fmt.allocPrint(a, row, .{message}));
+    const redacted = upload.row.object.get("message").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, redacted, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "hunter2") == null);
+}
+
 test "redaction allocation failure never produces raw rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
