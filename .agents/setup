@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb: mise + pinned Zig, DuckDB runtime library, warm Zig cache.
+# Idempotent; reruns on a stale snapshot skip work that is already done.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name="$1"; shift
+  local start=$SECONDS
+  echo "==> ${name}"
+  "$@"
+  echo "    ${name} took $((SECONDS - start))s"
+}
+
+mise_bin="$HOME/.local/bin/mise"
+mise_shims="$HOME/.local/share/mise/shims"
+
+install_mise() {
+  if [[ -x "$mise_bin" ]]; then
+    "$mise_bin" --version
+    return
+  fi
+  curl -fsSL https://mise.run | MISE_QUIET=1 sh
+}
+
+install_toolchain() {
+  "$mise_bin" trust --quiet "$repo_root/.mise.toml"
+  "$mise_bin" install --yes
+}
+
+persist_path() {
+  # Make mise and its shims (zig) available to Amp and supervised services,
+  # which start in non-interactive login shells.
+  local marker="# sermon-daemon: mise toolchain"
+  if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<EOF
+
+$marker
+case ":\$PATH:" in
+  *":$mise_shims:"*) ;;
+  *) export PATH="$HOME/.local/bin:$mise_shims:\$PATH" ;;
+esac
+EOF
+  fi
+}
+
+bootstrap_duckdb() {
+  # lib/libduckdb.so is gitignored, so it persists in snapshots; the bootstrap
+  # script always re-downloads, so only run it when the library is missing.
+  if [[ -f lib/libduckdb.so ]]; then
+    echo "    lib/libduckdb.so already present"
+    return
+  fi
+  ./scripts/bootstrap-duckdb.sh
+}
+
+warm_build() {
+  PATH="$HOME/.local/bin:$mise_shims:$PATH" zig build
+}
+
+step "Install mise" install_mise
+step "Install pinned toolchain (.mise.toml)" install_toolchain
+step "Persist toolchain PATH" persist_path
+step "Bootstrap DuckDB" bootstrap_duckdb
+step "Warm Zig build cache" warm_build
