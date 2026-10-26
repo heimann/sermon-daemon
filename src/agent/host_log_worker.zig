@@ -365,7 +365,7 @@ pub const Worker = struct {
         }
         // After iteration: renames must not disturb the directory walk.
         for (poison.items) |name| {
-            std.log.err("undeliverable upload record quarantined as {s}.bad; the retained local store still has the row", .{name});
+            std.log.err("quarantining undeliverable upload record as {s}.bad; retained local data may be available", .{name});
             try box.quarantine(a, name);
         }
         return .{ .names = names.items, .rows = rows, .payload = payload, .remaining = self.suspects[next_suspect..] };
@@ -378,13 +378,12 @@ pub const Worker = struct {
                 for (batch.names) |name| try box.removeUpload(name);
                 if (self.suspects.len != 0) try self.setSuspects(batch.remaining);
             },
-            // Hosted answered and will not take this batch as it stands, and
-            // does not say which row. Replaying it duplicates the rows it did
-            // accept, so bisect: halve until the refused record is alone, then
-            // set only that record aside. Retries are bounded by log2(batch).
+            // Hosted does not identify refused rows. Halve the suspect set
+            // until a refused record is alone; accepted rows may be replayed.
+            // The halving bound excludes transient retries and restarts.
             .rejected => {
                 if (batch.names.len == 1) {
-                    std.log.err("hosted refused upload record {s} (status {d}): quarantined", .{ batch.names[0], status });
+                    std.log.err("hosted refused upload record {s} (status {d}): quarantining", .{ batch.names[0], status });
                     try box.quarantine(a, batch.names[0]);
                     self.clearSuspects();
                 } else {
@@ -720,8 +719,7 @@ test "bisection isolates a refused record while new records keep arriving" {
     var rejections: usize = 0;
     var rounds: usize = 0;
     const isolated = while (rounds < 64) : (rounds += 1) {
-        // A busy journal spools more records per round than a narrowed batch
-        // carries; the search must still converge.
+        // New records arrive each round; the pinned search must converge.
         for (0..3) |_| try box.enqueue(try std.fmt.bufPrint(&buf, row, .{"arrived later"}));
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();

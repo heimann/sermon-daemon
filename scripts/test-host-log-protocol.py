@@ -144,12 +144,18 @@ def run():
         claim_calls = []
         telemetry_failures = []
         rejections = []
+        suspect_rows = None
+        inflowed = []
+        retry_rows = None
+        retry_attempts = 0
+        ambient_seen = 0
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
 
             def do_POST(self):
+                nonlocal suspect_rows, retry_rows, retry_attempts, ambient_seen
                 try:
                     assert self.headers.get("x-sermon-ingestion-key") == "fixture-only-key"
                     raw = self.rfile.read(int(self.headers["Content-Length"]))
@@ -175,8 +181,25 @@ def run():
                         batch = body.get("logs", [])
                         assert len(batch) <= 100
                         assert all("private-value" not in row["message"] for row in batch)
-                        # The agent also uploads this host's own journal. Every
-                        # row is acknowledged; only fixture rows are counted.
+                        if batch and suspect_rows is not None:
+                            assert all(json.dumps(row, sort_keys=True) in suspect_rows for row in batch), "new inflow entered the refused cohort"
+                            if retry_attempts < 3:
+                                if retry_rows is None:
+                                    retry_rows = batch
+                                assert batch == retry_rows, "malformed/lost acknowledgment changed the pending batch"
+                                retry_attempts += 1
+                                if retry_attempts == 1:
+                                    self.send_response(200)
+                                    self.send_header("Content-Length", "2")
+                                    self.end_headers()
+                                    self.wfile.write(b"{}")
+                                    return
+                                if retry_attempts == 2:
+                                    self.connection.shutdown(socket.SHUT_RDWR)
+                                    return
+                        # Ack counts include the real host journal; fixture
+                        # delivery assertions count only the seeded rows.
+                        ambient_seen += sum(row.get("unit") == "ambient-fixture" for row in batch)
                         logs = [row for row in batch if row.get("unit") == FIXTURE_UNIT]
                         if logs:
                             uploads.append(len(logs))
@@ -186,6 +209,15 @@ def run():
                         if refused:
                             rejections.append(len(batch))
                             response = {"log_count": len(batch) - refused, "log_rejected_count": refused}
+                            if len(batch) > 1:
+                                suspect_rows = {json.dumps(row, sort_keys=True) for row in batch}
+                                # Publish before acknowledging rejection: every
+                                # narrowed attempt faces a full batch of new rows.
+                                for _ in range(100):
+                                    name = f"upload-inflow-{len(inflowed)}.json"
+                                    inflowed.append(spool(name, {**record("busy host"), "logs": [{**row, "unit": "inflow", "message": name}]}))
+                            else:
+                                suspect_rows = None
                         if not batch:
                             telemetry_failures.append(time.monotonic())
                             status = 503
@@ -217,6 +249,14 @@ def run():
         for name in initial:
             (box / name).write_text(json.dumps({"hostname": "fixture", "collected_at": 101,
                                                                "metrics": metrics, "logs": [row], "processes": [], "disks": []}))
+        # Retain real journal collection, but guarantee non-fixture traffic
+        # even on quiet runners so namespace accounting is always exercised.
+        for i in range(3):
+            name = f"upload-ambient-{i}.json"
+            initial.append(name)
+            (box / name).write_text(json.dumps({"hostname": "fixture", "collected_at": 101,
+                                               "metrics": metrics, "logs": [{**row, "unit": "ambient-fixture"}],
+                                               "processes": [], "disks": []}))
         config = base / "config.json"
         config.write_text(json.dumps({"db_path": str(root / "metrics.db"), "interval": 60,
                                       "server_url": origin, "api_key": "fixture-only-key"}))
@@ -238,6 +278,7 @@ def run():
             wait_for(lambda: drained(initial) or errors, seconds=90)
             assert not errors, errors
             assert sum(uploads[1:]) == 101, uploads
+            assert ambient_seen >= 3, "fixture never exercised non-fixture upload accounting"
             assert len(claim_calls) >= 2
             assert telemetry_failures, "fixture never exercised ordinary ingest failure"
             print("PASS TLS/auth/closed claim, lost claim, restart completion replay, <=100 batching, mismatched-ack retry")
@@ -269,38 +310,30 @@ def run():
             # Hosted refuses one row without naming it. The daemon bisects, so
             # only that record is set aside and its batch siblings still arrive,
             # even while a busy host keeps spooling more than a narrowed batch.
-            stop_inflow = threading.Event()
-
-            inflowed = []
-
-            def inflow():
-                # Only the narrowing needs a busy host; siblings then drain.
-                while not (box / "upload-refused.json.bad").exists():
-                    inflowed.append(spool(f"upload-inflow-{len(inflowed)}.json",
-                                          {**record("busy host"), "logs": [{**row, "unit": "inflow", "message": "busy host"}]}))
-                    if stop_inflow.wait(.5):
-                        break
-
+            # Stop collection while publishing the cohort so the refused row
+            # cannot be consumed alone before its siblings exist.
+            process.terminate()
+            assert process.wait(timeout=12) == 0
             batch = [spool("upload-refused.json", record("reject-me"))]
             batch += [spool(f"upload-sibling-{i}.json", record(f"accepted sibling {i}")) for i in range(7)]
-            filler = threading.Thread(target=inflow, daemon=True)
-            filler.start()
-            try:
-                wait_for(lambda: drained(batch) or errors, seconds=300)
-            finally:
-                stop_inflow.set()
-                filler.join()
+            process = subprocess.Popen([AGENT, "--config", config], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            wait_for(lambda: drained(batch) or errors, seconds=300)
             assert not errors, errors
             assert (box / "upload-refused.json.bad").exists()
-            assert len(inflowed) >= 20, "bisection never ran against steady inflow"
+            assert len(inflowed) >= 100, "fixture never exercised a refused cohort under inflow"
+            assert retry_attempts == 3, "fixture never checked malformed and transport retries of pinned rows"
             assert not any((box / f"upload-sibling-{i}.json.bad").exists() for i in range(7))
             # One halving per round from the 100-row cap: at most 8 refusals.
             assert len(rejections) <= 8, rejections
+            wait_for(lambda: drained(inflowed) or errors, seconds=300)
+            assert not errors, errors
+            assert not any((box / (name + ".bad")).exists() for name in inflowed)
             delivered = sum(uploads)
             later = [spool("upload-good-after-refusal.json", record("good row"))]
             wait_for(lambda: drained(later) or errors)
+            assert not errors, errors
             assert sum(uploads) >= delivered + 1 and process.poll() is None
-            print("PASS refused row isolated by bisection under continuous inflow and quarantined alone; siblings and later uploads delivered")
+            print("PASS pinned cohort under rejection-boundary inflow, malformed/lost ack retries, singleton quarantine; siblings, inflow and later uploads delivered")
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()
