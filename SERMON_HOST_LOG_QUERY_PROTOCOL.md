@@ -85,7 +85,8 @@ claim/completion traffic; the hosted side
 tracks query-channel availability separately in `log_query_seen_at`. Do not
 busy-poll after empty claims. On network errors or 5xx, exponential backoff
 starting at two seconds, capped at 60 seconds, with jitter. On 429, honor
-`retry_after_seconds` (currently 60). On 401, suspend control requests until
+`retry_after_seconds` (currently 60); the daemon applies a 60 s floor and a
+300 s ceiling to the honored value. On 401, suspend control requests until
 credentials are reloaded/rotated. On 404 claim endpoint or 422 unsupported
 version, disable polling for five minutes; keep ordinary telemetry working.
 
