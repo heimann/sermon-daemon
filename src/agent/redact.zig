@@ -177,7 +177,26 @@ const Probe = ?usize;
 // They are deliberately conservative: a scanner returns null rather than risk a
 // partial/garbage match. The driver (scanFirst) tries them in priority order so
 // the most specific / highest-entropy pattern wins at a given position.
+//
+// INVARIANT: work per probe must be bounded by a constant, or by a span that
+// only a constant number of probes can re-walk (a failed walk is recorded in the
+// driver's Memo so probes inside it return at once). A walk-then-fail over the
+// whole buffer makes redaction quadratic.
 // ============================================================================
+
+/// Spans already proven to fail, shared by the probes of one left-to-right pass.
+/// email_until and jwt_until hold only for probes at or after the one that set
+/// them, so a probe that runs out of order (benignEnvValue) needs its own Memo.
+const Memo = struct {
+    email_until: usize = 0,
+    ipv6_from: usize = 0,
+    ipv6_until: usize = 0,
+    jwt_until: usize = 0,
+    /// Unquoted env values: no delimiter in [env_from, env_until), so any
+    /// unquoted value starting inside ends at env_until.
+    env_from: usize = 0,
+    env_until: usize = 0,
+};
 
 /// IPv4: d{1,3}.d{1,3}.d{1,3}.d{1,3}, each octet 0-255, dotted, 4 groups.
 fn scanIpv4(s: []const u8, start: usize) Probe {
@@ -214,13 +233,23 @@ fn scanIpv4(s: []const u8, start: usize) Probe {
 /// IPv6: at least two hex groups separated by ':', allowing one "::" elision.
 /// Conservative: requires either a "::" OR >= 3 colon-separated hex groups so
 /// we don't redact a bare "ab:cd" (that is the MAC scanner's job / too short).
-fn scanIpv6(s: []const u8, start: usize) Probe {
+///
+/// A probe that fails without a "::" also fails from every start between its
+/// first ':' and the start of its last group: such a start sees a token-aligned
+/// suffix, whose group, colon and hex-letter counts can only be lower and which
+/// cannot gain a "::". Starts inside the first or last group are not covered: a
+/// shorter group can slip under the 4-digit cap that stopped the full walk.
+fn scanIpv6(s: []const u8, start: usize, memo: *Memo) Probe {
+    if (start >= memo.ipv6_from and start < memo.ipv6_until) return null;
     var i = start;
     var groups: usize = 0;
     var colons: usize = 0;
+    var first_colon: usize = 0;
+    var last_group: usize = start;
     var saw_double: bool = false;
     var saw_hex_letter: bool = false;
     while (i < s.len) {
+        last_group = i;
         // Hex group (0-4 hex digits).
         var hx: usize = 0;
         while (i < s.len and isHex(s[i]) and hx < 4) : (i += 1) {
@@ -229,6 +258,7 @@ fn scanIpv6(s: []const u8, start: usize) Probe {
         }
         if (hx > 0) groups += 1;
         if (i < s.len and s[i] == ':') {
+            if (colons == 0) first_colon = i;
             colons += 1;
             i += 1;
             if (i < s.len and s[i] == ':') {
@@ -246,6 +276,10 @@ fn scanIpv6(s: []const u8, start: usize) Probe {
     // is an acceptable miss vs. destroying every timestamp's signal).
     if (saw_double and groups >= 1 and colons >= 2) return i;
     if (!saw_double and groups >= 3 and colons >= 2 and saw_hex_letter) return i;
+    if (!saw_double and colons > 0) {
+        memo.ipv6_from = first_colon;
+        memo.ipv6_until = last_group;
+    }
     return null;
 }
 
@@ -273,11 +307,16 @@ fn scanMac(s: []const u8, start: usize) Probe {
 
 /// EMAIL: local@domain.tld. Walk backward NOT needed; the driver anchors at the
 /// local-part start. We require a '@', a domain label, and a dotted TLD >= 2.
-fn scanEmail(s: []const u8, start: usize) Probe {
+///
+/// A failed probe depends only on where its local-part walk ended, so every
+/// start inside that walk fails identically; the memo records that end.
+fn scanEmail(s: []const u8, start: usize, memo: *Memo) Probe {
+    if (start < memo.email_until) return null;
     var i = start;
     const local_start = i;
     while (i < s.len and isEmailChar(s[i])) : (i += 1) {}
     if (i == local_start) return null; // empty local part
+    memo.email_until = i;
     if (i >= s.len or s[i] != '@') return null;
     i += 1; // consume '@'
     const domain_start = i;
@@ -377,18 +416,30 @@ fn scanOpenAiKey(s: []const u8, start: usize) Probe {
 }
 
 /// JWT: three base64url segments separated by '.', first two starting "eyJ".
-fn scanJwt(s: []const u8, start: usize) Probe {
+///
+/// Every start inside the first segment reaches the same segment end and then
+/// the same remaining walk, so a failure is recorded up to that end.
+fn scanJwt(s: []const u8, start: usize, memo: *Memo) Probe {
+    if (start < memo.jwt_until) return null;
     if (start + 3 > s.len or !std.mem.eql(u8, s[start .. start + 3], "eyJ")) return null;
     var i = start;
     var segs: usize = 0;
+    var first_end: usize = 0;
     while (segs < 3) : (segs += 1) {
         if (segs != 0) {
-            if (i >= s.len or s[i] != '.') return null;
+            if (i >= s.len or s[i] != '.') {
+                memo.jwt_until = first_end;
+                return null;
+            }
             i += 1;
         }
         const seg_start = i;
         while (i < s.len and isB64(s[i]) and s[i] != '.') : (i += 1) {}
-        if (i == seg_start) return null;
+        if (segs == 0) first_end = i;
+        if (i == seg_start) {
+            memo.jwt_until = first_end;
+            return null;
+        }
     }
     return i;
 }
@@ -452,7 +503,7 @@ const benign_env_keys = [_][]const u8{ "PWD", "USER" };
 /// separator by whitespace and/or a closing quote, so `password = x`,
 /// `"password":"x"`, and `"token" : "x"` all anchor on the key. Anchored on a
 /// word boundary so "newuser" does not match "user".
-fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
+fn matchSensitiveKey(s: []const u8, sep: usize, memo: *Memo) ?usize {
     // Walk back over spaces/tabs, then an optional single closing quote, to find
     // where the key token actually ends. Remember whether a quote was consumed:
     // a quoted key ({"USER":"bob"}) is JSON payload, not a bare env token, and
@@ -482,7 +533,7 @@ fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
             if (!std.mem.eql(u8, s[key_end - key.len .. key_end], key)) continue;
             const before = key_end - key.len;
             if (before > 0 and (isAlnum(s[before - 1]) or s[before - 1] == '_')) continue;
-            if (benignEnvValue(s, sep, key)) return null; // benign: preserve
+            if (benignEnvValue(s, sep, key, memo)) return null; // benign: preserve
             break; // token matched but value looks secret: fall through
         }
     }
@@ -501,7 +552,7 @@ fn matchSensitiveKey(s: []const u8, sep: usize) ?usize {
 /// Returns true only when the value looks benign, so the allowlist stays far
 /// narrower than the sensitive match. Locates the value token (past the
 /// separator, spaces, and one optional opening quote) exactly like the emitters.
-fn benignEnvValue(s: []const u8, sep: usize, key: []const u8) bool {
+fn benignEnvValue(s: []const u8, sep: usize, key: []const u8, memo: *Memo) bool {
     var j = sep + 1;
     while (j < s.len and (s[j] == ' ' or s[j] == '\t')) : (j += 1) {}
     var quoted = false;
@@ -510,11 +561,19 @@ fn benignEnvValue(s: []const u8, sep: usize, key: []const u8) bool {
         j += 1;
     }
     const v_start = j;
-    while (j < s.len) : (j += 1) {
-        const c = s[j];
-        if (quoted) {
-            if (c == '"' or c == '\'') break;
-        } else if (c == ' ' or c == '\t' or c == ',' or c == ';' or c == '\n' or c == '\r') break;
+    if (!quoted and v_start >= memo.env_from and v_start < memo.env_until) {
+        j = memo.env_until;
+    } else {
+        while (j < s.len) : (j += 1) {
+            const c = s[j];
+            if (quoted) {
+                if (c == '"' or c == '\'') break;
+            } else if (c == ' ' or c == '\t' or c == ',' or c == ';' or c == '\n' or c == '\r') break;
+        }
+        if (!quoted) {
+            memo.env_from = v_start;
+            memo.env_until = j;
+        }
     }
     const value = s[v_start..j];
     if (value.len == 0) return false;
@@ -533,7 +592,10 @@ fn benignEnvValue(s: []const u8, sep: usize, key: []const u8) bool {
     // username shape and, if no scanner matches it, is preserved -- narrow, USER
     // rarely holds secrets, and it is not a regression the corpus covers.
     if (isUnixUsername(value)) return true;
-    if (scanFirst(s, v_start) != null) return true;
+    // A fresh Memo: its entries hold only for starts at or after the probe
+    // that set them, and v_start runs ahead of the driver.
+    var scratch: Memo = .{};
+    if (scanFirst(s, v_start, &scratch) != null) return true;
     return false;
 }
 
@@ -590,20 +652,20 @@ fn scanValueToken(s: []const u8, start: usize) Probe {
 /// Try every standalone scanner at offset `i`, returning the highest-priority
 /// match anchored there, or null. Token/secret scanners are anchored on a word
 /// boundary so we don't match inside an unrelated identifier.
-fn scanFirst(s: []const u8, i: usize) ?Match {
+fn scanFirst(s: []const u8, i: usize, memo: *Memo) ?Match {
     const boundary = boundaryBefore(s, i);
 
     // Order matters: most specific / highest-confidence first.
     if (boundary) {
         if (scanAwsKey(s, i)) |e| return .{ .start = i, .end = e, .tag = .aws_key };
         if (scanOpenAiKey(s, i)) |e| return .{ .start = i, .end = e, .tag = .openai_key };
-        if (scanJwt(s, i)) |e| return .{ .start = i, .end = e, .tag = .jwt };
+        if (scanJwt(s, i, memo)) |e| return .{ .start = i, .end = e, .tag = .jwt };
         if (scanProviderToken(s, i)) |e| return .{ .start = i, .end = e, .tag = .token };
     }
-    if (scanEmail(s, i)) |e| return .{ .start = i, .end = e, .tag = .email };
+    if (scanEmail(s, i, memo)) |e| return .{ .start = i, .end = e, .tag = .email };
     if (scanMac(s, i)) |e| return .{ .start = i, .end = e, .tag = .mac };
     if (scanIpv4(s, i)) |e| return .{ .start = i, .end = e, .tag = .ip };
-    if (scanIpv6(s, i)) |e| return .{ .start = i, .end = e, .tag = .ipv6 };
+    if (scanIpv6(s, i, memo)) |e| return .{ .start = i, .end = e, .tag = .ipv6 };
     if (boundary) {
         if (scanSsn(s, i)) |e| return .{ .start = i, .end = e, .tag = .ssn };
         if (scanCard(s, i)) |e| return .{ .start = i, .end = e, .tag = .card };
@@ -620,11 +682,12 @@ pub fn redactText(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
+    var memo: Memo = .{};
     while (i < src.len) {
         // 1. key=value structural rule. When we are sitting on a '=' or ':'
         //    whose left side is a sensitive key, redact the value token.
         if ((src[i] == '=' or src[i] == ':') and i > 0) {
-            if (matchSensitiveKey(src, i)) |_| {
+            if (matchSensitiveKey(src, i, &memo)) |_| {
                 var j = i + 1;
                 while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
                 // For "user:" we keep the colon-as-separator only when a value
@@ -644,7 +707,7 @@ pub fn redactText(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
         }
 
         // 2. standalone scanners.
-        if (scanFirst(src, i)) |m| {
+        if (scanFirst(src, i, &memo)) |m| {
             try out.appendSlice(allocator, m.tag.text());
             i = m.end;
             continue;
@@ -702,10 +765,11 @@ fn collectDeterministic(
     list: *std.ArrayList(TaggedSpan),
 ) Allocator.Error!void {
     var i: usize = 0;
+    var memo: Memo = .{};
     while (i < src.len) {
         // 1. key=value structural rule (same condition as redactText).
         if ((src[i] == '=' or src[i] == ':') and i > 0) {
-            if (matchSensitiveKey(src, i)) |_| {
+            if (matchSensitiveKey(src, i, &memo)) |_| {
                 var j = i + 1;
                 while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
                 if (scanValueToken(src, j)) |vend| {
@@ -728,7 +792,7 @@ fn collectDeterministic(
         }
 
         // 2. standalone scanners.
-        if (scanFirst(src, i)) |m| {
+        if (scanFirst(src, i, &memo)) |m| {
             try list.append(allocator, .{
                 .start = m.start,
                 .end = m.end,
@@ -1612,4 +1676,102 @@ test "merged: redactProcess with a stub NER scrubs cmdline person + secret" {
     try testing.expect(std.mem.indexOf(u8, proc.cmdline, "hunter2") == null);
     try testing.expect(std.mem.indexOf(u8, proc.cmdline, "<REDACTED:PERSON>") != null);
     try testing.expect(std.mem.indexOf(u8, proc.cmdline, "<REDACTED:VALUE>") != null);
+}
+
+// ============================================================================
+// Linear-time regression: every scanner is probed at every offset, so a single
+// long run must not make redaction quadratic.
+// ============================================================================
+
+fn fillShape(buf: []u8, unit: []const u8) void {
+    for (buf, 0..) |*b, k| b.* = unit[k % unit.len];
+}
+
+const linear_shapes = [_][]const u8{
+    "a", // all-alnum run: scanEmail local part
+    "1:", // all-decimal colon run: scanIpv6 fails, memoized per run
+    "eyJ+", // scanJwt first segment runs to the end of the buffer with no '.'
+    "PWD=/", // benign env value with no delimiter before the end of the buffer
+    "USER=10.0.0.1-", // as above, benign via a standalone scanner
+    "a:", // hex-letter colon run: matches, then driver skips
+    "the quick brown fox jumps over a lazy dog ", // benign prose
+};
+
+fn redactCpuNs(a: Allocator, src: []const u8) !u64 {
+    const t0 = try std.posix.clock_gettime(.PROCESS_CPUTIME_ID);
+    const out = try redactTextMerged(a, src, null, 0.5);
+    const t1 = try std.posix.clock_gettime(.PROCESS_CPUTIME_ID);
+    a.free(out);
+    const ns0 = @as(u64, @intCast(t0.sec)) * std.time.ns_per_s + @as(u64, @intCast(t0.nsec));
+    const ns1 = @as(u64, @intCast(t1.sec)) * std.time.ns_per_s + @as(u64, @intCast(t1.nsec));
+    return ns1 - ns0;
+}
+
+test "redaction time is linear in message length for attacker-shaped runs" {
+    const a = testing.allocator;
+    const small = try a.alloc(u8, 16384);
+    defer a.free(small);
+    const large = try a.alloc(u8, 131072);
+    defer a.free(large);
+    for (linear_shapes) |unit| {
+        fillShape(small, unit);
+        fillShape(large, unit);
+        // Best of several runs: other test binaries share the CPU, and only a
+        // lower bound reflects the algorithm rather than contention.
+        var t_small: u64 = std.math.maxInt(u64);
+        var t_large: u64 = std.math.maxInt(u64);
+        for (0..5) |_| {
+            t_small = @min(t_small, try redactCpuNs(a, small));
+            t_large = @min(t_large, try redactCpuNs(a, large));
+        }
+        t_small = @max(t_small, 1);
+        // 8x the length: linear is ~8x, quadratic is ~64x.
+        try testing.expect(@as(f64, @floatFromInt(t_large)) < 20.0 * @as(f64, @floatFromInt(t_small)));
+    }
+}
+
+test "driver recall: long email local parts and IPv6 literals are fully redacted" {
+    const a = testing.allocator;
+    const dec = try a.alloc(u8, 4096);
+    defer a.free(dec);
+    fillShape(dec, "1:");
+    try expectRedact(dec, dec);
+    const hex = try a.alloc(u8, 4096);
+    defer a.free(hex);
+    fillShape(hex, "a:");
+    try expectRedact(hex, "<REDACTED:IPV6>");
+
+    try expectRedact("a:a:a:a:a:a", "<REDACTED:IPV6>");
+    try expectRedact("1:" ** 1000 ++ "a", "<REDACTED:IPV6>");
+    try expectRedact("2001:4860:4860:0:0:0:0:8888:a", "<REDACTED:IPV6>");
+    try expectRedact("1:1:1:1:1:1:1:1:a", "<REDACTED:IPV6>");
+    try expectRedact("2001:db8::1", "<REDACTED:IPV6>");
+    try expectRedact("fp=43:51:43:a1:b5:fc:8b:b7:0a:3a:a9:b1:0f:66:73:a8", "fp=<REDACTED:MAC><REDACTED:IPV6>");
+    try expectRedact("dead:beef:dead:beef:dead:beef:dead:beef:dead:beef", "<REDACTED:IPV6>");
+    try expectRedact("a:b:c:d:e:f:a:b:c", "<REDACTED:IPV6>");
+    try expectRedact("2001:db8:1:2:3:4:5:6:dead", "<REDACTED:IPV6>");
+
+    try expectRedact("a" ** 64 ++ "@example.com", "<REDACTED:EMAIL>");
+    try expectRedact("b" ** 65 ++ "@example.com", "<REDACTED:EMAIL>");
+    try expectRedact("x=" ++ "a" ** 100 ++ "@example.com y", "x=<REDACTED:EMAIL> y");
+    try expectRedact("c" ** 70 ++ ".y@example.com", "<REDACTED:EMAIL>");
+    try expectRedact("CAJabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef@mail.gmail.com", "<REDACTED:EMAIL>");
+    try expectRedact("Message-ID: <CAJabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef@mail.gmail.com>", "Message-ID: <<REDACTED:EMAIL>>");
+    try expectRedact("::1bob@x.com", "<REDACTED:IPV6><REDACTED:EMAIL>");
+    try expectRedact("fe80::abcbob@example.com", "<REDACTED:IPV6><REDACTED:EMAIL>");
+    try expectRedact("00:1a:2b:3c:4d:5ezbob@example.com", "<REDACTED:MAC><REDACTED:EMAIL>");
+}
+
+test "merged with null ner is byte-identical to redactText for linear-test shapes" {
+    const a = testing.allocator;
+    const buf = try a.alloc(u8, 2048);
+    defer a.free(buf);
+    for (linear_shapes) |unit| {
+        fillShape(buf, unit);
+        const plain = try redactText(a, buf);
+        defer a.free(plain);
+        const merged = try redactTextMerged(a, buf, null, 0.5);
+        defer a.free(merged);
+        try testing.expectEqualStrings(plain, merged);
+    }
 }
