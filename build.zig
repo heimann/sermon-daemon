@@ -300,6 +300,16 @@ pub fn build(b: *std.Build) void {
     const ner_tests = b.addTest(.{ .root_module = ner_mod });
     const redact_tests = b.addTest(.{ .root_module = redact_mod });
 
+    const cli_output_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/output.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_output_test_mod.addImport("collector", collector_mod);
+    cli_output_test_mod.addImport("logs", logs_mod);
+    const cli_output_tests = b.addTest(.{ .root_module = cli_output_test_mod });
+
     const test_step = b.step("test", "Run all tests");
     const worker_tests = b.addTest(.{ .root_module = worker_mod });
     test_step.dependOn(&b.addRunArtifact(worker_tests).step);
@@ -317,6 +327,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(staging_tests).step);
     test_step.dependOn(&b.addRunArtifact(roll_tests).step);
     test_step.dependOn(&b.addRunArtifact(parquet_query_tests).step);
+    test_step.dependOn(&b.addRunArtifact(cli_output_tests).step);
 
     // ── Bench (resource usage check) ──
     const bench = b.addSystemCommand(&.{ "bash", "bench.sh" });
