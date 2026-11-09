@@ -148,12 +148,16 @@ pub const LogTailer = struct {
     }
 };
 
+const max_journal_line_bytes = 1024 * 1024;
+
 /// Systemd journal tailer using journalctl subprocess
 const JournalTailer = struct {
     allocator: Allocator,
     process: ChildProcess,
     line_buffer: std.ArrayList(u8),
     running: bool,
+    discarding: bool = false,
+    warned_oversize: bool = false,
 
     pub fn init(allocator: Allocator) !JournalTailer {
         var process = ChildProcess.init(&[_][]const u8{
@@ -191,22 +195,42 @@ const JournalTailer = struct {
     pub fn next(self: *JournalTailer) !?LogEntry {
         if (!self.running) return null;
 
-        self.line_buffer.clearRetainingCapacity();
-
-        // Read one line of JSON
+        // Read one line of JSON. On WouldBlock the bytes read so far stay in
+        // line_buffer and the pipe position has already advanced past them, so
+        // the buffer is only cleared once a full line has been consumed. A line
+        // over max_journal_line_bytes is dropped and input skipped to the next
+        // newline, bounding memory across calls.
         const reader = self.process.stdout.?.deprecatedReader();
-        reader.streamUntilDelimiter(
-            self.line_buffer.writer(self.allocator),
-            '\n',
-            null,
-        ) catch |err| {
-            if (err == error.EndOfStream) {
-                self.running = false;
-                return null;
+        while (true) {
+            const byte = reader.readByte() catch |err| {
+                if (err == error.EndOfStream) {
+                    self.running = false;
+                    return null;
+                }
+                if (err == error.WouldBlock) return null;
+                self.line_buffer.clearRetainingCapacity();
+                self.discarding = false;
+                return err;
+            };
+            if (byte == '\n') {
+                if (!self.discarding) break;
+                self.discarding = false;
+                self.line_buffer.clearRetainingCapacity();
+                continue;
             }
-            if (err == error.WouldBlock) return null;
-            return err;
-        };
+            if (self.discarding) continue;
+            if (self.line_buffer.items.len >= max_journal_line_bytes) {
+                self.discarding = true;
+                self.line_buffer.clearRetainingCapacity();
+                if (!self.warned_oversize) {
+                    self.warned_oversize = true;
+                    std.log.warn("journal line exceeds {d} bytes; dropping it, coverage unknown", .{max_journal_line_bytes});
+                }
+                continue;
+            }
+            try self.line_buffer.append(self.allocator, byte);
+        }
+        defer self.line_buffer.clearRetainingCapacity();
 
         // Parse JSON
         const parsed = std.json.parseFromSlice(
@@ -519,4 +543,60 @@ test "structured trace IDs normalize, absent invalid and zero IDs stay null" {
     try std.testing.expect((try normalizeTrace(a, null)) == null);
     try std.testing.expect((try normalizeTrace(a, "00000000000000000000000000000000")) == null);
     try std.testing.expect((try normalizeTrace(a, "trace_id=abcdef0123456789abcdef0123456789")) == null);
+}
+
+test "JournalTailer reassembles a line split across a non-blocking read" {
+    const fds = try std.posix.pipe2(.{ .NONBLOCK = true });
+    defer std.posix.close(fds[1]);
+
+    var process = ChildProcess.init(&[_][]const u8{"unused"}, std.testing.allocator);
+    process.stdout = std.fs.File{ .handle = fds[0] };
+    defer process.stdout.?.close();
+    var tailer = JournalTailer{
+        .allocator = std.testing.allocator,
+        .process = process,
+        .line_buffer = std.ArrayList(u8){},
+        .running = true,
+    };
+    defer tailer.line_buffer.deinit(std.testing.allocator);
+
+    const line = "{\"MESSAGE\":\"split entry\",\"SYSLOG_IDENTIFIER\":\"sshd\"}\n";
+    const half = line.len / 2;
+    _ = try std.posix.write(fds[1], line[0..half]);
+    try std.testing.expect((try tailer.next()) == null);
+    _ = try std.posix.write(fds[1], line[half..]);
+
+    var entry = (try tailer.next()) orelse return error.TestExpectedEntry;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("split entry", entry.message);
+    try std.testing.expectEqualStrings("sshd", entry.identifier.?);
+}
+
+test "JournalTailer drops a line over the cap without unbounded growth and resumes" {
+    const fds = try std.posix.pipe2(.{ .NONBLOCK = true });
+    defer std.posix.close(fds[1]);
+
+    var process = ChildProcess.init(&[_][]const u8{"unused"}, std.testing.allocator);
+    process.stdout = std.fs.File{ .handle = fds[0] };
+    defer process.stdout.?.close();
+    var tailer = JournalTailer{
+        .allocator = std.testing.allocator,
+        .process = process,
+        .line_buffer = std.ArrayList(u8){},
+        .running = true,
+    };
+    defer tailer.line_buffer.deinit(std.testing.allocator);
+
+    const chunk = [_]u8{'x'} ** 32768;
+    var sent: usize = 0;
+    while (sent < max_journal_line_bytes + 3 * chunk.len) : (sent += chunk.len) {
+        _ = try std.posix.write(fds[1], &chunk);
+        try std.testing.expect((try tailer.next()) == null);
+        try std.testing.expect(tailer.line_buffer.items.len <= max_journal_line_bytes);
+    }
+    _ = try std.posix.write(fds[1], "\n{\"MESSAGE\":\"after\"}\n");
+
+    var entry = (try tailer.next()) orelse return error.TestExpectedEntry;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("after", entry.message);
 }
