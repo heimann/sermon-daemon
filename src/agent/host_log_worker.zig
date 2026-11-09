@@ -454,6 +454,8 @@ fn loadRecord(a: std.mem.Allocator, data: []const u8) !Record {
     }
     try row.object.put("message", .{ .string = log.message });
     try row.object.put("source", .{ .string = log.source });
+    try row.object.put("identifier", if (log.identifier) |v| .{ .string = v } else .null);
+    try row.object.put("unit", if (log.unit) |v| .{ .string = v } else .null);
     return .{ .payload = record.value, .row = row };
 }
 fn clearClaim(box: *outbox.Outbox) !void {
@@ -634,6 +636,11 @@ test "poison spool records are errors, never panics, and empty rows do not fail 
     try std.testing.expectError(error.InvalidRow, loadRecord(a, try std.fmt.allocPrint(a, row, .{"nul\\u0000byte"})));
     const ok = try loadRecord(a, try std.fmt.allocPrint(a, row, .{"password=secret-value"}));
     try std.testing.expect(std.mem.indexOf(u8, ok.row.object.get("message").?.string, "secret-value") == null);
+    const ident_row = "{\"collected_at\":1,\"logs\":[{\"timestamp\":1,\"source\":\"systemd\",\"unit\":\"AKIAIOSFODNN7EXAMPLE\",\"identifier\":\"AKIAIOSFODNN7EXAMPLE\",\"systemd_unit\":\"user@1000.service\",\"priority\":3,\"message\":\"x\",\"pid\":null,\"trace_id\":null}]}";
+    const ident = try loadRecord(a, ident_row);
+    try std.testing.expect(std.mem.indexOf(u8, ident.row.object.get("identifier").?.string, "AKIAIOSFODNN7EXAMPLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ident.row.object.get("unit").?.string, "AKIAIOSFODNN7EXAMPLE") == null);
+    try std.testing.expectEqualStrings("user@1000.service", ident.row.object.get("systemd_unit").?.string);
 
     var entries = [_]logs.LogEntry{
         .{ .timestamp = 2, .source = try a.dupe(u8, "systemd"), .unit = null, .identifier = null, .systemd_unit = null, .priority = 3, .message = try a.dupe(u8, ""), .pid = null },
