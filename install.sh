@@ -11,7 +11,9 @@ Usage: install.sh [--server-name <name>] [--ingestion-key <key>] [options]
 
 Options:
   --server-name <name>          Human name for this server. Default: hostname.
-  --ingestion-key <key>         Optional Sermon ingestion key. If omitted, installs local-only.
+  --ingestion-key <key>         Sermon ingestion key (or set SERMON_INGESTION_KEY, which keeps it
+                                out of the process list). Without it the install is local-only.
+  --local-only                  Allow a keyless install even with --server-name/--server-url.
   --server-url <url>            Sermon web URL for remote push. Default: https://sermon.fyi
   --version <tag>               Release tag. Default: latest GitHub release.
   --release-base-url <url>      Base URL containing tarball + .sha256 files.
@@ -49,7 +51,7 @@ json_escape() {
 }
 
 SERVER_NAME=""
-INGESTION_KEY=""
+INGESTION_KEY="${SERMON_INGESTION_KEY:-}"
 SERVER_URL="${SERMON_SERVER_URL:-${DEFAULT_SERVER_URL}}"
 VERSION="${SERMON_INSTALL_VERSION:-}"
 RELEASE_BASE_URL="${SERMON_RELEASE_BASE_URL:-${DEFAULT_RELEASE_BASE_URL}}"
@@ -57,19 +59,27 @@ INSTALL_DIR=""
 CONFIG_DIR_OVERRIDE=""
 DB_PATH_OVERRIDE=""
 SERVICE_NAME="${SERMON_SERVICE_NAME:-sermon-agent}"
+LOCAL_ONLY=0
+HOSTED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --server-name)
       SERVER_NAME="${2:-}"
+      HOSTED=1
       shift 2
       ;;
     --ingestion-key)
       INGESTION_KEY="${2:-}"
       shift 2
       ;;
+    --local-only)
+      LOCAL_ONLY=1
+      shift
+      ;;
     --server-url)
       SERVER_URL="${2:-}"
+      HOSTED=1
       shift 2
       ;;
     --version)
@@ -105,6 +115,9 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Only needed to write config.json; keep it out of curl, tar and systemctl.
+unset SERMON_INGESTION_KEY
 
 if [[ -z "${SERVER_NAME}" ]]; then
   SERVER_NAME="$(hostname 2>/dev/null || printf 'sermon-host')"
@@ -164,6 +177,13 @@ else
   UNIT_PATH="${UNIT_DIR}/${UNIT_NAME}"
   SYSTEMCTL=(systemctl --user)
   JOURNALCTL=(journalctl --user -u "${UNIT_NAME}")
+fi
+
+# A hosted command (it passes --server-name/--server-url) that arrives keyless
+# usually lost the key to sudo's environment reset; fail rather than silently
+# installing local-only.
+if [[ -z "${INGESTION_KEY}" && "${HOSTED}" == "1" && "${LOCAL_ONLY}" == "0" && ! -f "${CONFIG_DIR}/config.json" ]]; then
+  fail "no ingestion key given. Set SERMON_INGESTION_KEY (sudo drops it: run as root, or pass --ingestion-key), or pass --local-only"
 fi
 
 if [[ -z "${VERSION}" ]]; then
