@@ -313,6 +313,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     const worker_tests = b.addTest(.{ .root_module = worker_mod });
     test_step.dependOn(&b.addRunArtifact(worker_tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = agent_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = protocol_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = outbox_mod })).step);
     test_step.dependOn(&b.addRunArtifact(ner_tests).step);
