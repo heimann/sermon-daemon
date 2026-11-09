@@ -132,6 +132,33 @@ const ProcessStats = struct {
     timestamp: i64,
 };
 
+/// Upper bound on the mount table we will parse. Unprivileged users can add
+/// mounts (FUSE), so an unbounded read is a memory risk. Past the bound we keep
+/// the whole lines that fit rather than failing: an error here would make the
+/// caller drop the cycle's telemetry.
+const max_mount_table_bytes = 4 * 1024 * 1024;
+var mount_truncation_warned = false;
+
+fn readMountTable(allocator: Allocator, file: fs.File) ![]u8 {
+    var list = std.ArrayList(u8){};
+    errdefer list.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (list.items.len < max_mount_table_bytes) {
+        const want = @min(chunk.len, max_mount_table_bytes - list.items.len);
+        const n = try file.read(chunk[0..want]);
+        if (n == 0) return list.toOwnedSlice(allocator);
+        try list.appendSlice(allocator, chunk[0..n]);
+    }
+    // At the cap: only a truncation if more data remains.
+    if ((try file.read(chunk[0..1])) == 0) return list.toOwnedSlice(allocator);
+    if (std.mem.lastIndexOfScalar(u8, list.items, '\n')) |nl| list.shrinkRetainingCapacity(nl + 1);
+    if (!mount_truncation_warned) {
+        mount_truncation_warned = true;
+        std.log.warn("/proc/mounts exceeds {d} bytes; later mounts are not reported", .{max_mount_table_bytes});
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 pub const Collector = struct {
     allocator: Allocator,
     prev_cpu: ?CpuStats,
@@ -845,9 +872,8 @@ pub const Collector = struct {
         const mounts_file = try fs.openFileAbsolute("/proc/mounts", .{});
         defer mounts_file.close();
 
-        var buf: [32768]u8 = undefined; // /proc/mounts can have many entries
-        const bytes_read = try mounts_file.readAll(&buf);
-        const content = buf[0..bytes_read];
+        const content = try readMountTable(allocator, mounts_file);
+        defer allocator.free(content);
 
         var line_it = std.mem.splitScalar(u8, content, '\n');
         while (line_it.next()) |line| {
@@ -1477,4 +1503,38 @@ test "collect disks" {
         }
     }
     try std.testing.expect(found_root);
+}
+
+test "readMountTable returns a mount table larger than 32 KiB whole" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const line = "fuse /mnt/x fuse rw 0 0\n";
+    const count = 40_000 / line.len + 1;
+    const file = try tmp.dir.createFile("mounts", .{ .read = true });
+    defer file.close();
+    for (0..count) |_| try file.writeAll(line);
+    const tail = "/dev/sda1 /data ext4 rw 0 0\n";
+    try file.writeAll(tail);
+    try file.seekTo(0);
+
+    const content = try readMountTable(std.testing.allocator, file);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(content.len > 32768);
+    try std.testing.expect(std.mem.endsWith(u8, content, tail));
+}
+
+test "readMountTable keeps whole lines when the table exceeds the cap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const line = "fuse /mnt/x fuse rw 0 0\n";
+    const file = try tmp.dir.createFile("mounts", .{ .read = true });
+    defer file.close();
+    for (0..max_mount_table_bytes / line.len + 100) |_| try file.writeAll(line);
+    try file.seekTo(0);
+
+    const content = try readMountTable(std.testing.allocator, file);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(content.len <= max_mount_table_bytes);
+    try std.testing.expect(content.len > max_mount_table_bytes / 2);
+    try std.testing.expectEqual(@as(u8, '\n'), content[content.len - 1]);
 }

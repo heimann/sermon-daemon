@@ -545,9 +545,9 @@ pub fn main() !void {
             }
             allocator.free(procs);
         }
-        const disks = collector_mod.Collector.collectDisks(allocator) catch |err| {
+        const disks = collector_mod.Collector.collectDisks(allocator) catch |err| blk: {
             std.debug.print("Warning: disk collection failed: {}\n", .{err});
-            continue;
+            break :blk try allocator.alloc(collector_mod.DiskInfo, 0);
         };
         defer {
             for (disks) |d| {
