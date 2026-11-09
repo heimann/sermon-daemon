@@ -284,11 +284,11 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--key-file")) {
             const key_path = args.next() orelse {
                 std.debug.print("Error: --key-file requires a path\n", .{});
-                return;
+                std.process.exit(1);
             };
             const key = readKeyFile(allocator, key_path) catch |err| {
                 std.debug.print("Error: cannot read key from '{s}': {}\n", .{ key_path, err });
-                return;
+                std.process.exit(1);
             };
             if (key_from_file) |old| allocator.free(old);
             key_from_file = key;
@@ -949,7 +949,10 @@ fn readKeyFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     defer file.close();
     var buf: [1024]u8 = undefined;
     const len = try file.readAll(&buf);
-    const key = std.mem.trim(u8, buf[0..len], " \t\r\n");
+    if (len == buf.len) return error.KeyFileTooLarge;
+    const first_line = buf[0 .. std.mem.indexOfScalar(u8, buf[0..len], '\n') orelse len];
+    const key = std.mem.trim(u8, first_line, " \t\r");
+    for (key) |c| if (c < 0x21 or c == 0x7f) return error.InvalidKey;
     if (key.len == 0) return error.EmptyKey;
     return allocator.dupe(u8, key);
 }
@@ -968,6 +971,28 @@ test "readKeyFile trims whitespace and rejects an empty file" {
     defer std.testing.allocator.free(key);
     try std.testing.expectEqualStrings("serm_abc123", key);
     try std.testing.expectError(error.EmptyKey, readKeyFile(std.testing.allocator, empty_path));
+
+    try tmp.dir.writeFile(.{ .sub_path = "multi", .data = "abc\ndef\n" });
+    const multi_path = try tmp.dir.realpathAlloc(std.testing.allocator, "multi");
+    defer std.testing.allocator.free(multi_path);
+    const first = try readKeyFile(std.testing.allocator, multi_path);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("abc", first);
+
+    try tmp.dir.writeFile(.{ .sub_path = "inner", .data = "ab cd\n" });
+    const inner_path = try tmp.dir.realpathAlloc(std.testing.allocator, "inner");
+    defer std.testing.allocator.free(inner_path);
+    try std.testing.expectError(error.InvalidKey, readKeyFile(std.testing.allocator, inner_path));
+
+    try tmp.dir.writeFile(.{ .sub_path = "ctl", .data = "ab\x01cd\n" });
+    const ctl_path = try tmp.dir.realpathAlloc(std.testing.allocator, "ctl");
+    defer std.testing.allocator.free(ctl_path);
+    try std.testing.expectError(error.InvalidKey, readKeyFile(std.testing.allocator, ctl_path));
+
+    try tmp.dir.writeFile(.{ .sub_path = "big", .data = "k" ** 2048 });
+    const big_path = try tmp.dir.realpathAlloc(std.testing.allocator, "big");
+    defer std.testing.allocator.free(big_path);
+    try std.testing.expectError(error.KeyFileTooLarge, readKeyFile(std.testing.allocator, big_path));
 }
 
 fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
