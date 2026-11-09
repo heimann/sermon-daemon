@@ -217,6 +217,8 @@ pub fn main() !void {
     var server_url: ?[]const u8 = if (config) |c| c.value.server_url else null;
     var api_key: ?[]const u8 = if (config) |c| c.value.api_key else null;
     var cli_credentials = false;
+    var key_from_file: ?[]u8 = null;
+    defer if (key_from_file) |k| allocator.free(k);
     // RETAINED FOR BACK-COMPAT: still parsed so old config.json files load, but
     // the resident-DuckDB write path it capped is retired. Logged at startup.
     const memory_limit_mb: u32 = if (config) |c|
@@ -279,6 +281,19 @@ pub fn main() !void {
                 std.debug.print("Error: --key requires a token\n", .{});
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--key-file")) {
+            const key_path = args.next() orelse {
+                std.debug.print("Error: --key-file requires a path\n", .{});
+                return;
+            };
+            const key = readKeyFile(allocator, key_path) catch |err| {
+                std.debug.print("Error: cannot read key from '{s}': {}\n", .{ key_path, err });
+                return;
+            };
+            if (key_from_file) |old| allocator.free(old);
+            key_from_file = key;
+            cli_credentials = true;
+            api_key = key;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
                 \\Usage: sermon-agent [OPTIONS]
@@ -288,7 +303,10 @@ pub fn main() !void {
                 \\  --db <path>         Database path (default: ~/.local/share/sermon/metrics.db)
                 \\  --interval <secs>   Collection interval in seconds (default: 10)
                 \\  --server <url>      Push metrics to web server (optional)
-                \\  --key <token>       Ingestion key for web server (optional)
+                \\  --key <token>       Ingestion key for web server (optional). Visible to
+                \\                      other local users via /proc and ps; prefer --key-file
+                \\                      or api_key in the config file
+                \\  --key-file <path>   Read the ingestion key from a file (first line, trimmed)
                 \\  -h, --help          Show this help
                 \\
             , .{});
@@ -921,6 +939,35 @@ fn readHostname(allocator: std.mem.Allocator) ![]const u8 {
     }
 
     return allocator.dupe(u8, hostname);
+}
+
+/// Reads an ingestion key from `path` (keeps it out of argv, where other local
+/// users can read it). Surrounding whitespace is trimmed; an empty key is an
+/// error so a blank file cannot silently disable remote push.
+fn readKeyFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    var buf: [1024]u8 = undefined;
+    const len = try file.readAll(&buf);
+    const key = std.mem.trim(u8, buf[0..len], " \t\r\n");
+    if (key.len == 0) return error.EmptyKey;
+    return allocator.dupe(u8, key);
+}
+
+test "readKeyFile trims whitespace and rejects an empty file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "key", .data = "  serm_abc123\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "empty", .data = "\n" });
+    const key_path = try tmp.dir.realpathAlloc(std.testing.allocator, "key");
+    defer std.testing.allocator.free(key_path);
+    const empty_path = try tmp.dir.realpathAlloc(std.testing.allocator, "empty");
+    defer std.testing.allocator.free(empty_path);
+
+    const key = try readKeyFile(std.testing.allocator, key_path);
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqualStrings("serm_abc123", key);
+    try std.testing.expectError(error.EmptyKey, readKeyFile(std.testing.allocator, empty_path));
 }
 
 fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {

@@ -39,6 +39,8 @@ The installer creates a systemd service:
 - root install: `/opt/sermon`, `/etc/sermon`, `/var/lib/sermon/metrics.db`, `sermon-agent.service`
 - user install: `~/.local/opt/sermon`, `~/.config/sermon`, `~/.local/share/sermon/metrics.db`, user `sermon-agent.service`
 
+When running `sermon-agent` by hand, `--key <token>` leaves the ingestion key readable by other local users in `/proc/<pid>/cmdline` and `ps` for the life of the process. Prefer `--key-file <path>` (a file readable only by the daemon user) or `api_key` in the `0600` config file. Installed units already use `--config`.
+
 To update an installed daemon, rerun the installer with the desired `--version`. If an existing config is present and no `--ingestion-key` is provided, the installer preserves the existing config, replaces the binaries, and restarts the systemd service.
 
 ## Query local data
@@ -223,7 +225,7 @@ The worker honors rate-limit delays, backs off on disconnect/5xx, disables claim
 for five minutes on unsupported endpoints. After a 401 it logs once, pauses
 claims and log uploads on a backoff from 5 minutes up to 1 hour, and re-reads
 `server_url`/`api_key` from the config file before each retry (credentials given
-as flags cannot be re-read). A changed key is re-bound first, so old uploads are
+as flags, including `--key-file`, cannot be re-read). A changed key is re-bound first, so old uploads are
 held rather than sent to a different server. Ordinary telemetry keeps its
 per-cycle attempts and resumes everything on its first accepted request; no
 restart is needed. Keep the host clock synchronized: a missing hosted HTTP Date
