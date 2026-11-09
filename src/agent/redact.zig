@@ -8,9 +8,11 @@
 //!
 //! Design constraints (PRAGMATIC-MINIMAL):
 //!   * Only the highest-PII free-text fields are scanned: LogEntry.message,
-//!     LogEntry.source, DiskInfo.mount_point, ProcessInfo.cgroup. Everything
-//!     else (process name, units, identifiers, ALL numerics) is preserved -
-//!     it is operational signal the anomaly engine needs.
+//!     LogEntry.source, DiskInfo.mount_point, ProcessInfo.cgroup, plus the
+//!     SYSLOG_IDENTIFIER (and `unit` when copied from it), which is client-
+//!     supplied. systemd_unit is journald-verified and left exact. Everything
+//!     else (process name, ALL numerics) is preserved - it is operational
+//!     signal the anomaly engine needs.
 //!   * No regex (Zig stdlib has none). Every rule is a hand-written byte
 //!     scanner over []const u8.
 //!   * Allocation-careful: each struct string field is an individually-owned
@@ -1068,11 +1070,29 @@ fn redactMountPoint(allocator: Allocator, field: *[]const u8) Allocator.Error!vo
 // Public entry points - operate on the in-memory slices in place.
 // ============================================================================
 
+fn replaceOptionalField(allocator: Allocator, field: *?[]const u8) ner.Error!void {
+    if (field.*) |value| {
+        var tmp = value;
+        try replaceField(allocator, &tmp, null);
+        field.* = tmp;
+    }
+}
+
 /// Redact a single LogEntry: message (full scan + optional NER, shape-
-/// preserving) and source (basename only). identifier / systemd_unit / unit /
-/// numerics are preserved. `maybe_ner` null => deterministic-only (never raw).
+/// preserving), source (basename only), and the client-supplied
+/// SYSLOG_IDENTIFIER (and the unit copied from it), deterministic scanners only.
+/// Numerics are preserved. `maybe_ner` null => deterministic-only (never raw).
 pub fn redactLog(allocator: Allocator, entry: *LogEntry, maybe_ner: ?Ner) ner.Error!void {
     try replaceField(allocator, &entry.message, maybe_ner);
+    // logs.zig derives `unit` from the client-supplied identifier when one is
+    // present; systemd_unit is journald-verified and must stay exact (templated
+    // names like user@1000.service would otherwise scan as EMAIL).
+    const unit_is_identifier = if (entry.unit) |u|
+        if (entry.identifier) |i| std.mem.eql(u8, u, i) else false
+    else
+        false;
+    try replaceOptionalField(allocator, &entry.identifier);
+    if (unit_is_identifier) try replaceOptionalField(allocator, &entry.unit);
     try redactSource(allocator, &entry.source);
 }
 
@@ -1395,6 +1415,44 @@ test "record count and structure invariant: in-place replace preserves slice" {
     try testing.expectEqualStrings("auth.log", entries[0].source);
     try testing.expectEqualStrings("no pii here", entries[1].message);
     try testing.expectEqualStrings("kernel", entries[1].source);
+}
+
+test "redactLog scrubs a secret-shaped identifier but keeps templated systemd units exact" {
+    var entry = LogEntry{
+        .timestamp = 1,
+        .source = try testing.allocator.dupe(u8, "systemd"),
+        .unit = try testing.allocator.dupe(u8, "AKIAIOSFODNN7EXAMPLE"),
+        .identifier = try testing.allocator.dupe(u8, "AKIAIOSFODNN7EXAMPLE"),
+        .systemd_unit = try testing.allocator.dupe(u8, "user@1000.service"),
+        .priority = 6,
+        .message = try testing.allocator.dupe(u8, "key AKIAIOSFODNN7EXAMPLE"),
+        .pid = null,
+    };
+    defer entry.deinit(testing.allocator);
+
+    try redactLog(testing.allocator, &entry, null);
+    try testing.expect(std.mem.indexOf(u8, entry.message, "AKIAIOSFODNN7EXAMPLE") == null);
+    try testing.expect(std.mem.indexOf(u8, entry.identifier.?, "AKIAIOSFODNN7EXAMPLE") == null);
+    try testing.expect(std.mem.indexOf(u8, entry.unit.?, "AKIAIOSFODNN7EXAMPLE") == null);
+    try testing.expectEqualStrings("user@1000.service", entry.systemd_unit.?);
+}
+
+test "redactLog leaves a unit derived from systemd_unit untouched" {
+    var entry = LogEntry{
+        .timestamp = 1,
+        .source = try testing.allocator.dupe(u8, "systemd"),
+        .unit = try testing.allocator.dupe(u8, "getty@tty1.service"),
+        .identifier = null,
+        .systemd_unit = try testing.allocator.dupe(u8, "getty@tty1.service"),
+        .priority = 6,
+        .message = try testing.allocator.dupe(u8, "ok"),
+        .pid = null,
+    };
+    defer entry.deinit(testing.allocator);
+
+    try redactLog(testing.allocator, &entry, null);
+    try testing.expectEqualStrings("getty@tty1.service", entry.unit.?);
+    try testing.expectEqualStrings("getty@tty1.service", entry.systemd_unit.?);
 }
 
 test "process named xmrig is not redacted (name/username/numerics preserved)" {
