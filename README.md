@@ -64,7 +64,7 @@ gh release download vX.Y.Z --repo heimann/sermon-daemon --pattern 'sermon-vX.Y.Z
 gh attestation verify sermon-vX.Y.Z-x86_64-linux-gnu.tar.gz --repo heimann/sermon-daemon \
   --signer-workflow heimann/sermon-daemon/.github/workflows/release.yml \
   --source-ref refs/tags/vX.Y.Z
-sha256sum sermon-vX.Y.Z-x86_64-linux-gnu.tar.gz  # pass this to --sha256
+sha256sum sermon-vX.Y.Z-x86_64-linux-gnu.tar.gz | cut -d' ' -f1  # pass this to --sha256
 ```
 
 To update an installed daemon, rerun the installer with the desired `--version`. If an existing config is present and no `--ingestion-key` is provided, the installer preserves the existing config, replaces the binaries, and restarts the systemd service.
