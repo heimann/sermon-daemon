@@ -17,6 +17,9 @@ Options:
   --server-url <url>            Sermon web URL for remote push. Default: https://sermon.fyi
   --version <tag>               Release tag. Default: latest GitHub release.
   --release-base-url <url>      Base URL containing tarball + .sha256 files.
+  --sha256 [<arch>=]<hex>       Expected SHA-256 of the release tarball. Repeat with an arch
+                                prefix (x86_64=..., aarch64=...) to pin several; once given,
+                                this host's arch must have a pin and the tarball must match it.
   --install-dir <path>          Install dir. Default: /opt/sermon or ~/.local/opt/sermon.
   --config-dir <path>           Config dir. Default: /etc/sermon or ~/.config/sermon.
   --db-path <path>              Metrics DB path. Default: /var/lib/sermon/metrics.db or ~/.local/share/sermon/metrics.db.
@@ -61,6 +64,7 @@ DB_PATH_OVERRIDE=""
 SERVICE_NAME="${SERMON_SERVICE_NAME:-sermon-agent}"
 LOCAL_ONLY=0
 HOSTED=0
+PINNED_SHA256=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -88,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --release-base-url)
       RELEASE_BASE_URL="${2:-}"
+      shift 2
+      ;;
+    --sha256)
+      PINNED_SHA256+=("${2:-}")
       shift 2
       ;;
     --install-dir)
@@ -152,6 +160,34 @@ case "$(uname -m)" in
     ;;
 esac
 
+EXPECTED_SHA256=""
+if [[ ${#PINNED_SHA256[@]} -gt 0 ]]; then
+  for pin in "${PINNED_SHA256[@]}"; do
+    case "${pin}" in
+      *=*)
+        pin_arch="${pin%%=*}"
+        pin_hash="${pin#*=}"
+        ;;
+      *)
+        pin_arch="${TARGET%%-*}"
+        pin_hash="${pin}"
+        ;;
+    esac
+    case "${pin_arch}" in
+      x86_64|aarch64) ;;
+      *) fail "invalid --sha256 arch: ${pin_arch} (expected x86_64 or aarch64)" ;;
+    esac
+    pin_hash="$(printf '%s' "${pin_hash}" | tr 'A-F' 'a-f')"
+    [[ "${pin_hash}" =~ ^[0-9a-f]{64}$ ]] || fail "invalid --sha256 value: ${pin}"
+    if [[ "${pin_arch}" == "${TARGET%%-*}" ]]; then
+      [[ -z "${EXPECTED_SHA256}" || "${EXPECTED_SHA256}" == "${pin_hash}" ]] ||
+        fail "conflicting --sha256 values for ${pin_arch}"
+      EXPECTED_SHA256="${pin_hash}"
+    fi
+  done
+  [[ -n "${EXPECTED_SHA256}" ]] || fail "--sha256 given but none for this host's arch (${TARGET%%-*})"
+fi
+
 need_cmd curl
 need_cmd tar
 need_cmd sha256sum
@@ -210,6 +246,12 @@ trap cleanup EXIT
 
 log "downloading ${ARCHIVE_URL}"
 curl -fsSL "${ARCHIVE_URL}" -o "${tmpdir}/${ARCHIVE}"
+if [[ -n "${EXPECTED_SHA256}" ]]; then
+  actual_sha256="$(sha256sum "${tmpdir}/${ARCHIVE}" | awk '{print $1}')"
+  [[ "${actual_sha256}" == "${EXPECTED_SHA256}" ]] ||
+    fail "${ARCHIVE} sha256 ${actual_sha256} does not match pinned --sha256 ${EXPECTED_SHA256}"
+  log "${ARCHIVE} matches pinned sha256"
+fi
 curl -fsSL "${SHA_URL}" -o "${tmpdir}/${ARCHIVE}.sha256"
 (
   cd "${tmpdir}"
